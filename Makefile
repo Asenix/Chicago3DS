@@ -33,7 +33,7 @@ $(TARGET).elf: build/main.o build/vshader.o
 	arm-none-eabi-gcc $(LDFLAGS) $^ $(LIBS) -o $@
 
 $(TARGET).3dsx: $(TARGET).elf
-	3dsxtool $< $@ 
+	3dsxtool $< $@ --romfs=romfs
 
 clean:
 	rm -rf build $(TARGET).elf $(TARGET).3dsx

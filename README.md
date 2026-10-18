@@ -48,3 +48,14 @@ The output should be `chicago3ds.3dsx`. Copy it to your SD card and launch it wi
 Upload this folder's contents to a GitHub repository, preserving the `.github/workflows/build.yml` path. Push to the repository or open Actions and run **Build 3DSX** manually. Download the `chicago3ds` artifact from the completed workflow run.
 
 Note: this archive has been reorganized to match the existing Makefile. A successful build still needs to be confirmed in a devkitPro environment.
+
+
+## City Overhaul test build (New 3DS)
+- Five walkable pocket parks, two open plazas, low-poly trees, paths, planters and sculpture.
+- Eight NPC skin palettes and twelve clothing palettes, plus basic hair/hat variation.
+- Traffic reduced to 16 cars to leave headroom for scenery; 18 pedestrians.
+- New 3DS speedup was already enabled. FPS counter is available in Graphics.
+- This is a source-only update: compile using devkitPro as in the instructions above.
+- Target: 60 FPS, with 50 FPS acceptable; **not yet verified on real hardware**.
+- Title music: `romfs/title.pcm` is included; if silent, verify DSP support and that the system volume is up. Music playback is not confirmed fixed.
+- Larger city grid, lakefront, billboards and graffiti are planned, not yet implemented.
