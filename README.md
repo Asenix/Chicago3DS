@@ -1,12 +1,34 @@
-[README.md](https://github.com/user-attachments/files/33630385/README.md)
 # Chicago3DS
 
 Nintendo 3DS homebrew source project.
 
 ## Controls
-Circle Pad = move, B = run, L/R or C-Stick = turn, D-Pad Up/Down = look, touch-drag = look.
+| Button | Action |
+| --- | --- |
+| Circle Pad | move (strafes while aiming) |
+| C-Stick / D-Pad / touch-drag | look (D-Pad Left/Right turn, Up/Down tilt) |
+| B | run |
+| L or ZL | aim (over-the-shoulder camera + crosshair) |
+| R or ZR | shoot (firing also aims) |
+| Hold X | weapon wheel: pick with the Circle Pad or by touch, release to equip |
+| Y | quick-switch camera style |
+| SELECT | pause menu: RESUME, WEATHER, GRAPHICS, CAMERA, TITLE |
+| START | quit (title screen only) |
+
+Weapons: pistol, SMG, shotgun, rocket launcher. Each has its own ammo count (shown in the wheel and on the map screen).
+A pedestrian goes down after 4 hits (a shotgun blast counts as one hit); rocket explosions kill everyone nearby. Yellow
+crates on the sidewalks refill ammo. Camera styles (CAMERA menu): Default, Watch Dogs (close over-the-shoulder), First Person.
 Touch HACK LIGHTS / BLACKOUT on the bottom screen to use the phone.
-SELECT = pause menu (RESUME, WEATHER: sunny / rainy / sunset / night, GRAPHICS: fog / windows / FPS toggles, TITLE). START quits from the title screen.
+
+## Sound and music
+* The title music is `assets/title.mp3`, converted to `romfs/title.pcm` (32 kHz stereo) and streamed from the app's romfs. To use a different
+  song, replace `assets/title.mp3` and run `tools/convert_audio.sh` (needs ffmpeg), then rebuild.
+* Gunshots, explosions, footsteps, traffic, rain, crickets, birdsong, horns and sirens are generated in code.
+* Audio needs the DSP firmware dump at `sdmc:/3ds/dspfirm.cdc` (create it once with the DSP1 homebrew). Without it the game runs silently.
+
+## Boot sequence
+Three developer logos (original placeholders, edit `logoName` / `logoTag` in `main.c`) fade in and slowly out to black, then the title
+screen fades in and the music starts. A or START skips the logos.
 
 ## Performance notes
 Tuned for a New 3DS: the game switches the CPU to 804 MHz at start-up (`osSetSpeedupEnable`). It still runs on an Old 3DS, just with a shorter safe draw distance.
