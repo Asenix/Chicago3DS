@@ -1,16 +1,22 @@
-; Simple vertex shader: transform position, tint vertex color
+; Vertex shader: transform, tint, distance fog, pass texture coordinates.
+; fog.x = -1/(end-start), fog.y = -start/(end-start); fog.x = fog.y = 0 turns fog off.
 
 .fvec projection[4], modelView[4]
 .fvec tint
+.fvec fog
+.fvec fogClr
 
 .constf myconst(0.0, 1.0, 0.0, 0.0)
-.alias  ones myconst.yyyy
+.alias  zeros myconst.xxxx
+.alias  ones  myconst.yyyy
 
 .out outpos position
 .out outclr color
+.out outtc0 texcoord0
 
 .in inpos v0
 .in inclr v1
+.in intex v2
 
 .proc main
 	mov r0.xyz, inpos
@@ -26,7 +32,22 @@
 	dp4 outpos.z, projection[2], r1
 	dp4 outpos.w, projection[3], r1
 
-	mul outclr, tint, inclr
+	; base colour = tint * vertex colour
+	mul r3, tint, inclr
+
+	; fog factor f = clamp(viewZ * fog.x + fog.y, 0, 1)   (viewZ is negative in front of the camera)
+	mul r2, fog.xxxx, r1.zzzz
+	add r2, fog.yyyy, r2
+	max r2, zeros, r2
+	min r2, ones, r2
+
+	; colour = base + (fogClr - base) * f   (alpha untouched)
+	add r4, fogClr, -r3
+	mul r4, r4, r2
+	add outclr.xyz, r3, r4
+	mov outclr.w, r3
+
+	mov outtc0, intex
 
 	end
 .end
