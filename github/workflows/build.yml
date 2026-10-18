@@ -1,0 +1,26 @@
+
+name: Build Chicago3DS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v4
+
+      - name: Build Chicago3DS
+        run: make
+
+      - name: Upload 3DSX
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chicago3DS-3DSX
+          path: chicago3ds.3dsx
+          if-no-files-found: error
