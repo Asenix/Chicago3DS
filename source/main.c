@@ -23,11 +23,11 @@
 #define PITCH     24.0f
 #define BLDG_W    16.0f
 #define FLOOR_H   3.5f
-#define MAX_VERTS 26000
+#define MAX_VERTS 30000
 #define RAIN_N    140
 #define N_DROPS   11
-#define N_CARS    20
-#define N_PEDS    14
+#define N_CARS    16
+#define N_PEDS    18
 #define N_STARS   70
 #define ROADS     7
 #define PLAYER_R  0.6f
@@ -229,6 +229,41 @@ static int cellOf(float x, float z) {
 	return iz * 4 + ix;
 }
 
+// Open public lots. Keep the original street grid and collision system intact.
+static int isPark(int i, int j) {
+    return (i == 2 && j == 2) || (i == 2 && j == 3) ||
+           (i == 5 && j == 4) || (i == 6 && j == 4) ||
+           (i == 1 && j == 6);
+}
+static int isPlaza(int i, int j) {
+    return (i == 4 && j == 2) || (i == 4 && j == 3);
+}
+static void flatLot(float x0, float z0, float x1, float z1, float y, float r, float g, float b) {
+    float a[3]={x0,y,z0}, c[3]={x1,y,z1}, d[3]={x0,y,z1}, e[3]={x1,y,z0};
+    quad(a,d,c,e,r,g,b);
+}
+static void treeLow(float x, float z, float scale) {
+    addBoxG(x-.14f,z-.14f,x+.14f,z+.14f,0.08f,2.4f*scale,.34f,.24f,.15f,.9f,1.f);
+    addBoxG(x-.85f*scale,z-.75f*scale,x+.85f*scale,z+.75f*scale,1.65f*scale,3.5f*scale,
+            .12f,.39f,.19f,.75f,1.f);
+}
+static void decorateOpenLot(const Building* b, int park, unsigned seed) {
+    float x=(b->x0+b->x1)*.5f, z=(b->z0+b->z1)*.5f;
+    flatLot(b->x0,b->z0,b->x1,b->z1,.09f,park?.20f:.56f,park?.43f:.55f,park?.23f:.49f);
+    if (park) {
+        flatLot(x-1.f,b->z0,x+1.f,b->z1,.105f,.69f,.65f,.53f);
+        flatLot(b->x0,z-1.f,b->x1,z+1.f,.11f,.69f,.65f,.53f);
+        treeLow(x-4.5f,z-4.5f,.95f); treeLow(x+4.5f,z+4.5f,1.1f);
+        treeLow(x-4.5f,z+4.5f,.85f);
+        addBoxG(x+2.0f,z-4.5f,x+4.2f,z-3.9f,.12f,.48f,.37f,.26f,.18f,.8f,1.f);
+    } else {
+        // Open paved square with planter and low sculpture.
+        addBoxG(x-2.f,z-2.f,x+2.f,z+2.f,.12f,.55f,.34f,.37f,.39f,.85f,1.f);
+        addBoxG(x-.6f,z-.6f,x+.6f,z+.6f,.55f,2.7f,.40f,.56f,.64f,.8f,1.f);
+    }
+    (void)seed;
+}
+
 static void buildCity(void) {
 	float ext = GRID * PITCH * 0.5f, G = ext + 300.0f;
 	// asphalt ground, extends far so fog can melt it into the horizon
@@ -258,6 +293,8 @@ static void buildCity(void) {
 			b->x0 = cx - BLDG_W * 0.5f; b->x1 = cx + BLDG_W * 0.5f;
 			b->z0 = cz - BLDG_W * 0.5f; b->z1 = cz + BLDG_W * 0.5f;
 			b->h  = FLOOR_H * (float)(2 + (h % 12));
+            if (isPark(i,j) || isPlaza(i,j)) b->h = 0.0f;
+            else if ((h % 9) == 0) b->h *= .60f; // neighborhood height variation
 		}
 	}
 
@@ -273,6 +310,10 @@ static void buildCity(void) {
 				float s0[3] = {b->x0 - 1.5f, 0.03f, b->z0 - 1.5f}, s1[3] = {b->x1 + 1.5f, 0.03f, b->z0 - 1.5f};
 				float s2[3] = {b->x1 + 1.5f, 0.03f, b->z1 + 1.5f}, s3[3] = {b->x0 - 1.5f, 0.03f, b->z1 + 1.5f};
 				quad(s0, s3, s2, s1, 0.45f, 0.45f, 0.47f);
+                if (b->h <= 0.0f) {
+                    decorateOpenLot(b, isPark(i,j), h);
+                    continue;
+                }
 
 				float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
 				float r0[3] = {b->x0, b->h, b->z0}, r1[3] = {b->x1, b->h, b->z0};
@@ -340,7 +381,7 @@ static void buildCity(void) {
 		for (int i = 0; i < GRID; i++) {
 			for (int j = 0; j < GRID; j++) {
 				const Building* b = &bldg[i * GRID + j];
-				if (cellOf((b->x0 + b->x1) * 0.5f, (b->z0 + b->z1) * 0.5f) != c) continue;
+				if (cellOf((b->x0 + b->x1) * 0.5f, (b->z0 + b->z1) * 0.5f) != c || b->h <= 0.0f) continue;
 				unsigned h = hash2(i, j);
 				float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
 				float tint = (float)((h >> 16) % 3);
@@ -725,7 +766,7 @@ static void updateCars(int frame, float px, float pz) {
 static int blocked(float x, float z) {
 	for (int i = 0; i < GRID * GRID; i++) {
 		const Building* b = &bldg[i];
-		if (x > b->x0 - PLAYER_R && x < b->x1 + PLAYER_R &&
+		if (b->h > 0.0f && x > b->x0 - PLAYER_R && x < b->x1 + PLAYER_R &&
 		    z > b->z0 - PLAYER_R && z < b->z1 + PLAYER_R) return 1;
 	}
 	float lim = GRID * PITCH * 0.5f + 20.0f;
@@ -777,12 +818,15 @@ typedef struct { int axis, road, side, dir, walk, hp, dead, deadT, panic; float 
 static Ped peds[N_PEDS];
 
 static void initPeds(void) {
-	static const float shirt[6][3] = {
+	static const float shirt[12][3] = {
 		{0.80f, 0.20f, 0.20f}, {0.20f, 0.45f, 0.80f}, {0.90f, 0.75f, 0.20f},
-		{0.85f, 0.85f, 0.85f}, {0.25f, 0.65f, 0.40f}, {0.65f, 0.30f, 0.70f}
+		{0.85f, 0.85f, 0.85f}, {0.25f, 0.65f, 0.40f}, {0.65f, 0.30f, 0.70f},
+        {0.08f,0.09f,0.11f}, {0.95f,0.48f,0.13f}, {0.23f,0.72f,0.71f},
+        {0.58f,0.18f,0.25f}, {0.72f,0.70f,0.61f}, {0.30f,0.35f,0.18f}
 	};
-	static const float skin[4][3] = {
-		{0.85f, 0.66f, 0.52f}, {0.62f, 0.45f, 0.34f}, {0.95f, 0.80f, 0.68f}, {0.45f, 0.32f, 0.24f}
+	static const float skin[8][3] = {
+		{0.85f, 0.66f, 0.52f}, {0.62f, 0.45f, 0.34f}, {0.95f, 0.80f, 0.68f}, {0.45f, 0.32f, 0.24f},
+        {0.28f,0.18f,0.13f}, {0.72f,0.51f,0.39f}, {0.96f,0.73f,0.58f}, {0.54f,0.35f,0.26f}
 	};
 	for (int i = 0; i < N_PEDS; i++) {
 		unsigned h = hash2(i, 777);
@@ -795,8 +839,8 @@ static void initPeds(void) {
 		p->speed = 0.035f + (float)((h >> 20) % 5) * 0.006f;
 		p->ph    = (float)(h % 100) * 0.1f;
 		p->walk  = 1; p->hp = 4; p->dead = 0; p->deadT = 0; p->panic = 0;
-		const float* c = shirt[(h >> 5) % 6];
-		const float* k = skin[(h >> 14) % 4];
+		const float* c = shirt[(h >> 5) % 12];
+		const float* k = skin[(h >> 14) % 8];
 		for (int q = 0; q < 3; q++) { p->shirt[q] = c[q]; p->skin[q] = k[q]; p->pants[q] = 0.10f + 0.06f * (float)((h >> (16 + q)) & 3); }
 	}
 }
@@ -864,6 +908,10 @@ static void drawPed(const Ped* p) {
 	addPart( 0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f, -s, p->pants[0], p->pants[1], p->pants[2]);
 	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, p->shirt[0], p->shirt[1], p->shirt[2]);
 	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.00f, 0.0f, 0.13f, 0.14f, 0.13f, 0.0f, p->skin[0], p->skin[1], p->skin[2]);
+    // Simple varied hair/caps; shared geometry, no extra textures.
+    unsigned style = hash2(p->road * 7 + p->side, (int)(p->ph * 10.f)) % 3;
+    if (style != 0) addPart(0.f,1.78f,0.f,0.f,0.f,0.f,.145f,style==1?.055f:.10f,.145f,0.f,
+                            style==1?.08f:.24f,style==1?.07f:.17f,style==1?.07f:.11f);
 }
 
 // Rebuilds the dynamic tail of the vertex buffer: shadows, cars, pedestrians (only those near the camera).
