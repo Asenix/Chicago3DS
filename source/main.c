@@ -46,6 +46,8 @@ static int gFpsValue = 60;
 
 // camera position used to skip far-away dynamic geometry (keeps the frame rate at 60)
 static float gCamX = 0.0f, gCamZ = 0.0f, gCullR = 140.0f;
+static float gFwdX = 0.0f, gFwdZ = -1.0f; // camera forward on the ground plane
+static int   gCone = 1;                   // 1 = also skip things outside the view cone
 
 static unsigned hash2(int a, int b) {
 	unsigned h = (unsigned)a * 374761393u + (unsigned)b * 668265263u;
@@ -54,8 +56,10 @@ static unsigned hash2(int a, int b) {
 }
 
 static int inView(float x, float z) {
-	float dx = x - gCamX, dz = z - gCamZ;
-	return dx * dx + dz * dz < gCullR * gCullR;
+	float dx = x - gCamX, dz = z - gCamZ, d2 = dx * dx + dz * dz;
+	if (d2 >= gCullR * gCullR) return 0;
+	if (!gCone || d2 < 196.0f) return 1;                    // close objects are always kept
+	return (dx * gFwdX + dz * gFwdZ) > 0.5f * sqrtf(d2) - 6.0f; // roughly +-60 degrees of the view direction
 }
 
 static float gAlpha = 1.0f; // alpha written into new vertices (rain, sky bodies, shadows, droplets)
@@ -214,6 +218,17 @@ static void addWalls(float x0, float z0, float x1, float z1, float h, float r, f
 	wallFace(p100, p101, p111, p110, r * 0.88f, g * 0.88f, b * 0.88f, uo + 0.75f, uo + 0.75f + u, vo, vo + v);
 }
 
+#define CELLS 16 // 4x4 districts of 2x2 blocks; each gets its own vertex ranges so it can be skipped when out of view
+static int cellAStart[CELLS], cellACount[CELLS], cellWStart[CELLS], cellWCount[CELLS];
+static int globalEnd = 0; // ground + skyline, always drawn
+
+static int cellOf(float x, float z) {
+	int ix = (int)floorf((x + 96.0f) / 48.0f), iz = (int)floorf((z + 96.0f) / 48.0f);
+	ix = ix < 0 ? 0 : (ix > 3 ? 3 : ix);
+	iz = iz < 0 ? 0 : (iz > 3 ? 3 : iz);
+	return iz * 4 + ix;
+}
+
 static void buildCity(void) {
 	float ext = GRID * PITCH * 0.5f, G = ext + 300.0f;
 	// asphalt ground, extends far so fog can melt it into the horizon
@@ -231,8 +246,9 @@ static void buildCity(void) {
 		float tone = 0.42f + (float)((h >> 20) % 20) / 100.0f;
 		addBoxG(cx - w, cz - w, cx + w, cz + w, 0.0f, hh, tone * 0.95f, tone, tone * 1.08f, 0.5f, 1.0f);
 	}
+	globalEnd = vcount;
 
-	// sidewalks, roofs, rooftop units
+	// building footprints
 	for (int i = 0; i < GRID; i++) {
 		for (int j = 0; j < GRID; j++) {
 			float cx = (i - (GRID - 1) * 0.5f) * PITCH;
@@ -242,81 +258,398 @@ static void buildCity(void) {
 			b->x0 = cx - BLDG_W * 0.5f; b->x1 = cx + BLDG_W * 0.5f;
 			b->z0 = cz - BLDG_W * 0.5f; b->z1 = cz + BLDG_W * 0.5f;
 			b->h  = FLOOR_H * (float)(2 + (h % 12));
-
-			float s0[3] = {b->x0 - 1.5f, 0.03f, b->z0 - 1.5f}, s1[3] = {b->x1 + 1.5f, 0.03f, b->z0 - 1.5f};
-			float s2[3] = {b->x1 + 1.5f, 0.03f, b->z1 + 1.5f}, s3[3] = {b->x0 - 1.5f, 0.03f, b->z1 + 1.5f};
-			quad(s0, s3, s2, s1, 0.45f, 0.45f, 0.47f);
-
-			float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
-			float r0[3] = {b->x0, b->h, b->z0}, r1[3] = {b->x1, b->h, b->z0};
-			float r2[3] = {b->x1, b->h, b->z1}, r3[3] = {b->x0, b->h, b->z1};
-			quad(r0, r1, r2, r3, 0.30f + tone * 0.15f, 0.31f + tone * 0.15f, 0.33f + tone * 0.15f);
-			float ux = cx + ((int)((h >> 3) % 9) - 4) * 1.1f, uz = cz + ((int)((h >> 7) % 9) - 4) * 1.1f;
-			addBoxG(ux - 0.9f, uz - 0.9f, ux + 0.9f, uz + 0.9f, b->h, b->h + 1.1f, 0.52f, 0.54f, 0.57f, 0.8f, 1.0f);
 		}
 	}
 
-	// road markings: dashed centre lines, zebra crossings, signal poles
-	for (int k = 0; k < ROADS; k++) {
-		float c0 = ROAD_C(k);
-		for (float s = -ext; s < ext; s += 6.0f) {
-			float m = s + 1.25f;
-			int skip = 0;
-			for (int q = 0; q < ROADS; q++) if (fabsf(m - ROAD_C(q)) < 4.8f) skip = 1;
-			if (skip) continue;
-			float a[3] = {c0 - 0.12f, 0.05f, s}, b[3] = {c0 + 0.12f, 0.05f, s};
-			float c[3] = {c0 + 0.12f, 0.05f, s + 2.5f}, d[3] = {c0 - 0.12f, 0.05f, s + 2.5f};
-			quad(a, b, c, d, 0.85f, 0.72f, 0.16f);
-			float e[3] = {s, 0.05f, c0 - 0.12f}, f[3] = {s, 0.05f, c0 + 0.12f};
-			float g[3] = {s + 2.5f, 0.05f, c0 + 0.12f}, hh[3] = {s + 2.5f, 0.05f, c0 - 0.12f};
-			quad(e, f, g, hh, 0.85f, 0.72f, 0.16f);
+	// per district: sidewalks, roofs, rooftop units, road markings, crossings, signal poles
+	for (int c = 0; c < CELLS; c++) {
+		cellAStart[c] = vcount;
+		for (int i = 0; i < GRID; i++) {
+			for (int j = 0; j < GRID; j++) {
+				const Building* b = &bldg[i * GRID + j];
+				float cx = (b->x0 + b->x1) * 0.5f, cz = (b->z0 + b->z1) * 0.5f;
+				if (cellOf(cx, cz) != c) continue;
+				unsigned h = hash2(i, j);
+				float s0[3] = {b->x0 - 1.5f, 0.03f, b->z0 - 1.5f}, s1[3] = {b->x1 + 1.5f, 0.03f, b->z0 - 1.5f};
+				float s2[3] = {b->x1 + 1.5f, 0.03f, b->z1 + 1.5f}, s3[3] = {b->x0 - 1.5f, 0.03f, b->z1 + 1.5f};
+				quad(s0, s3, s2, s1, 0.45f, 0.45f, 0.47f);
+
+				float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
+				float r0[3] = {b->x0, b->h, b->z0}, r1[3] = {b->x1, b->h, b->z0};
+				float r2[3] = {b->x1, b->h, b->z1}, r3[3] = {b->x0, b->h, b->z1};
+				quad(r0, r1, r2, r3, 0.30f + tone * 0.15f, 0.31f + tone * 0.15f, 0.33f + tone * 0.15f);
+				float ux = cx + ((int)((h >> 3) % 9) - 4) * 1.1f, uz = cz + ((int)((h >> 7) % 9) - 4) * 1.1f;
+				addBoxG(ux - 0.9f, uz - 0.9f, ux + 0.9f, uz + 0.9f, b->h, b->h + 1.1f, 0.52f, 0.54f, 0.57f, 0.8f, 1.0f);
+			}
 		}
-	}
-	for (int a = 0; a < ROADS; a++) {
-		for (int b = 0; b < ROADS; b++) {
-			float xc = ROAD_C(a), zc = ROAD_C(b);
-			for (int arm = 0; arm < 4; arm++) {
-				float sg = (arm & 1) ? 1.0f : -1.0f;
-				for (int st = -1; st <= 1; st++) {
-					float off = st * 1.7f;
-					float p0[3], p1[3], p2[3], p3[3];
-					if (arm < 2) { // vertical road arm: bars run along z
-						float zz = zc + sg * 3.6f, xx = xc + off;
-						p0[0] = xx - 0.4f; p0[1] = 0.05f; p0[2] = zz - 0.8f;
-						p1[0] = xx + 0.4f; p1[1] = 0.05f; p1[2] = zz - 0.8f;
-						p2[0] = xx + 0.4f; p2[1] = 0.05f; p2[2] = zz + 0.8f;
-						p3[0] = xx - 0.4f; p3[1] = 0.05f; p3[2] = zz + 0.8f;
-					} else {       // horizontal road arm: bars run along x
-						float xx = xc + sg * 3.6f, zz = zc + off;
-						p0[0] = xx - 0.8f; p0[1] = 0.05f; p0[2] = zz - 0.4f;
-						p1[0] = xx + 0.8f; p1[1] = 0.05f; p1[2] = zz - 0.4f;
-						p2[0] = xx + 0.8f; p2[1] = 0.05f; p2[2] = zz + 0.4f;
-						p3[0] = xx - 0.8f; p3[1] = 0.05f; p3[2] = zz + 0.4f;
-					}
-					quad(p0, p1, p2, p3, 0.78f, 0.78f, 0.76f);
+		for (int k = 0; k < ROADS; k++) {
+			float c0 = ROAD_C(k);
+			for (float s = -ext; s < ext; s += 6.0f) {
+				float m = s + 1.25f;
+				int skip = 0;
+				for (int q = 0; q < ROADS; q++) if (fabsf(m - ROAD_C(q)) < 4.8f) skip = 1;
+				if (skip) continue;
+				if (cellOf(c0, m) == c) { // dash on the road running along z
+					float a[3] = {c0 - 0.12f, 0.05f, s}, b[3] = {c0 + 0.12f, 0.05f, s};
+					float cc[3] = {c0 + 0.12f, 0.05f, s + 2.5f}, d[3] = {c0 - 0.12f, 0.05f, s + 2.5f};
+					quad(a, b, cc, d, 0.85f, 0.72f, 0.16f);
+				}
+				if (cellOf(m, c0) == c) { // dash on the road running along x
+					float e[3] = {s, 0.05f, c0 - 0.12f}, f[3] = {s, 0.05f, c0 + 0.12f};
+					float g[3] = {s + 2.5f, 0.05f, c0 + 0.12f}, hh[3] = {s + 2.5f, 0.05f, c0 - 0.12f};
+					quad(e, f, g, hh, 0.85f, 0.72f, 0.16f);
 				}
 			}
-			float x = xc + 3.4f, z = zc + 3.4f;
-			addBoxG(x - 0.15f, z - 0.15f, x + 0.15f, z + 0.15f, 0.0f, 4.0f, 0.2f, 0.2f, 0.22f, 0.8f, 1.0f);
 		}
+		for (int a = 0; a < ROADS; a++) {
+			for (int b = 0; b < ROADS; b++) {
+				float xc = ROAD_C(a), zc = ROAD_C(b);
+				if (cellOf(xc, zc) != c) continue;
+				for (int arm = 0; arm < 4; arm++) {
+					float sg = (arm & 1) ? 1.0f : -1.0f;
+					for (int st = -1; st <= 1; st++) {
+						float off = st * 1.7f;
+						float p0[3], p1[3], p2[3], p3[3];
+						if (arm < 2) { // vertical road arm: bars run along z
+							float zz = zc + sg * 3.6f, xx = xc + off;
+							p0[0] = xx - 0.4f; p0[1] = 0.05f; p0[2] = zz - 0.8f;
+							p1[0] = xx + 0.4f; p1[1] = 0.05f; p1[2] = zz - 0.8f;
+							p2[0] = xx + 0.4f; p2[1] = 0.05f; p2[2] = zz + 0.8f;
+							p3[0] = xx - 0.4f; p3[1] = 0.05f; p3[2] = zz + 0.8f;
+						} else {       // horizontal road arm: bars run along x
+							float xx = xc + sg * 3.6f, zz = zc + off;
+							p0[0] = xx - 0.8f; p0[1] = 0.05f; p0[2] = zz - 0.4f;
+							p1[0] = xx + 0.8f; p1[1] = 0.05f; p1[2] = zz - 0.4f;
+							p2[0] = xx + 0.8f; p2[1] = 0.05f; p2[2] = zz + 0.4f;
+							p3[0] = xx - 0.8f; p3[1] = 0.05f; p3[2] = zz + 0.4f;
+						}
+						quad(p0, p1, p2, p3, 0.78f, 0.78f, 0.76f);
+					}
+				}
+				float x = xc + 3.4f, z = zc + 3.4f;
+				addBoxG(x - 0.15f, z - 0.15f, x + 0.15f, z + 0.15f, 0.0f, 4.0f, 0.2f, 0.2f, 0.22f, 0.8f, 1.0f);
+			}
+		}
+		cellACount[c] = vcount - cellAStart[c];
 	}
 
-	// textured facades go last so they can be drawn (and re-drawn for night glow) as one range
+	// textured facades go last (per district) so they can be drawn, and re-drawn for night glow, as ranges
 	wallStart = vcount;
-	for (int i = 0; i < GRID; i++) {
-		for (int j = 0; j < GRID; j++) {
-			unsigned h = hash2(i, j);
-			const Building* b = &bldg[i * GRID + j];
-			float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
-			float tint = (float)((h >> 16) % 3);
-			float r  = tone * (tint == 0 ? 1.00f : 0.85f);
-			float g  = tone * (tint == 1 ? 1.00f : 0.90f);
-			float bl = tone * (tint == 2 ? 1.05f : 0.95f);
-			addWalls(b->x0, b->z0, b->x1, b->z1, b->h, r, g, bl,
-			         (float)((h >> 20) & 3) * 0.25f, (float)((h >> 24) & 3) * 0.25f);
+	for (int c = 0; c < CELLS; c++) {
+		cellWStart[c] = vcount;
+		for (int i = 0; i < GRID; i++) {
+			for (int j = 0; j < GRID; j++) {
+				const Building* b = &bldg[i * GRID + j];
+				if (cellOf((b->x0 + b->x1) * 0.5f, (b->z0 + b->z1) * 0.5f) != c) continue;
+				unsigned h = hash2(i, j);
+				float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
+				float tint = (float)((h >> 16) % 3);
+				float r  = tone * (tint == 0 ? 1.00f : 0.85f);
+				float g  = tone * (tint == 1 ? 1.00f : 0.90f);
+				float bl = tone * (tint == 2 ? 1.05f : 0.95f);
+				addWalls(b->x0, b->z0, b->x1, b->z1, b->h, r, g, bl,
+				         (float)((h >> 20) & 3) * 0.25f, (float)((h >> 24) & 3) * 0.25f);
+			}
 		}
+		cellWCount[c] = vcount - cellWStart[c];
 	}
 	wallEnd = vcount;
+}
+
+// ---- audio ------------------------------------------------------------------
+// Sound effects and ambience loops are synthesised at start-up (no sample files). The title music is
+// streamed from romfs:/title.pcm (32 kHz stereo) by a background thread so it never stalls a frame.
+// Needs the DSP firmware dump at sdmc:/3ds/dspfirm.cdc (dump it once with the DSP1 homebrew);
+// without it the game simply stays silent.
+#define SFX_RATE 22050
+#define MUS_RATE 32000
+#define PI_F     3.14159265f
+enum { SFX_PISTOL, SFX_SMG, SFX_SHOTGUN, SFX_ROCKET, SFX_EXPLODE, SFX_HIT, SFX_CLICK, SFX_SWITCH,
+       SFX_PICKUP, SFX_HORN, SFX_STEP, SFX_SIREN, SFX_COUNT };
+typedef struct { s16* data; int n; } Snd;
+static Snd sfx[SFX_COUNT], ambSnd[4]; // ambience: 0 city, 1 rain, 2 night crickets, 3 daytime birds
+static int sndOK = 0;
+static ndspWaveBuf sfxWB[8], ambWB[4];
+static int sfxNext = 0;
+static float ambSet[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
+
+static float nrand(unsigned* st) {
+	*st = *st * 1664525u + 1013904223u;
+	return (float)((*st >> 8) & 0xFFFF) / 32768.0f - 1.0f;
+}
+
+static s16 pcm(float v) {
+	if (v > 1.0f) v = 1.0f;
+	if (v < -1.0f) v = -1.0f;
+	return (s16)(v * 30000.0f);
+}
+
+static Snd newSnd(int n) {
+	Snd s;
+	s.n = n;
+	s.data = (s16*)linearAlloc((size_t)n * 2);
+	if (!s.data) s.n = 0;
+	return s;
+}
+
+static Snd synthSfx(int id) {
+	static const float dur[SFX_COUNT] = {0.22f, 0.13f, 0.55f, 0.90f, 1.40f, 0.12f, 0.05f, 0.12f, 0.25f, 0.55f, 0.09f, 3.60f};
+	int n = (int)(dur[id] * SFX_RATE);
+	Snd s = newSnd(n);
+	if (!s.data) return s;
+	unsigned st = 12345u + (unsigned)id * 977u;
+	float lp = 0.0f, lp2 = 0.0f, ph = 0.0f;
+	for (int i = 0; i < n; i++) {
+		float t = (float)i / SFX_RATE, v = 0.0f, w = nrand(&st);
+		lp  += (w - lp)  * 0.30f;
+		lp2 += (w - lp2) * 0.06f;
+		switch (id) {
+		case SFX_PISTOL:
+			v = 0.7f * w * expf(-t * 38.0f) + 0.5f * lp * expf(-t * 15.0f) + 0.6f * sinf(2.0f * PI_F * 140.0f * t) * expf(-t * 26.0f);
+			break;
+		case SFX_SMG:
+			v = 0.8f * w * expf(-t * 50.0f) + 0.5f * sinf(2.0f * PI_F * 190.0f * t) * expf(-t * 42.0f);
+			break;
+		case SFX_SHOTGUN:
+			v = 0.9f * lp * expf(-t * 9.0f) + 0.5f * w * expf(-t * 30.0f) + 0.8f * sinf(2.0f * PI_F * 68.0f * t) * expf(-t * 8.0f);
+			break;
+		case SFX_ROCKET: {
+			float e = sinf(PI_F * t / dur[id]);
+			v = (0.8f * lp2 + 0.25f * lp) * powf(e, 0.7f) * 2.0f;
+			break;
+		}
+		case SFX_EXPLODE:
+			v = lp2 * 3.0f * expf(-t * 2.2f) + 0.4f * lp * expf(-t * 6.0f) + 0.9f * sinf(2.0f * PI_F * 46.0f * t) * expf(-t * 2.6f);
+			break;
+		case SFX_HIT:
+			v = 0.9f * sinf(2.0f * PI_F * 95.0f * t) * expf(-t * 30.0f) + 0.4f * w * expf(-t * 60.0f);
+			break;
+		case SFX_CLICK:
+			v = 0.7f * w * expf(-t * 130.0f) + 0.4f * sinf(2.0f * PI_F * 1800.0f * t) * expf(-t * 90.0f);
+			break;
+		case SFX_SWITCH: {
+			float t2 = t - 0.06f;
+			v = 0.6f * w * expf(-t * 130.0f) + (t2 > 0.0f ? 0.6f * w * expf(-t2 * 110.0f) : 0.0f);
+			break;
+		}
+		case SFX_PICKUP:
+			v = 0.5f * sinf(2.0f * PI_F * (t < 0.1f ? 660.0f : 990.0f) * t) * expf(-fmodf(t, 0.1f) * 14.0f);
+			break;
+		case SFX_HORN: {
+			float e = fminf(1.0f, t * 40.0f) * fminf(1.0f, (dur[id] - t) * 25.0f);
+			v = e * 0.30f * (sinf(2.0f * PI_F * 410.0f * t) + sinf(2.0f * PI_F * 512.0f * t) + 0.5f * sinf(2.0f * PI_F * 820.0f * t));
+			break;
+		}
+		case SFX_STEP:
+			v = 2.4f * lp2 * expf(-t * 45.0f) + 0.4f * sinf(2.0f * PI_F * 70.0f * t) * expf(-t * 35.0f);
+			break;
+		case SFX_SIREN: {
+			float f = 900.0f + 280.0f * sinf(2.0f * PI_F * t / 1.5f);
+			ph += 2.0f * PI_F * f / SFX_RATE;
+			float e = powf(sinf(PI_F * t / dur[id]), 1.5f);
+			v = e * 0.35f * (sinf(ph) + 0.3f * sinf(2.0f * ph));
+			break;
+		}
+		}
+		s.data[i] = pcm(v * 0.7f); // headroom so the shots don't clip
+	}
+	DSP_FlushDataCache(s.data, (u32)s.n * 2);
+	return s;
+}
+
+// Seamless ambience loop: render a little extra and cross-fade the tail into the head.
+static Snd synthLoop(int kind, int seconds) {
+	int L = seconds * SFX_RATE, X = 4096, n = L + X;
+	Snd s = newSnd(L);
+	float* tmp = (float*)malloc((size_t)n * sizeof(float));
+	if (!s.data || !tmp) { free(tmp); return s; }
+	static const float birdT[7]  = {0.30f, 0.90f, 1.55f, 2.20f, 2.50f, 3.30f, 3.70f};
+	static const float birdF[7]  = {3400.0f, 2900.0f, 3800.0f, 3100.0f, 4200.0f, 3500.0f, 3000.0f};
+	unsigned st = 777u + (unsigned)kind * 31u;
+	float b = 0.0f, lp = 0.0f, lp2 = 0.0f;
+	for (int i = 0; i < n; i++) {
+		float t = (float)i / SFX_RATE, v = 0.0f, w = nrand(&st);
+		lp  += (w - lp)  * 0.25f;
+		lp2 += (w - lp2) * 0.03f;
+		b = b * 0.985f + w * 0.04f;
+		if (kind == 0) { // traffic rumble, engine drone and the odd car passing
+			float drone = 0.10f * sinf(2.0f * PI_F * 55.0f * t) + 0.06f * sinf(2.0f * PI_F * 82.5f * t) * (0.6f + 0.4f * sinf(2.0f * PI_F * 0.25f * t));
+			float pass = expf(-powf((t - 1.4f) / 0.35f, 2.0f)) + 0.7f * expf(-powf((t - 3.1f) / 0.30f, 2.0f));
+			v = b * 1.6f + drone + pass * 0.35f * lp2 * 4.0f;
+		} else if (kind == 1) { // steady rain hiss
+			v = 0.55f * (w - lp * 0.9f) * (0.85f + 0.15f * sinf(2.0f * PI_F * 0.7f * t));
+		} else if (kind == 2) { // crickets
+			for (int k = 0; k < 3; k++) {
+				float per = 0.46f + 0.05f * (float)k, tp = fmodf(t + 0.13f * (float)k, per), e = 0.0f;
+				if (tp < 0.12f) {
+					float tq = fmodf(tp, 0.034f);
+					if (tq < 0.017f) e = sinf(PI_F * tq / 0.017f);
+				}
+				v += 0.10f * e * sinf(2.0f * PI_F * (4300.0f + 380.0f * (float)k) * t);
+			}
+			v += 0.03f * lp2;
+		} else { // birdsong over a little wind
+			for (int k = 0; k < 7; k++) {
+				float tau = t - birdT[k];
+				if (tau >= 0.0f && tau < 0.14f) {
+					float u = tau / 0.14f;
+					v += 0.18f * sinf(2.0f * PI_F * (birdF[k] * tau + 1400.0f * tau * tau * tau / (3.0f * 0.14f * 0.14f))) * sinf(PI_F * u);
+				}
+			}
+			v += 0.10f * lp2;
+		}
+		tmp[i] = v;
+	}
+	for (int i = 0; i < X; i++) {
+		float wgt = (float)i / (float)X;
+		tmp[i] = tmp[i] * wgt + tmp[L + i] * (1.0f - wgt);
+	}
+	for (int i = 0; i < L; i++) s.data[i] = pcm(tmp[i]);
+	free(tmp);
+	DSP_FlushDataCache(s.data, (u32)s.n * 2);
+	return s;
+}
+
+static void playSfx(int id, float vol) {
+	if (!sndOK || !sfx[id].data) return;
+	int ch = 5 + sfxNext;
+	sfxNext = (sfxNext + 1) & 7;
+	ndspChnWaveBufClear(ch);
+	float mix[12];
+	memset(mix, 0, sizeof mix);
+	mix[0] = vol; mix[1] = vol;
+	ndspChnSetMix(ch, mix);
+	ndspWaveBuf* wb = &sfxWB[ch - 5];
+	memset(wb, 0, sizeof *wb);
+	wb->data_vaddr = sfx[id].data;
+	wb->nsamples = (u32)sfx[id].n;
+	wb->looping = false;
+	ndspChnWaveBufAdd(ch, wb);
+}
+
+static void ambSetVol(int i, float v) {
+	if (!sndOK || fabsf(v - ambSet[i]) < 0.01f) return;
+	ambSet[i] = v;
+	float mix[12];
+	memset(mix, 0, sizeof mix);
+	mix[0] = v; mix[1] = v;
+	ndspChnSetMix(1 + i, mix);
+}
+
+// ---- title music streaming thread ----
+static volatile int musicWant = 0, musicQuit = 0;
+static Thread musicThread = NULL;
+
+static void musicSetMix(float g) {
+	float mix[12];
+	memset(mix, 0, sizeof mix);
+	mix[0] = g; mix[1] = g;
+	ndspChnSetMix(0, mix);
+}
+
+static void fillMusic(FILE* f, s16* buf, int frames) {
+	int need = frames * 4, got = 0, retry = 0;
+	while (got < need) {
+		size_t r = fread((u8*)buf + got, 1, (size_t)(need - got), f);
+		got += (int)r;
+		if (got < need) {
+			if (r == 0 && ++retry > 2) break;
+			fseek(f, 0, SEEK_SET); // end of the track: loop
+		}
+	}
+	if (got < need) memset((u8*)buf + got, 0, (size_t)(need - got));
+	DSP_FlushDataCache(buf, (u32)need);
+}
+
+static void musicThreadFn(void* arg) {
+	(void)arg;
+	const int CH = 8192; // stereo frames per buffer, about 0.26 s
+	s16* bufs[3];
+	ndspWaveBuf wbs[3];
+	FILE* f = NULL;
+	int playing = 0;
+	float gain = 0.0f;
+	for (int i = 0; i < 3; i++) bufs[i] = (s16*)linearAlloc((size_t)CH * 4);
+	memset(wbs, 0, sizeof wbs);
+	while (!musicQuit) {
+		if (musicWant && !playing) {
+			f = fopen("romfs:/title.pcm", "rb");
+			if (!f) f = fopen("sdmc:/3ds/Chicago3DS/title.pcm", "rb");
+			if (f && bufs[0] && bufs[1] && bufs[2]) {
+				ndspChnWaveBufClear(0);
+				memset(wbs, 0, sizeof wbs);
+				gain = 0.0f;
+				musicSetMix(0.0f);
+				for (int i = 0; i < 3; i++) {
+					fillMusic(f, bufs[i], CH);
+					wbs[i].data_vaddr = bufs[i];
+					wbs[i].nsamples = (u32)CH;
+					ndspChnWaveBufAdd(0, &wbs[i]);
+				}
+				playing = 1;
+			} else {
+				if (f) { fclose(f); f = NULL; }
+				musicWant = 0; // no music file found: stay quiet
+			}
+		}
+		if (playing) {
+			for (int i = 0; i < 3; i++) {
+				if (wbs[i].status == NDSP_WBUF_DONE) {
+					fillMusic(f, bufs[i], CH);
+					wbs[i].nsamples = (u32)CH;
+					ndspChnWaveBufAdd(0, &wbs[i]);
+				}
+			}
+			gain += ((musicWant ? 1.0f : 0.0f) - gain) * 0.06f;
+			musicSetMix(gain * 0.85f);
+			if (!musicWant && gain < 0.01f) {
+				ndspChnWaveBufClear(0);
+				fclose(f); f = NULL;
+				playing = 0;
+			}
+		}
+		svcSleepThread(20000000LL);
+	}
+	ndspChnWaveBufClear(0);
+	if (f) fclose(f);
+	for (int i = 0; i < 3; i++) if (bufs[i]) linearFree(bufs[i]);
+}
+
+static void initAudio(void) {
+	if (R_FAILED(ndspInit())) return; // dspfirm.cdc missing
+	sndOK = 1;
+	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+	for (int ch = 0; ch < 13; ch++) {
+		ndspChnReset(ch);
+		ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
+	}
+	ndspChnSetRate(0, (float)MUS_RATE);
+	ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
+	for (int ch = 1; ch < 13; ch++) {
+		ndspChnSetRate(ch, (float)SFX_RATE);
+		ndspChnSetFormat(ch, NDSP_FORMAT_MONO_PCM16);
+	}
+	for (int i = 0; i < SFX_COUNT; i++) sfx[i] = synthSfx(i);
+	for (int i = 0; i < 4; i++) {
+		ambSnd[i] = synthLoop(i, 4);
+		if (!ambSnd[i].data) continue;
+		memset(&ambWB[i], 0, sizeof ambWB[i]);
+		ambWB[i].data_vaddr = ambSnd[i].data;
+		ambWB[i].nsamples = (u32)ambSnd[i].n;
+		ambWB[i].looping = true;
+		ambSetVol(i, 0.0f);
+		ndspChnWaveBufAdd(1 + i, &ambWB[i]);
+	}
+	s32 prio = 0;
+	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+	musicThread = threadCreate(musicThreadFn, NULL, 32 * 1024, prio - 1, -1, false);
+}
+
+static void shutdownAudio(void) {
+	if (!sndOK) return;
+	musicQuit = 1;
+	if (musicThread) { threadJoin(musicThread, U64_MAX); threadFree(musicThread); }
+	ndspExit();
 }
 
 // ---- traffic -------------------------------------------------------------
@@ -440,7 +773,7 @@ static void addShadow(float x, float z, float hx, float hz, float a) {
 
 // ---- pedestrians -------------------------------------------------------------
 // They walk the sidewalks and wait at the kerb until the cross traffic has a red light.
-typedef struct { int axis, road, side, dir, walk; float s, speed, ph; float shirt[3], pants[3], skin[3]; } Ped;
+typedef struct { int axis, road, side, dir, walk, hp, dead, deadT, panic; float s, speed, ph; float shirt[3], pants[3], skin[3]; } Ped;
 static Ped peds[N_PEDS];
 
 static void initPeds(void) {
@@ -461,26 +794,45 @@ static void initPeds(void) {
 		p->s     = -90.0f + (float)((h >> 12) % 180);
 		p->speed = 0.035f + (float)((h >> 20) % 5) * 0.006f;
 		p->ph    = (float)(h % 100) * 0.1f;
-		p->walk  = 1;
+		p->walk  = 1; p->hp = 4; p->dead = 0; p->deadT = 0; p->panic = 0;
 		const float* c = shirt[(h >> 5) % 6];
 		const float* k = skin[(h >> 14) % 4];
 		for (int q = 0; q < 3; q++) { p->shirt[q] = c[q]; p->skin[q] = k[q]; p->pants[q] = 0.10f + 0.06f * (float)((h >> (16 + q)) & 3); }
 	}
 }
 
+// A killed pedestrian is replaced by a fresh one somewhere else after a few seconds.
+static void respawnPed(Ped* p, int salt) {
+	unsigned h = hash2(salt, 9001 + salt * 7);
+	p->axis = (int)((h >> 11) & 1);
+	p->road = (int)(h % ROADS);
+	p->side = ((h >> 8) & 1) ? 1 : -1;
+	p->dir  = ((h >> 9) & 1) ? 1 : -1;
+	p->s    = -90.0f + (float)((h >> 12) % 180);
+	p->hp = 4; p->dead = 0; p->deadT = 0; p->panic = 0; p->walk = 1;
+}
+
 static void updatePeds(int frame) {
+	static int respawns = 0;
 	for (int i = 0; i < N_PEDS; i++) {
 		Ped* p = &peds[i];
-		int wait = 0;
-		for (int m = 0; m < ROADS; m++) {
-			float gap = (ROAD_C(m) - p->s) * p->dir;
-			if (gap > 2.9f && gap < 3.5f) {
-				int st = (p->axis == 0) ? lightState(m, p->road, 1, frame) : lightState(p->road, m, 0, frame);
-				if (st != 2) wait = 1;
-			}
+		if (p->dead) {
+			if (++p->deadT > 360) respawnPed(p, ++respawns + i);
+			continue;
 		}
+		int wait = 0;
+		if (p->panic <= 0) { // a frightened pedestrian ignores the signals
+			for (int m = 0; m < ROADS; m++) {
+				float gap = (ROAD_C(m) - p->s) * p->dir;
+				if (gap > 2.9f && gap < 3.5f) {
+					int st = (p->axis == 0) ? lightState(m, p->road, 1, frame) : lightState(p->road, m, 0, frame);
+					if (st != 2) wait = 1;
+				}
+			}
+		} else p->panic--;
+		float sp = p->speed * (p->panic > 0 ? 2.4f : 1.0f);
 		p->walk = !wait;
-		if (!wait) { p->s += p->dir * p->speed; p->ph += p->speed * 1.3f + 0.02f; }
+		if (!wait) { p->s += p->dir * sp; p->ph += sp * 1.3f + 0.02f; }
 		if (p->s >  100.0f) p->s = -100.0f;
 		if (p->s < -100.0f) p->s =  100.0f;
 	}
@@ -496,9 +848,18 @@ static void drawPed(const Ped* p) {
 	float x, z;
 	pedPos(p, &x, &z);
 	float mx = (p->axis == 0) ? (float)p->dir : 0.0f, mz = (p->axis == 0) ? 0.0f : (float)p->dir;
-	gPx = x; gPz = z; gFace = atan2f(-mx, -mz); gLean = 0.0f;
-	gBob = p->walk ? fabsf(cosf(p->ph)) * 0.03f : 0.0f;
-	float s = p->walk ? sinf(p->ph) * 0.5f : 0.0f;
+	gPx = x; gPz = z; gFace = atan2f(-mx, -mz);
+	float s;
+	if (p->dead) { // topples over backwards and stays down
+		float fall = (float)p->deadT * 0.09f;
+		gLean = fall < 1.45f ? fall : 1.45f;
+		gBob = 0.15f * (gLean / 1.45f);
+		s = 0.0f;
+	} else {
+		gLean = 0.0f;
+		gBob = p->walk ? fabsf(cosf(p->ph)) * 0.03f : 0.0f;
+		s = p->walk ? sinf(p->ph) * (p->panic > 0 ? 0.8f : 0.5f) : 0.0f;
+	}
 	addPart(-0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f,  s, p->pants[0], p->pants[1], p->pants[2]);
 	addPart( 0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f, -s, p->pants[0], p->pants[1], p->pants[2]);
 	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, p->shirt[0], p->shirt[1], p->shirt[2]);
@@ -579,7 +940,32 @@ static void drawLights(int frame, float night) {
 	GSPGPU_FlushDataCache(&vbo[start], (vcount - start) * sizeof(Vertex));
 }
 
-static void drawPlayer(float px, float pz, float face, float phase, float moveAmt, float phoneE) {
+static void addBillboard(float X, float Y, float Z, float hw, float hh, float rx, float rz,
+                         float r, float g, float b, float a);
+
+// ---- weapons ---------------------------------------------------------------
+typedef struct {
+	const char* name;
+	int startAmmo, pickupAmmo, cooldown, autoFire;
+	float len, thick, r, g, b;
+} WDef;
+enum { WP_FISTS, WP_PISTOL, WP_SMG, WP_SHOTGUN, WP_ROCKET, WP_COUNT };
+static const WDef wdef[WP_COUNT] = {
+	{"FISTS",    0,  0,  0, 0, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f},
+	{"PISTOL",  48, 24, 14, 0, 0.30f, 0.05f, 0.14f, 0.14f, 0.16f},
+	{"SMG",    120, 60,  4, 1, 0.50f, 0.06f, 0.10f, 0.10f, 0.12f},
+	{"SHOTGUN", 16,  8, 38, 0, 0.85f, 0.06f, 0.30f, 0.20f, 0.12f},
+	{"ROCKET",   4,  2, 72, 0, 0.95f, 0.12f, 0.22f, 0.30f, 0.18f}
+};
+static int   ammo[WP_COUNT], curWeapon = WP_PISTOL, fireCool = 0;
+static float kick = 0.0f, shake = 0.0f, recoilAnim = 0.0f;
+static int   hitMark = 0, killMark = 0;
+static int   camStyle = 0; // 0 default, 1 Watch Dogs, 2 first person
+
+static unsigned gRng = 20251018u;
+static float rnd(void) { return nrand(&gRng); }
+
+static void drawPlayer(float px, float pz, float face, float phase, float moveAmt, float phoneE, float aim) {
 	int start = vcount;
 	float walk = moveAmt < 1.0f ? moveAmt : 1.0f;
 	float run  = moveAmt > 1.0f ? moveAmt - 1.0f : 0.0f;
@@ -596,14 +982,336 @@ static void drawPlayer(float px, float pz, float face, float phase, float moveAm
 	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, 0.10f, 0.10f, 0.12f);
 	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.00f, 0.0f, 0.13f, 0.14f, 0.13f, 0.0f, 0.85f, 0.66f, 0.52f);
 	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.14f, -0.02f, 0.15f, 0.05f, 0.16f, 0.0f, 0.08f, 0.08f, 0.09f);
-	// arms: left swings opposite the left leg; right raises the phone when hacking
-	addPart(-0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, -s * 0.9f, 0.10f, 0.10f, 0.12f);
-	float armSwing = s * 0.9f * (1.0f - phoneE) + 1.65f * phoneE;
-	addPart( 0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, armSwing, 0.10f, 0.10f, 0.12f);
+
+	int armed = (curWeapon != WP_FISTS) && phoneE < 0.05f;
+	float lSwing = -s * 0.9f;
+	float rSwing = s * 0.9f * (1.0f - phoneE) + 1.65f * phoneE;
+	if (armed) { // gun low at the hip, raised towards the crosshair while aiming
+		rSwing = 0.35f + (1.55f - 0.35f) * aim + recoilAnim * 0.25f;
+		lSwing = 0.25f + 1.20f * aim;
+	}
+	addPart(-0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, lSwing, 0.10f, 0.10f, 0.12f);
+	addPart( 0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, rSwing, 0.10f, 0.10f, 0.12f);
+	if (armed) {
+		const WDef* w = &wdef[curWeapon];
+		addPart(0.36f, 1.50f, 0.0f, 0.0f, -0.58f - w->len * 0.35f, 0.0f, w->thick * 0.5f, w->len * 0.5f, w->thick * 0.9f,
+		        rSwing, w->r, w->g, w->b);
+	}
 	if (phoneE > 0.05f) // glowing phone in the raised hand
-		addPart(0.36f, 1.50f, 0.0f, 0.0f, -0.66f, 0.0f, 0.07f, 0.03f, 0.11f, armSwing, 0.20f, 0.90f, 1.00f);
+		addPart(0.36f, 1.50f, 0.0f, 0.0f, -0.66f, 0.0f, 0.07f, 0.03f, 0.11f, rSwing, 0.20f, 0.90f, 1.00f);
 
 	GSPGPU_FlushDataCache(&vbo[start], (vcount - start) * sizeof(Vertex));
+}
+
+static void camForward(float yaw, float pitch, float f[3]) {
+	f[0] = -cosf(pitch) * sinf(yaw);
+	f[1] = -sinf(pitch);
+	f[2] = -cosf(pitch) * cosf(yaw);
+}
+
+// First-person view model: the weapon is glued to the camera (lower right of the screen).
+static void drawViewModel(float cx, float cy, float cz, float cyaw, float cpitch) {
+	if (curWeapon == WP_FISTS) return;
+	int start = vcount;
+	const WDef* w = &wdef[curWeapon];
+	float f[3];
+	camForward(cyaw, cpitch, f);
+	float rx = cosf(cyaw), rz = -sinf(cyaw);
+	float ux = -sinf(cpitch) * sinf(cyaw), uy = cosf(cpitch), uz = -sinf(cpitch) * cosf(cyaw);
+	float back = 0.58f - recoilAnim * 0.10f;
+	gPx = cx + f[0] * back + rx * 0.27f - ux * 0.24f;
+	gBob = cy + f[1] * back - uy * 0.24f;
+	gPz = cz + f[2] * back + rz * 0.27f - uz * 0.24f;
+	gFace = cyaw; gLean = -cpitch;
+	addPart(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -w->len * 0.5f, w->thick * 0.5f, w->thick * 0.9f, w->len * 0.5f, 0.0f, w->r, w->g, w->b);
+	addPart(0.0f, 0.0f, 0.0f, 0.0f, -0.09f, 0.02f, 0.05f, 0.08f, 0.05f, 0.0f, 0.85f, 0.66f, 0.52f); // hand on the grip
+	GSPGPU_FlushDataCache(&vbo[start], (vcount - start) * sizeof(Vertex));
+}
+
+// ---- combat ------------------------------------------------------------------
+// Bullets are hitscans along the crosshair ray. A pedestrian dies after 4 hits (a shotgun blast counts as
+// one hit however many pellets land); rocket explosions kill everyone nearby.
+typedef struct { float x, y, z, size, grow, life, maxLife, r, g, b; } Fx;
+#define N_FX 32
+static Fx fxs[N_FX];
+static int fxNext = 0;
+typedef struct { float a[3], b[3]; int life; } Tracer;
+#define N_TR 12
+static Tracer trs[N_TR];
+static int trNext = 0;
+typedef struct { int alive, life; float p[3], v[3]; } Rocket;
+static Rocket rocket;
+
+static void addFx(float x, float y, float z, float size, float grow, float life, float r, float g, float b) {
+	Fx* f = &fxs[fxNext];
+	fxNext = (fxNext + 1) % N_FX;
+	f->x = x; f->y = y; f->z = z; f->size = size; f->grow = grow;
+	f->life = life; f->maxLife = life; f->r = r; f->g = g; f->b = b;
+}
+
+static void addTracer(const float a[3], const float b[3]) {
+	Tracer* t = &trs[trNext];
+	trNext = (trNext + 1) % N_TR;
+	for (int i = 0; i < 3; i++) { t->a[i] = a[i]; t->b[i] = b[i]; }
+	t->life = 4;
+}
+
+static float rayBox(const float o[3], const float d[3], float x0, float y0, float z0, float x1, float y1, float z1) {
+	const float mn[3] = {x0, y0, z0}, mx[3] = {x1, y1, z1};
+	float tmin = 0.0f, tmax = 1e9f;
+	for (int a = 0; a < 3; a++) {
+		if (fabsf(d[a]) < 1e-6f) {
+			if (o[a] < mn[a] || o[a] > mx[a]) return -1.0f;
+		} else {
+			float t1 = (mn[a] - o[a]) / d[a], t2 = (mx[a] - o[a]) / d[a];
+			if (t1 > t2) { float tt = t1; t1 = t2; t2 = tt; }
+			if (t1 > tmin) tmin = t1;
+			if (t2 < tmax) tmax = t2;
+			if (tmin > tmax) return -1.0f;
+		}
+	}
+	return tmin;
+}
+
+static float rayCyl(const float o[3], const float d[3], float cx, float cz, float r, float y0, float y1) {
+	float a = d[0] * d[0] + d[2] * d[2];
+	if (a < 1e-6f) return -1.0f;
+	float ox = o[0] - cx, oz = o[2] - cz;
+	float b = 2.0f * (ox * d[0] + oz * d[2]), c = ox * ox + oz * oz - r * r;
+	float disc = b * b - 4.0f * a * c;
+	if (disc < 0.0f) return -1.0f;
+	float sq = sqrtf(disc), t = (-b - sq) / (2.0f * a);
+	if (t < 0.0f) t = (-b + sq) / (2.0f * a);
+	if (t < 0.0f) return -1.0f;
+	float y = o[1] + d[1] * t;
+	return (y < y0 || y > y1) ? -1.0f : t;
+}
+
+// Distance to the first thing a ray hits (ground, buildings, cars, living pedestrians), up to maxT.
+// *ped is the pedestrian index when one is hit first, otherwise -1.
+static float castRay(const float o[3], const float d[3], float maxT, int* ped) {
+	float best = maxT;
+	*ped = -1;
+	if (d[1] < -1e-4f) {
+		float t = -o[1] / d[1];
+		if (t > 0.0f && t < best) best = t;
+	}
+	for (int i = 0; i < GRID * GRID; i++) {
+		const Building* b = &bldg[i];
+		float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
+		if (t >= 0.0f && t < best) best = t;
+	}
+	for (int i = 0; i < N_CARS; i++) {
+		const Car* c = &cars[i];
+		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float hx = (c->axis == 0) ? 2.1f : 1.0f, hz = (c->axis == 0) ? 1.0f : 2.1f;
+		float cx = (c->axis == 0) ? c->s : lane, cz = (c->axis == 0) ? lane : c->s;
+		float t = rayBox(o, d, cx - hx, 0.15f, cz - hz, cx + hx, 1.66f, cz + hz);
+		if (t >= 0.0f && t < best) best = t;
+	}
+	for (int i = 0; i < N_PEDS; i++) {
+		if (peds[i].dead) continue;
+		float x, z;
+		pedPos(&peds[i], &x, &z);
+		float t = rayCyl(o, d, x, z, 0.45f, 0.0f, 1.8f);
+		if (t >= 0.0f && t < best) { best = t; *ped = i; }
+	}
+	return best;
+}
+
+static void hurtPed(int i, int dmg) {
+	Ped* p = &peds[i];
+	if (p->dead) return;
+	p->hp -= dmg;
+	p->panic = 300;
+	float x, z;
+	pedPos(p, &x, &z);
+	addFx(x, 1.2f, z, 0.45f, 0.02f, 8.0f, 0.8f, 0.05f, 0.05f);
+	if (p->hp <= 0) { p->dead = 1; p->deadT = 0; killMark = 16; }
+	else hitMark = 8;
+	playSfx(SFX_HIT, 0.5f);
+}
+
+static void explode(float x, float y, float z) {
+	addFx(x, y + 0.5f, z, 3.0f, 0.35f, 26.0f, 1.0f, 0.55f, 0.15f);
+	addFx(x, y + 0.8f, z, 2.0f, 0.25f, 20.0f, 1.0f, 0.90f, 0.50f);
+	addFx(x, y + 1.6f, z, 2.5f, 0.12f, 45.0f, 0.25f, 0.25f, 0.25f);
+	float dx = x - gCamX, dz = z - gCamZ, dist = sqrtf(dx * dx + dz * dz);
+	float sh = 1.4f / (1.0f + dist * 0.08f);
+	if (sh > shake) shake = sh;
+	playSfx(SFX_EXPLODE, 1.0f);
+	for (int i = 0; i < N_PEDS; i++) {
+		if (peds[i].dead) continue;
+		float px, pz;
+		pedPos(&peds[i], &px, &pz);
+		float ex = px - x, ey = 0.9f - y, ez = pz - z;
+		if (ex * ex + ey * ey + ez * ez < 7.5f * 7.5f) hurtPed(i, 99);
+	}
+}
+
+static void normalize3(float v[3]) {
+	float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+	if (l < 1e-6f) return;
+	v[0] /= l; v[1] /= l; v[2] /= l;
+}
+
+// One trigger pull. cam/fwd = the crosshair ray, muz = where the barrel is.
+static void fireWeapon(const float cam[3], const float fwd[3], const float muz[3]) {
+	const int w = curWeapon;
+	addFx(muz[0], muz[1], muz[2], 0.32f, 0.0f, 2.0f, 1.0f, 0.85f, 0.4f); // muzzle flash
+	recoilAnim = 1.0f;
+	if (w == WP_ROCKET) {
+		int pi;
+		float t = castRay(cam, fwd, 120.0f, &pi);
+		float P[3] = {cam[0] + fwd[0] * t, cam[1] + fwd[1] * t, cam[2] + fwd[2] * t};
+		float d[3] = {P[0] - muz[0], P[1] - muz[1], P[2] - muz[2]};
+		normalize3(d);
+		rocket.alive = 1; rocket.life = 160;
+		for (int i = 0; i < 3; i++) { rocket.p[i] = muz[i]; rocket.v[i] = d[i] * 1.5f; }
+		playSfx(SFX_ROCKET, 0.9f);
+		kick += 0.07f;
+		return;
+	}
+	int pellets = (w == WP_SHOTGUN) ? 8 : 1;
+	float spread = (w == WP_PISTOL) ? 0.004f : (w == WP_SMG) ? 0.014f : 0.055f;
+	float range = (w == WP_SHOTGUN) ? 35.0f : 90.0f;
+	unsigned hitMask = 0;
+	for (int k = 0; k < pellets; k++) {
+		float d[3] = {fwd[0] + rnd() * spread, fwd[1] + rnd() * spread, fwd[2] + rnd() * spread};
+		normalize3(d);
+		int pi;
+		float t = castRay(cam, d, range, &pi);
+		float P[3] = {cam[0] + d[0] * t, cam[1] + d[1] * t, cam[2] + d[2] * t};
+		if (k < 3) addTracer(muz, P);
+		if (pi >= 0) hitMask |= 1u << pi;
+		else if (t < range - 0.01f) addFx(P[0], P[1], P[2], 0.22f, 0.0f, 5.0f, 1.0f, 0.9f, 0.6f); // impact spark
+	}
+	for (int i = 0; i < N_PEDS; i++) if (hitMask & (1u << i)) hurtPed(i, 1);
+	playSfx(w == WP_PISTOL ? SFX_PISTOL : (w == WP_SMG ? SFX_SMG : SFX_SHOTGUN), w == WP_SMG ? 0.55f : 0.8f);
+	kick += (w == WP_PISTOL) ? 0.012f : (w == WP_SMG) ? 0.008f : 0.05f;
+}
+
+static void updateRocket(void) {
+	if (!rocket.alive) return;
+	float d[3] = {rocket.v[0], rocket.v[1], rocket.v[2]};
+	float spd = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+	normalize3(d);
+	int pi;
+	float t = castRay(rocket.p, d, spd, &pi);
+	if (t < spd - 0.001f || rocket.p[1] < 0.1f || --rocket.life <= 0) {
+		explode(rocket.p[0] + d[0] * t, rocket.p[1] + d[1] * t, rocket.p[2] + d[2] * t);
+		rocket.alive = 0;
+		return;
+	}
+	for (int i = 0; i < 3; i++) rocket.p[i] += rocket.v[i];
+	addFx(rocket.p[0], rocket.p[1], rocket.p[2], 0.28f, 0.03f, 12.0f, 0.55f, 0.55f, 0.55f); // smoke trail
+}
+
+static void updateFx(void) {
+	for (int i = 0; i < N_FX; i++) {
+		if (fxs[i].life <= 0.0f) continue;
+		fxs[i].life -= 1.0f;
+		fxs[i].size += fxs[i].grow;
+	}
+	for (int i = 0; i < N_TR; i++) if (trs[i].life > 0) trs[i].life--;
+	if (hitMark > 0) hitMark--;
+	if (killMark > 0) killMark--;
+	recoilAnim *= 0.82f;
+	kick *= 0.86f;
+	shake *= 0.9f;
+}
+
+// Blended sprites: muzzle flashes, sparks, blood, smoke and explosions.
+static void drawFx(float cyaw) {
+	float rx = cosf(cyaw), rz = -sinf(cyaw);
+	for (int i = 0; i < N_FX; i++) {
+		const Fx* f = &fxs[i];
+		if (f->life <= 0.0f) continue;
+		float a = f->life / f->maxLife;
+		addBillboard(f->x, f->y, f->z, f->size, f->size, rx, rz, f->r, f->g, f->b, a * 0.9f);
+	}
+}
+
+// Bright geometry for the emissive pass: tracer streaks and the rocket body.
+static void drawTracers(void) {
+	for (int i = 0; i < N_TR; i++) {
+		const Tracer* t = &trs[i];
+		if (t->life <= 0) continue;
+		float d[3] = {t->b[0] - t->a[0], t->b[1] - t->a[1], t->b[2] - t->a[2]};
+		float L = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+		if (L < 0.5f) continue;
+		if (L > 70.0f) { // keep long shots short on screen: start the streak near the target
+			for (int k = 0; k < 3; k++) d[k] *= 70.0f / L;
+			L = 70.0f;
+		}
+		for (int k = 0; k < 3; k++) d[k] /= L;
+		float sx = -d[2], sz = d[0], sl = sqrtf(sx * sx + sz * sz);
+		if (sl < 0.01f) { sx = 1.0f; sz = 0.0f; sl = 1.0f; }
+		sx = sx / sl * 0.025f; sz = sz / sl * 0.025f;
+		float ux = d[1] * sz, uy = d[2] * sx - d[0] * sz, uz = -d[1] * sx;
+		float ul = sqrtf(ux * ux + uy * uy + uz * uz);
+		if (ul > 1e-6f) { ux = ux / ul * 0.025f; uy = uy / ul * 0.025f; uz = uz / ul * 0.025f; }
+		float e[3] = {t->a[0] + d[0] * L, t->a[1] + d[1] * L, t->a[2] + d[2] * L};
+		gAlpha = 0.25f + 0.2f * (float)t->life;
+		float a0[3] = {t->a[0] - sx, t->a[1], t->a[2] - sz}, a1[3] = {t->a[0] + sx, t->a[1], t->a[2] + sz};
+		float b1[3] = {e[0] + sx, e[1], e[2] + sz}, b0[3] = {e[0] - sx, e[1], e[2] - sz};
+		quad(a0, a1, b1, b0, 1.0f, 0.9f, 0.55f);
+		float c0[3] = {t->a[0] - ux, t->a[1] - uy, t->a[2] - uz}, c1[3] = {t->a[0] + ux, t->a[1] + uy, t->a[2] + uz};
+		float d1[3] = {e[0] + ux, e[1] + uy, e[2] + uz}, d0[3] = {e[0] - ux, e[1] - uy, e[2] - uz};
+		quad(c0, c1, d1, d0, 1.0f, 0.9f, 0.55f);
+		gAlpha = 1.0f;
+	}
+	if (rocket.alive) {
+		const float* p = rocket.p;
+		addBoxY(p[0] - 0.12f, p[2] - 0.12f, p[0] + 0.12f, p[2] + 0.12f, p[1] - 0.12f, p[1] + 0.12f, 0.35f, 0.35f, 0.30f);
+		addBoxY(p[0] - 0.06f, p[2] - 0.06f, p[0] + 0.06f, p[2] + 0.06f, p[1] - 0.06f, p[1] + 0.06f, 1.0f, 0.6f, 0.2f);
+	}
+}
+
+// ---- ammo crates -----------------------------------------------------------
+typedef struct { float x, z; int active, respawn; } Crate;
+#define N_CRATES 8
+static Crate crates[N_CRATES];
+
+static void initCrates(void) {
+	for (int i = 0; i < N_CRATES; i++) {
+		unsigned h = hash2(i, 4401);
+		float lat = ROAD_C((int)(h % ROADS)) + (((h >> 8) & 1) ? 3.3f : -3.3f);
+		float s = -80.0f + (float)((h >> 12) % 160);
+		crates[i].x = ((h >> 20) & 1) ? lat : s;
+		crates[i].z = ((h >> 20) & 1) ? s : lat;
+		crates[i].active = 1;
+		crates[i].respawn = 0;
+	}
+}
+
+static void updateCrates(float px, float pz) {
+	for (int i = 0; i < N_CRATES; i++) {
+		Crate* c = &crates[i];
+		if (!c->active) {
+			if (--c->respawn <= 0) c->active = 1;
+			continue;
+		}
+		float dx = px - c->x, dz = pz - c->z;
+		if (dx * dx + dz * dz < 1.3f * 1.3f) {
+			c->active = 0; c->respawn = 1800;
+			for (int w = 1; w < WP_COUNT; w++) {
+				ammo[w] += wdef[w].pickupAmmo;
+				if (ammo[w] > 999) ammo[w] = 999;
+			}
+			playSfx(SFX_PICKUP, 0.7f);
+		}
+	}
+}
+
+static void drawCrates(int frame) {
+	for (int i = 0; i < N_CRATES; i++) {
+		const Crate* c = &crates[i];
+		if (!c->active || !inView(c->x, c->z)) continue;
+		float y = 0.55f + 0.10f * sinf((float)frame * 0.07f + (float)i);
+		addBoxY(c->x - 0.25f, c->z - 0.25f, c->x + 0.25f, c->z + 0.25f, y - 0.25f, y + 0.25f, 1.0f, 0.85f, 0.20f);
+		addBoxY(c->x - 0.04f, c->z - 0.04f, c->x + 0.04f, c->z + 0.04f, 0.0f, 3.0f, 1.0f, 0.9f, 0.3f);
+	}
 }
 
 // ---- weather ----------------------------------------------------------------
@@ -731,6 +1439,64 @@ static void drawDroplets(void) {
 	}
 }
 
+// Ambience follows the weather and time of day; occasional car horns and distant sirens.
+static void updateAudio(int inGame, int paused) {
+	static float g = 0.0f;
+	static int hornT = 400, sirenT = 1800;
+	if (!sndOK) return;
+	g += ((inGame ? (paused ? 0.35f : 1.0f) : 0.0f) - g) * 0.05f;
+	ambSetVol(0, 0.30f * g);
+	ambSetVol(1, wRain * 0.50f * g);
+	ambSetVol(2, wNight * 0.30f * g);
+	ambSetVol(3, (1.0f - wNight) * (1.0f - wRain) * (1.0f - 0.5f * wDusk) * 0.26f * g);
+	if (inGame && !paused) {
+		if (--hornT <= 0)  { playSfx(SFX_HORN, 0.16f);  hornT  = 420  + (int)(hash2(hornT, 5) % 900); }
+		if (--sirenT <= 0) { playSfx(SFX_SIREN, 0.20f); sirenT = 2600 + (int)(hash2(sirenT, 9) % 2400); }
+	}
+}
+
+static void addLine2D(float x0, float y0, float x1, float y1, float w, float r, float g, float b, float a) {
+	float dx = x1 - x0, dy = y1 - y0, l = sqrtf(dx * dx + dy * dy);
+	if (l < 0.01f) return;
+	float nx = -dy / l * w * 0.5f, ny = dx / l * w * 0.5f;
+	float p0[3] = {x0 + nx, y0 + ny, 0.0f}, p1[3] = {x1 + nx, y1 + ny, 0.0f};
+	float p2[3] = {x1 - nx, y1 - ny, 0.0f}, p3[3] = {x0 - nx, y0 - ny, 0.0f};
+	gAlpha = a;
+	quad(p0, p1, p2, p3, r, g, b);
+	gAlpha = 1.0f;
+}
+
+// Top-screen overlay in pixel coordinates: crosshair, hit / kill markers, fade-from-black.
+static void drawHud2D(float aim, int armed, float fade) {
+	const float cx = 200.0f, cy = 120.0f;
+	if (armed && aim > 0.05f) {
+		float a = aim * 0.9f, gap = 6.0f + kick * 150.0f;
+		addLine2D(cx - gap - 9.0f, cy, cx - gap, cy, 2.0f, 1.0f, 1.0f, 1.0f, a);
+		addLine2D(cx + gap, cy, cx + gap + 9.0f, cy, 2.0f, 1.0f, 1.0f, 1.0f, a);
+		addLine2D(cx, cy - gap - 9.0f, cx, cy - gap, 2.0f, 1.0f, 1.0f, 1.0f, a);
+		addLine2D(cx, cy + gap, cx, cy + gap + 9.0f, 2.0f, 1.0f, 1.0f, 1.0f, a);
+		addLine2D(cx - 1.0f, cy, cx + 1.0f, cy, 2.0f, 1.0f, 0.3f, 0.3f, a);
+	} else if (armed) {
+		addLine2D(cx - 1.5f, cy, cx + 1.5f, cy, 3.0f, 1.0f, 1.0f, 1.0f, 0.5f);
+	}
+	if (hitMark > 0 || killMark > 0) {
+		int kill = killMark > 0;
+		float a = (float)(kill ? killMark : hitMark) / (kill ? 16.0f : 8.0f);
+		float r = kill ? 1.0f : 1.0f, g = kill ? 0.15f : 1.0f, b = kill ? 0.15f : 1.0f;
+		for (int sx = -1; sx <= 1; sx += 2) {
+			for (int sy = -1; sy <= 1; sy += 2) {
+				addLine2D(cx + sx * 5.0f, cy + sy * 5.0f, cx + sx * 11.0f, cy + sy * 11.0f, 2.0f, r, g, b, a);
+			}
+		}
+	}
+	if (fade > 0.002f) {
+		float p0[3] = {0.0f, 0.0f, 0.0f}, p1[3] = {400.0f, 0.0f, 0.0f}, p2[3] = {400.0f, 240.0f, 0.0f}, p3[3] = {0.0f, 240.0f, 0.0f};
+		gAlpha = fade;
+		quad(p0, p1, p2, p3, 0.0f, 0.0f, 0.0f);
+		gAlpha = 1.0f;
+	}
+}
+
 // ---- bottom screen: street map ----------------------------------------------
 // North is up (-Z). The map scrolls so the player circle always stays in the centre.
 #define MAP_S   3.0f    // pixels per world unit
@@ -755,10 +1521,11 @@ static const char* hoods[4][4] = {
 	{ "West Town",      "Ukrainian Village", "The Loop",     "Grant Park"    }
 };
 
-#define N_MENU_TEXT 15
+#define N_MENU_TEXT 19
 static C2D_TextBuf gStatic, gDyn;
 static C2D_Text vLabel[ROADS], hLabel[ROADS], btnHack, btnBlackout;
-static C2D_Text txtMenu[N_MENU_TEXT], txtActive, txtPaused, txtWeatherT, txtGfxT, txtSub, txtFooter, txtHint;
+static C2D_Text txtMenu[N_MENU_TEXT], txtActive, txtPaused, txtWeatherT, txtGfxT, txtCamT, txtSub, txtFooter, txtHint;
+static C2D_Text txtWp[WP_COUNT], txtWheelT, txtRelease;
 
 static void initMapText(void) {
 	gStatic = C2D_TextBufNew(1024);
@@ -774,11 +1541,12 @@ static void initMapText(void) {
 	C2D_TextParse(&btnBlackout, gStatic, "BLACKOUT");
 	C2D_TextOptimize(&btnBlackout);
 
-	// pause menu labels: main 0-3, weather 4-8, graphics toggles 9-14
+	// pause menu labels: main 0-4, weather 5-9, graphics toggles 10-15, camera styles 16-18
 	static const char* menuNames[N_MENU_TEXT] = {
-		"RESUME", "WEATHER", "GRAPHICS", "TITLE",
+		"RESUME", "WEATHER", "GRAPHICS", "CAMERA", "TITLE",
 		"SUNNY", "RAINY", "SUNSET", "NIGHT", "BACK",
-		"FOG: ON", "FOG: OFF", "WINDOWS: ON", "WINDOWS: OFF", "FPS: ON", "FPS: OFF"
+		"FOG: ON", "FOG: OFF", "WINDOWS: ON", "WINDOWS: OFF", "FPS: ON", "FPS: OFF",
+		"DEFAULT", "WATCH DOGS", "FIRST PERSON"
 	};
 	for (int i = 0; i < N_MENU_TEXT; i++) {
 		C2D_TextParse(&txtMenu[i], gStatic, menuNames[i]);
@@ -788,6 +1556,10 @@ static void initMapText(void) {
 	C2D_TextParse(&txtPaused,   gStatic, "P A U S E D");
 	C2D_TextParse(&txtWeatherT, gStatic, "W E A T H E R");
 	C2D_TextParse(&txtGfxT,     gStatic, "G R A P H I C S");
+	C2D_TextParse(&txtCamT,     gStatic, "C A M E R A");
+	C2D_TextParse(&txtWheelT,   gStatic, "W E A P O N   W H E E L");
+	C2D_TextParse(&txtRelease,  gStatic, "RELEASE X TO EQUIP");
+	for (int i = 0; i < WP_COUNT; i++) { C2D_TextParse(&txtWp[i], gStatic, wdef[i].name); C2D_TextOptimize(&txtWp[i]); }
 	C2D_TextParse(&txtSub,      gStatic, "// CHICAGO GRID NET");
 	C2D_TextParse(&txtFooter,   gStatic, "B: RESUME     A: SELECT     D-PAD: MOVE");
 	C2D_TextParse(&txtHint,     gStatic, "SELECT: PAUSE");
@@ -795,6 +1567,9 @@ static void initMapText(void) {
 	C2D_TextOptimize(&txtPaused);
 	C2D_TextOptimize(&txtWeatherT);
 	C2D_TextOptimize(&txtGfxT);
+	C2D_TextOptimize(&txtCamT);
+	C2D_TextOptimize(&txtWheelT);
+	C2D_TextOptimize(&txtRelease);
 	C2D_TextOptimize(&txtSub);
 	C2D_TextOptimize(&txtFooter);
 	C2D_TextOptimize(&txtHint);
@@ -862,6 +1637,14 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 			C2D_DrawRectSolid(sx - 1.0f, sy - 1.0f, 0.5f, 2.0f, 2.0f, cText);
 	}
 
+	// ammo crates
+	for (int i = 0; i < N_CRATES; i++) {
+		if (!crates[i].active) continue;
+		float sx = MAP_CX + (crates[i].x - px) * MAP_S, sy = MAP_CY + (crates[i].z - pz) * MAP_S;
+		if (sx > 2.0f && sx < 318.0f && sy > 2.0f && sy < MAP_H - 2.0f)
+			C2D_DrawRectSolid(sx - 2.0f, sy - 2.0f, 0.5f, 4.0f, 4.0f, C2D_Color32(0xFF, 0xD8, 0x30, 0xFF));
+	}
+
 	// hacked traffic light marker
 	if (hackTimer > 0) {
 		float sx = MAP_CX + (ROAD_C(hackA) - px) * MAP_S, sy = MAP_CY + (ROAD_C(hackB) - pz) * MAP_S;
@@ -889,6 +1672,19 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 			C2D_DrawRectSolid(3.0f, sy - h * 0.5f - 1.0f, 0.5f, w + 6.0f, h + 2.0f, cPill);
 			C2D_DrawText(&hLabel[k], C2D_WithColor, 6.0f, sy - h * 0.5f, 0.5f, 0.38f, 0.38f, cText);
 		}
+	}
+
+	// current weapon and ammo
+	if (curWeapon != WP_FISTS) {
+		char ab[16];
+		C2D_Text ta;
+		snprintf(ab, sizeof ab, "%d", ammo[curWeapon]);
+		C2D_TextParse(&ta, gDyn, ab);
+		C2D_TextOptimize(&ta);
+		C2D_DrawRectSolid(206.0f, 22.0f, 0.5f, 110.0f, 31.0f, cPill);
+		C2D_DrawText(&txtWp[curWeapon], C2D_WithColor, 212.0f, 24.0f, 0.5f, 0.36f, 0.36f, cText);
+		C2D_DrawText(&ta, C2D_WithColor, 212.0f, 34.0f, 0.5f, 0.5f, 0.5f,
+		             ammo[curWeapon] > 0 ? cText : C2D_Color32(0xFF, 0x50, 0x50, 0xFF));
 	}
 
 	// pause hint
@@ -966,10 +1762,19 @@ static void drawTitleBottom(int frame) {
 	drawCentered(&t4, 160.0f, 214.0f, 0.4f, C2D_Color32(0x6b, 0x73, 0x8c, 0xFF));
 }
 
+// ---- weapon wheel (bottom screen, hold X) -----------------------------------
+#define WH_W 76.0f
+#define WH_H 36.0f
+static void wheelTile(int i, float* x, float* y) {
+	float a = (-90.0f + 72.0f * (float)i) * 0.0174533f;
+	*x = 160.0f + 78.0f * cosf(a);
+	*y = 112.0f + 78.0f * sinf(a);
+}
+
 // ---- pause menu (bottom screen only) ------------------------------------------
 // Menus: 0 main (RESUME, WEATHER, GRAPHICS, TITLE), 1 weather (SUNNY, RAINY, SUNSET, NIGHT, BACK),
 // 2 graphics (FOG, WINDOWS, FPS, BACK). B always resumes.
-static int menuCount(int state) { return state == 1 ? 5 : 4; }
+static int menuCount(int state) { return (state == 0 || state == 1) ? 5 : 4; }
 
 static void menuRect(int state, int i, float* y0, float* h) {
 	float sp = (menuCount(state) <= 4) ? 36.0f : 30.0f;
@@ -978,12 +1783,15 @@ static void menuRect(int state, int i, float* y0, float* h) {
 }
 
 static const C2D_Text* menuText(int state, int i) {
-	if (state == 0) return &txtMenu[i];
-	if (state == 1) return &txtMenu[4 + i];
-	if (i == 0) return gFog ? &txtMenu[9]  : &txtMenu[10];
-	if (i == 1) return gWin ? &txtMenu[11] : &txtMenu[12];
-	if (i == 2) return gFps ? &txtMenu[13] : &txtMenu[14];
-	return &txtMenu[8];
+	if (state == 0) return &txtMenu[i];                 // RESUME WEATHER GRAPHICS CAMERA TITLE
+	if (state == 1) return &txtMenu[5 + i];             // SUNNY RAINY SUNSET NIGHT BACK
+	if (state == 2) {
+		if (i == 0) return gFog ? &txtMenu[10] : &txtMenu[11];
+		if (i == 1) return gWin ? &txtMenu[12] : &txtMenu[13];
+		if (i == 2) return gFps ? &txtMenu[14] : &txtMenu[15];
+		return &txtMenu[9];
+	}
+	return i < 3 ? &txtMenu[16 + i] : &txtMenu[9];      // DEFAULT WATCH DOGS FIRST PERSON BACK
 }
 
 static u32 neon(int r, int g, int b, float a) {
@@ -1018,7 +1826,7 @@ static void drawPause(float dim, int state, int sel, int active, int frame) {
 	brackets(8.0f, 8.0f, 304.0f, 224.0f, 20.0f, 2.0f, neon(0, 229, 255, 0.95f * dim));
 	brackets(14.0f, 14.0f, 292.0f, 212.0f, 8.0f, 1.0f, neon(255, 46, 209, 0.7f * dim));
 
-	drawCentered(state == 0 ? &txtPaused : (state == 1 ? &txtWeatherT : &txtGfxT), 160.0f, 20.0f, 0.8f, neon(0, 229, 255, dim));
+	drawCentered(state == 0 ? &txtPaused : (state == 1 ? &txtWeatherT : (state == 2 ? &txtGfxT : &txtCamT)), 160.0f, 20.0f, 0.8f, neon(0, 229, 255, dim));
 	C2D_DrawRectSolid(50.0f, 52.0f, 0.5f, 220.0f, 1.0f, neon(0, 229, 255, 0.6f * dim));
 	C2D_DrawRectSolid(50.0f, 51.0f, 0.5f, 44.0f, 3.0f, neon(255, 46, 209, 0.9f * dim));
 	if (state == 0) drawCentered(&txtSub, 160.0f, 55.0f, 0.30f, neon(255, 46, 209, 0.9f * dim));
@@ -1041,7 +1849,7 @@ static void drawPause(float dim, int state, int sel, int active, int frame) {
 		C2D_DrawText(t, C2D_WithColor, x0 + 20.0f, y0 + (h - th) * 0.5f, 0.5f, 0.55f, 0.55f,
 		             on ? neon(255, 255, 255, dim) : neon(120, 220, 235, 0.9f * dim));
 
-		if (state == 1 && i < 4 && i == active) { // current weather tag
+		if (((state == 1 && i < 4) || (state == 3 && i < 3)) && i == active) { // current weather / camera tag
 			float aw, ah;
 			C2D_TextGetDimensions(&txtActive, 0.38f, 0.38f, &aw, &ah);
 			C2D_DrawText(&txtActive, C2D_WithColor, x0 + w - aw - 12.0f, y0 + (h - ah) * 0.5f, 0.5f, 0.38f, 0.38f,
@@ -1049,6 +1857,119 @@ static void drawPause(float dim, int state, int sel, int active, int frame) {
 		}
 	}
 	drawCentered(&txtFooter, 160.0f, 213.0f, 0.34f, neon(120, 220, 235, 0.85f * dim));
+}
+
+static void drawWheel(float amt, int sel, int cur, int frame) {
+	if (amt < 0.01f) return;
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, 240.0f, neon(2, 6, 14, 0.82f * amt));
+	for (float y = 2.0f; y < 240.0f; y += 6.0f)
+		C2D_DrawRectSolid(0.0f, y, 0.5f, 320.0f, 1.0f, neon(0, 229, 255, 0.05f * amt));
+	drawCentered(&txtWheelT, 160.0f, 1.0f, 0.34f, neon(0, 229, 255, amt));
+	float pulse = 0.5f + 0.5f * sinf((float)frame * 0.12f);
+	for (int i = 0; i < WP_COUNT; i++) {
+		float x, y;
+		wheelTile(i, &x, &y);
+		float x0 = x - WH_W * 0.5f, y0 = y - WH_H * 0.5f;
+		int on = (i == sel);
+		C2D_DrawRectSolid(x0, y0, 0.5f, WH_W, WH_H, on ? neon(0, 229, 255, (0.22f + 0.08f * pulse) * amt) : neon(8, 24, 40, 0.88f * amt));
+		frameRect(x0, y0, WH_W, WH_H, 1.0f, on ? neon(0, 229, 255, amt) : neon(0, 150, 180, 0.6f * amt));
+		if (i == cur) C2D_DrawRectSolid(x0, y0, 0.5f, 4.0f, WH_H, neon(255, 46, 209, amt));
+		C2D_DrawText(&txtWp[i], C2D_WithColor, x0 + 8.0f, y0 + 3.0f, 0.5f, 0.38f, 0.38f,
+		             on ? neon(255, 255, 255, amt) : neon(120, 220, 235, 0.9f * amt));
+		char ab[16];
+		C2D_Text ta;
+		if (i == WP_FISTS) snprintf(ab, sizeof ab, "-"); else snprintf(ab, sizeof ab, "%d", ammo[i]);
+		C2D_TextParse(&ta, gDyn, ab);
+		C2D_TextOptimize(&ta);
+		C2D_DrawText(&ta, C2D_WithColor, x0 + 8.0f, y0 + 15.0f, 0.5f, 0.52f, 0.52f,
+		             (i != WP_FISTS && ammo[i] == 0) ? neon(255, 80, 80, amt) : neon(255, 255, 255, 0.95f * amt));
+	}
+	drawCentered(&txtRelease, 160.0f, 104.0f, 0.30f, neon(255, 46, 209, 0.9f * amt));
+}
+
+// ---- boot: developer logo sequence ---------------------------------------------
+// Each logo fades in, holds, then fades slowly to black before the next one. These are original
+// placeholder studios - change the names / tag lines below to your own. A or START skips.
+#define LOGO_COUNT 3
+static const char* logoName[LOGO_COUNT] = {"NORTHBRANCH GAMES", "GRIDLINE STUDIOS", "CHICAGO 3DS"};
+static const char* logoTag[LOGO_COUNT]  = {"DEVELOPER", "TECHNOLOGY", "A HOMEBREW PRODUCTION"};
+
+static float smooth01(float x) {
+	x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+	return x * x * (3.0f - 2.0f * x);
+}
+
+static void drawEmblem(int idx, float cx, float cy, float a) {
+	if (idx == 0) { // ring with a diagonal slash
+		C2D_DrawCircleSolid(cx, cy, 0.5f, 36.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a));
+		C2D_DrawCircleSolid(cx, cy, 0.5f, 28.0f, C2D_Color32f(0.0f, 0.0f, 0.0f, 1.0f));
+		C2D_DrawTriangle(cx - 26.0f, cy + 22.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a),
+		                 cx - 14.0f, cy + 30.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a),
+		                 cx + 26.0f, cy - 22.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a), 0.5f);
+		C2D_DrawTriangle(cx + 26.0f, cy - 22.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a),
+		                 cx + 14.0f, cy - 30.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a),
+		                 cx - 14.0f, cy + 30.0f, C2D_Color32f(0.95f, 0.45f, 0.15f, a), 0.5f);
+	} else if (idx == 1) { // 3x3 grid
+		for (int r = 0; r < 3; r++)
+			for (int c = 0; c < 3; c++) {
+				float k = ((r + c) % 2) ? 1.0f : 0.55f;
+				C2D_DrawRectSolid(cx - 33.0f + c * 24.0f, cy - 33.0f + r * 24.0f, 0.5f, 18.0f, 18.0f,
+				                  C2D_Color32f(0.25f * k, 0.75f * k, 0.95f * k, a));
+			}
+	} else { // skyline
+		static const float hgt[7] = {26.0f, 44.0f, 34.0f, 62.0f, 40.0f, 50.0f, 24.0f};
+		for (int i = 0; i < 7; i++)
+			C2D_DrawRectSolid(cx - 42.0f + i * 12.5f, cy + 32.0f - hgt[i], 0.5f, 10.0f, hgt[i], C2D_Color32f(0.85f, 0.88f, 0.95f, a));
+	}
+}
+
+static void runSplash(C3D_RenderTarget* top, C3D_RenderTarget* bottom) {
+	const float T_IN = 0.9f, T_HOLD = 1.7f, T_OUT = 1.1f, T_GAP = 0.5f, T_LOGO = T_IN + T_HOLD + T_OUT + T_GAP;
+	C2D_TextBuf tb = C2D_TextBufNew(512);
+	u64 t0 = osGetTime();
+	while (aptMainLoop()) {
+		hidScanInput();
+		if (hidKeysDown() & (KEY_A | KEY_START)) break;
+		float el = (float)(osGetTime() - t0) / 1000.0f;
+		int idx = (int)(el / T_LOGO);
+		if (idx >= LOGO_COUNT) break;
+		float lt = el - (float)idx * T_LOGO;
+		float a = lt < T_IN ? smooth01(lt / T_IN)
+		        : lt < T_IN + T_HOLD ? 1.0f
+		        : lt < T_IN + T_HOLD + T_OUT ? 1.0f - smooth01((lt - T_IN - T_HOLD) / T_OUT) : 0.0f;
+		u8 a8 = (u8)(a * 255.0f);
+
+		C2D_TextBufClear(tb);
+		C2D_Text tn, tt, tl, th;
+		char dots[24];
+		int nd = (int)(el * 2.5f) % 4;
+		snprintf(dots, sizeof dots, "LOADING%.*s", nd, "...");
+		C2D_TextParse(&tn, tb, logoName[idx]);
+		C2D_TextParse(&tt, tb, logoTag[idx]);
+		C2D_TextParse(&tl, tb, dots);
+		C2D_TextParse(&th, tb, "A / START: SKIP");
+		C2D_TextOptimize(&tn); C2D_TextOptimize(&tt); C2D_TextOptimize(&tl); C2D_TextOptimize(&th);
+
+		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+		C2D_Prepare();
+		C2D_TargetClear(top, C2D_Color32(0, 0, 0, 0xFF));
+		C2D_SceneBegin(top);
+		drawEmblem(idx, 200.0f, 84.0f, a);
+		drawCentered(&tn, 200.0f, 132.0f, 0.85f, C2D_Color32(255, 255, 255, a8));
+		drawCentered(&tt, 200.0f, 170.0f, 0.42f, C2D_Color32(150, 160, 185, a8));
+
+		C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 0xFF));
+		C2D_SceneBegin(bottom);
+		float frac = el / ((float)LOGO_COUNT * T_LOGO);
+		if (frac > 1.0f) frac = 1.0f;
+		C2D_DrawRectSolid(60.0f, 122.0f, 0.5f, 200.0f, 4.0f, C2D_Color32(40, 44, 56, 0xFF));
+		C2D_DrawRectSolid(60.0f, 122.0f, 0.5f, 200.0f * frac, 4.0f, C2D_Color32(0, 229, 255, 0xFF));
+		drawCentered(&tl, 160.0f, 96.0f, 0.5f, C2D_Color32(200, 210, 230, 0xFF));
+		drawCentered(&th, 160.0f, 214.0f, 0.34f, C2D_Color32(90, 96, 112, 0xFF));
+		C2D_Flush();
+		C3D_FrameEnd(0);
+	}
+	C2D_TextBufDelete(tb);
 }
 
 static void envPlain(void) {
@@ -1069,9 +1990,21 @@ static void drawRange(int first, int count) {
 	if (count > 0) C3D_DrawArrays(GPU_TRIANGLES, first, count);
 }
 
+// Draws the visible districts; neighbouring visible districts are merged into one draw call.
+static void drawCells(const int* st, const int* cnt, const unsigned char* vis) {
+	int rs = 0, rc = 0;
+	for (int c = 0; c < CELLS; c++) {
+		if (!vis[c] || cnt[c] == 0) continue;
+		if (rc > 0 && rs + rc == st[c]) rc += cnt[c];
+		else { drawRange(rs, rc); rs = st[c]; rc = cnt[c]; }
+	}
+	drawRange(rs, rc);
+}
+
 int main(int argc, char** argv) {
 	gfxInitDefault();
 	osSetSpeedupEnable(true); // New 3DS: 804 MHz CPU + extra cache (ignored on an Old 3DS)
+	romfsInit();              // title music lives in romfs:/title.pcm
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
 	C2D_Prepare();
@@ -1109,28 +2042,36 @@ int main(int argc, char** argv) {
 	GSPGPU_FlushDataCache(vbo, staticCount * sizeof(Vertex));
 	initCars();
 	initPeds();
+	initCrates();
+	for (int w = 0; w < WP_COUNT; w++) ammo[w] = wdef[w].startAmmo;
+	initAudio();
 
 	C3D_BufInfo buf;
 	BufInfo_Init(&buf);
 	BufInfo_Add(&buf, vbo, sizeof(Vertex), 3, 0x210);
 
 	C3D_Mtx proj, ortho, ident;
-	Mtx_PerspTilt(&proj, C3D_AngleFromDegrees(65.0f), C3D_AspectRatioTop, 0.2f, 400.0f, false);
-	Mtx_OrthoTilt(&ortho, 0.0f, 400.0f, 240.0f, 0.0f, 1.0f, -1.0f, true); // lens droplets, pixel coordinates
+	Mtx_OrthoTilt(&ortho, 0.0f, 400.0f, 240.0f, 0.0f, 1.0f, -1.0f, true); // lens droplets, HUD: pixel coordinates
 	Mtx_Identity(&ident);
+
+	runSplash(top, bottom); // developer logos, each fading to black
 
 	// start on a road intersection
 	float px = 0.0f, pz = 0.0f, yaw = 0.0f, pitch = 0.3f;
 	int   hackFrames = 0, frame = 0;
 	int   title = 1;
+	float titleFade = 0.0f; // title screen fades in from black
 	float orbit = 0.0f;
 	float face = 0.0f, phase = 0.0f, moveAmt = 0.0f; // character heading, step cycle, 0 idle / 1 walk / 2 run
 	int   phoneTimer = 0, pending = 0;               // phone animation frames left, queued hack (1 lights, 2 blackout)
 	int   lastTouchX = -1, lastTouchY = -1;
 	int   paused = 0, menuState = 0, sel = 0, sim = 0; // pause menu; sim = simulation clock (stops while paused)
 	float pauseDim = 0.0f;
+	float aimAmt = 0.0f, wheelAmt = 0.0f;              // aim camera blend, weapon wheel fade
+	int   wheelSel = curWeapon, wheelWas = 0, lastStep = 0;
 	int   fpsFrames = 0;
 	u64   fpsT0 = osGetTime();
+	musicWant = 1;                                     // title music starts now
 
 	while (aptMainLoop()) {
 		hidScanInput();
@@ -1146,10 +2087,10 @@ int main(int argc, char** argv) {
 
 		if (title) {
 			if (down & (KEY_A | KEY_TOUCH)) {
-				title = 0;
+				title = 0; musicWant = 0; // the music fades out, the city ambience fades in
 				px = 0.0f; pz = 0.0f; yaw = 0.0f; pitch = 0.3f;
 				face = 0.0f; phoneTimer = 0; pending = 0;
-				hackFrames = 0; frame = 0;
+				hackFrames = 0; frame = 0; aimAmt = 0.0f;
 			}
 			held = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; // ignore game input on the title screen
 		}
@@ -1176,15 +2117,19 @@ int main(int argc, char** argv) {
 					if (sel == 0)      paused = 0;
 					else if (sel == 1) { menuState = 1; sel = weather; }
 					else if (sel == 2) { menuState = 2; sel = 0; }
-					else               { title = 1; paused = 0; menuState = 0; } // TITLE
+					else if (sel == 3) { menuState = 3; sel = camStyle; }
+					else { title = 1; paused = 0; menuState = 0; musicWant = 1; titleFade = 0.0f; wheelAmt = 0.0f; } // TITLE
 				} else if (menuState == 1) {
 					if (sel < 4) weather = sel;                  // SUNNY / RAINY / SUNSET / NIGHT
 					else         { menuState = 0; sel = 1; }     // BACK
-				} else {
+				} else if (menuState == 2) {
 					if (sel == 0)      gFog = !gFog;
 					else if (sel == 1) { if (texOK) gWin = !gWin; }
 					else if (sel == 2) gFps = !gFps;
 					else               { menuState = 0; sel = 2; } // BACK
+				} else {
+					if (sel < 3) camStyle = sel;                 // DEFAULT / WATCH DOGS / FIRST PERSON
+					else         { menuState = 0; sel = 3; }     // BACK
 				}
 			}
 			held = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; // game input is frozen while paused
@@ -1192,16 +2137,56 @@ int main(int argc, char** argv) {
 		pauseDim += ((paused ? 1.0f : 0.0f) - pauseDim) * 0.25f;
 		if (pauseDim < 0.01f) pauseDim = 0.0f;
 		updateWeather();
+		updateAudio(!title, paused);
+		if (title) titleFade += (1.0f - titleFade) * 0.04f;
 
-		if (held & KEY_L) yaw += 0.04f;
-		if (held & KEY_R) yaw -= 0.04f;
-		if (held & KEY_DUP)   pitch -= 0.03f;
-		if (held & KEY_DDOWN) pitch += 0.03f;
-		if (abs(cs.dx) > 15) yaw   -= cs.dx / 156.0f * 0.05f;
-		if (abs(cs.dy) > 15) pitch -= cs.dy / 156.0f * 0.04f;
+		if (!title && !paused && (down & KEY_Y)) camStyle = (camStyle + 1) % 3; // quick camera switch
+
+		// weapon wheel: hold X, pick with the Circle Pad or by touch, release to equip
+		int wheelOpen = (!title && !paused && (held & KEY_X)) ? 1 : 0;
+		if (wheelOpen && !wheelWas) wheelSel = curWeapon;
+		if (!wheelOpen && wheelWas && wheelSel != curWeapon) {
+			curWeapon = wheelSel; fireCool = 12;
+			playSfx(SFX_SWITCH, 0.6f);
+		}
+		wheelWas = wheelOpen;
+		wheelAmt += ((wheelOpen ? 1.0f : 0.0f) - wheelAmt) * 0.3f;
+		if (wheelAmt < 0.01f) wheelAmt = 0.0f;
+		if (wheelOpen) {
+			float mx = (float)cp.dx, my = -(float)cp.dy; // screen coordinates, y down
+			if (mx * mx + my * my > 55.0f * 55.0f) {
+				float bd = -1e9f;
+				for (int i = 0; i < WP_COUNT; i++) {
+					float a = (-90.0f + 72.0f * (float)i) * 0.0174533f, dd = mx * cosf(a) + my * sinf(a);
+					if (dd > bd) { bd = dd; wheelSel = i; }
+				}
+			}
+			if (down & KEY_TOUCH) {
+				for (int i = 0; i < WP_COUNT; i++) {
+					float x, y;
+					wheelTile(i, &x, &y);
+					if (fabsf((float)tp.px - x) < WH_W * 0.5f && fabsf((float)tp.py - y) < WH_H * 0.5f) wheelSel = i;
+				}
+			}
+			cp.dx = 0; cp.dy = 0; // the stick picks a weapon instead of moving the character
+		}
+
+		// aiming: hold L / ZL, or just fire - the camera goes over the shoulder and the crosshair appears
+		int armed = (curWeapon != WP_FISTS);
+		int wantAim = (!title && !paused && !wheelOpen && armed && (held & (KEY_L | KEY_ZL | KEY_R | KEY_ZR))) ? 1 : 0;
+		aimAmt += ((wantAim ? 1.0f : 0.0f) - aimAmt) * 0.22f;
+		if (aimAmt < 0.01f) aimAmt = 0.0f;
+		float lookScale = 1.0f - 0.45f * aimAmt;
+
+		if (held & KEY_DLEFT)  yaw += 0.04f * lookScale;
+		if (held & KEY_DRIGHT) yaw -= 0.04f * lookScale;
+		if (held & KEY_DUP)    pitch -= 0.03f * lookScale;
+		if (held & KEY_DDOWN)  pitch += 0.03f * lookScale;
+		if (abs(cs.dx) > 15) yaw   -= cs.dx / 156.0f * 0.05f * lookScale;
+		if (abs(cs.dy) > 15) pitch -= cs.dy / 156.0f * 0.04f * lookScale;
 
 		// touch: bottom strip = HACK button, elsewhere = drag to look
-		if (held & KEY_TOUCH) {
+		if ((held & KEY_TOUCH) && !wheelOpen) {
 			if (tp.py >= BTN_Y0) {
 				if (down & KEY_TOUCH) {
 					if (phoneTimer == 0 && tp.py < BTN_Y1) {
@@ -1210,15 +2195,16 @@ int main(int argc, char** argv) {
 					}
 				}
 			} else if (lastTouchX >= 0) {
-				yaw   -= (tp.px - lastTouchX) * 0.01f;
-				pitch += (tp.py - lastTouchY) * 0.01f;
+				yaw   -= (tp.px - lastTouchX) * 0.01f * lookScale;
+				pitch += (tp.py - lastTouchY) * 0.01f * lookScale;
 			}
 			lastTouchX = tp.px; lastTouchY = tp.py;
 		} else {
 			lastTouchX = lastTouchY = -1;
 		}
-		if (pitch >  1.2f) pitch =  1.2f;
-		if (pitch < -0.25f) pitch = -0.25f;
+		float pMin = (camStyle == 2) ? -1.3f : -0.3f, pMax = (camStyle == 2) ? 1.3f : 1.2f;
+		if (pitch > pMax) pitch = pMax;
+		if (pitch < pMin) pitch = pMin;
 
 		float fx = (cp.dy / 156.0f), sx = (cp.dx / 156.0f);
 		if (fabsf(fx) < 0.1f) fx = 0;
@@ -1226,8 +2212,9 @@ int main(int argc, char** argv) {
 		float len = sqrtf(fx * fx + sx * sx);
 		if (len > 1.0f) { fx /= len; sx /= len; len = 1.0f; }
 		if (phoneTimer > 0) { fx = 0.0f; sx = 0.0f; len = 0.0f; } // standing still while on the phone
-		int running = (held & KEY_B) && len > 0.5f;
-		float speed = running ? 0.17f : 0.07f;
+		int aimFace = (aimAmt > 0.5f) || (camStyle == 2);        // aiming / first person: body follows the camera
+		int running = (held & KEY_B) && len > 0.5f && aimAmt < 0.3f;
+		float speed = running ? 0.17f : (aimAmt > 0.3f ? 0.045f : 0.07f);
 		float dirx = -sinf(yaw), dirz = -cosf(yaw);
 		float rgtx =  cosf(yaw), rgtz = -sinf(yaw);
 		float nx = px + (dirx * fx + rgtx * sx) * speed;
@@ -1236,13 +2223,22 @@ int main(int argc, char** argv) {
 		if (!blocked(px, nz)) pz = nz;
 
 		// walking / running animation state
-		if (len > 0.0f) {
+		if (aimFace) {
+			float dlt = yaw - face;
+			while (dlt >  3.14159f) dlt -= 6.28318f;
+			while (dlt < -3.14159f) dlt += 6.28318f;
+			face += (camStyle == 2) ? dlt : dlt * 0.35f;
+		} else if (len > 0.0f) {
 			float mx = dirx * fx + rgtx * sx, mz = dirz * fx + rgtz * sx;
 			float dlt = atan2f(-mx, -mz) - face;
 			while (dlt >  3.14159f) dlt -= 6.28318f;
 			while (dlt < -3.14159f) dlt += 6.28318f;
-			face  += dlt * 0.25f;
+			face += dlt * 0.25f;
+		}
+		if (len > 0.0f) {
 			phase += speed * 0.6f + 0.06f;
+			int stepNo = (int)floorf(phase / 3.14159f);
+			if (stepNo != lastStep) { lastStep = stepNo; playSfx(SFX_STEP, running ? 0.35f : 0.20f); }
 		}
 		moveAmt += ((len > 0.0f ? (running ? 2.0f : 1.0f) : 0.0f) - moveAmt) * 0.15f;
 
@@ -1267,26 +2263,32 @@ int main(int argc, char** argv) {
 
 		if (!paused) {
 			if (hackFrames > 0) hackFrames--;
-			updateCars(sim, title ? 1e6f : px, title ? 1e6f : pz);
-			updatePeds(sim);
+			if (!wheelOpen || (sim & 3) == 0) { // the world slows to a crawl while the wheel is open
+				updateCars(sim, title ? 1e6f : px, title ? 1e6f : pz);
+				updatePeds(sim);
+			}
 			sim++;
 		}
 
-		C3D_Mtx mv;
-		Mtx_Identity(&mv);
-		float cyaw = yaw, cpitch = pitch;
+		// ---- camera ----
+		static const float baseDist[3] = {6.5f, 3.9f, 0.0f}, aimDist[3] = {2.8f, 2.4f, 0.0f};
+		static const float baseSh[3]   = {0.0f, 0.75f, 0.0f}, aimSh[3]   = {0.8f, 0.95f, 0.0f};
+		static const float baseH[3]    = {1.6f, 1.9f, 1.65f},  aimH[3]    = {1.75f, 1.85f, 1.65f};
+		float cyaw = yaw, cpitch = pitch - kick;
 		float cx, cy, cz;
-		{ // third-person camera orbiting the character's head
-			float dist = 6.5f, flat = cosf(pitch);
-			while (dist > 1.5f) { // pull in if the camera would end up inside a building
-				cx = px + flat * sinf(yaw) * dist;
-				cz = pz + flat * cosf(yaw) * dist;
-				if (!blocked(cx, cz)) break;
-				dist -= 0.5f;
+		{
+			float dist0 = baseDist[camStyle] + (aimDist[camStyle] - baseDist[camStyle]) * aimAmt;
+			float sh    = baseSh[camStyle]   + (aimSh[camStyle]   - baseSh[camStyle])   * aimAmt;
+			float hh    = baseH[camStyle]    + (aimH[camStyle]    - baseH[camStyle])    * aimAmt;
+			float flat = cosf(cpitch), sn = sinf(yaw), cs2 = cosf(yaw), dist = dist0;
+			for (;;) { // pull in if the camera would end up inside a building
+				cx = px + flat * sn * dist + cs2 * sh;
+				cz = pz + flat * cs2 * dist - sn * sh;
+				if (dist <= 1.0f || !blocked(cx, cz)) break;
+				dist -= 0.4f;
 			}
-			cx = px + flat * sinf(yaw) * dist;
-			cz = pz + flat * cosf(yaw) * dist;
-			cy = 1.6f + sinf(pitch) * dist;
+			if (camStyle == 2 || blocked(cx, cz)) { cx = px; cz = pz; dist = 0.0f; }
+			cy = (camStyle == 2) ? 1.62f + fabsf(cosf(phase)) * 0.035f * moveAmt : hh + sinf(cpitch) * dist;
 			if (cy < 0.4f) cy = 0.4f;
 		}
 		if (title) { // slow cinematic orbit around the city
@@ -1294,32 +2296,81 @@ int main(int argc, char** argv) {
 			cyaw = orbit; cpitch = 0.55f; cy = 55.0f;
 			cx = sinf(orbit) * 95.0f; cz = cosf(orbit) * 95.0f;
 		}
+		if (shake > 0.01f) { cx += rnd() * shake * 0.15f; cy += rnd() * shake * 0.15f; cz += rnd() * shake * 0.15f; }
+
+		float fov = ((camStyle == 2) ? 72.0f : 65.0f) - 16.0f * aimAmt;
+		Mtx_PerspTilt(&proj, C3D_AngleFromDegrees(fov), C3D_AspectRatioTop, 0.2f, 400.0f, false);
+		C3D_Mtx mv;
+		Mtx_Identity(&mv);
 		Mtx_RotateX(&mv, cpitch, true);
 		Mtx_RotateY(&mv, -cyaw, true);
 		Mtx_Translate(&mv, -cx, -cy, -cz, true);
 
 		gCamX = cx; gCamZ = cz;
 		gCullR = title ? 400.0f : 140.0f;
+		gFwdX = -sinf(cyaw); gFwdZ = -cosf(cyaw);
+		gCone = !title;
+		unsigned char vis[CELLS]; // which districts the camera can see (the title orbit sees them all)
+		for (int c = 0; c < CELLS; c++) {
+			float dx = ((float)(c & 3) - 1.5f) * 48.0f - cx, dz = ((float)(c >> 2) - 1.5f) * 48.0f - cz;
+			float d = sqrtf(dx * dx + dz * dz), dot = dx * gFwdX + dz * gFwdZ;
+			vis[c] = (title || d < 70.0f || dot + 40.0f > 0.62f * d) ? 1 : 0;
+		}
+
+		// ---- shooting (the crosshair ray starts at the camera; the bullet leaves the barrel) ----
+		if (!title && !paused) {
+			float fwd[3], cam[3] = {cx, cy, cz}, muz[3];
+			camForward(cyaw, cpitch, fwd);
+			if (camStyle == 2) {
+				float rx = cosf(cyaw), rz = -sinf(cyaw);
+				muz[0] = cx + fwd[0] * 0.9f + rx * 0.25f; muz[1] = cy + fwd[1] * 0.9f - 0.2f; muz[2] = cz + fwd[2] * 0.9f + rz * 0.25f;
+			} else {
+				float hx = -sinf(face), hz = -cosf(face), rx = cosf(face), rz = -sinf(face), L = wdef[curWeapon].len;
+				muz[0] = px + hx * (0.6f + L) + rx * 0.36f; muz[1] = 1.2f; muz[2] = pz + hz * (0.6f + L) + rz * 0.36f;
+			}
+			if (fireCool > 0) fireCool--;
+			if (!wheelOpen && phoneTimer == 0 && armed && (held & (KEY_R | KEY_ZR)) && fireCool == 0) {
+				const WDef* w = &wdef[curWeapon];
+				int fresh = (down & (KEY_R | KEY_ZR)) ? 1 : 0;
+				if (w->autoFire || fresh) {
+					if (ammo[curWeapon] > 0) { ammo[curWeapon]--; fireCool = w->cooldown; fireWeapon(cam, fwd, muz); }
+					else if (fresh) { playSfx(SFX_CLICK, 0.6f); fireCool = 10; }
+				}
+			}
+			updateRocket();
+			updateCrates(px, pz);
+			updateFx();
+		}
 
 		// ---- build this frame's dynamic geometry ----
 		drawDynamic();
 		if (!title) {
-			float phoneE = 0.0f; // 0 = phone away, 1 = phone raised (eased)
-			if (phoneTimer > 0) {
-				float up = (120 - phoneTimer) / 25.0f, dn = phoneTimer / 25.0f;
-				phoneE = up < dn ? up : dn;
-				if (phoneE > 1.0f) phoneE = 1.0f;
-				phoneE = phoneE * phoneE * (3.0f - 2.0f * phoneE);
+			if (camStyle == 2) {
+				drawViewModel(cx, cy, cz, cyaw, cpitch);
+			} else {
+				float phoneE = 0.0f; // 0 = phone away, 1 = phone raised (eased)
+				if (phoneTimer > 0) {
+					float up = (120 - phoneTimer) / 25.0f, dn = phoneTimer / 25.0f;
+					phoneE = up < dn ? up : dn;
+					if (phoneE > 1.0f) phoneE = 1.0f;
+					phoneE = phoneE * phoneE * (3.0f - 2.0f * phoneE);
+				}
+				drawPlayer(px, pz, face, phase, moveAmt, phoneE, aimAmt);
 			}
-			drawPlayer(px, pz, face, phase, moveAmt, phoneE);
 		}
-		int litStart = vcount;            // emissive: signal heads, head/tail lights
+		int litStart = vcount;            // emissive: signal heads, lights, ammo crates, tracers, rocket
 		drawLights(sim, wNight);
-		int skyStart = vcount;            // blended: sun / moon / stars, rain
+		drawCrates(sim);
+		drawTracers();
+		GSPGPU_FlushDataCache(&vbo[litStart], (vcount - litStart) * sizeof(Vertex));
+		int skyStart = vcount;            // blended: sun / moon / stars, rain, muzzle flashes, smoke, explosions
 		drawSkyBodies(cx, cy, cz, cyaw);
 		drawRain(cx, cz, cyaw);
-		int dropStart = vcount;           // lens droplets (pixel coordinates, own pass)
+		drawFx(cyaw);
+		int dropStart = vcount;           // lens droplets + HUD (pixel coordinates, own pass)
 		drawDroplets();
+		float fadeA = title ? 1.0f - titleFade : 0.0f;
+		drawHud2D(aimAmt, !title && !paused && armed, fadeA);
 		GSPGPU_FlushDataCache(&vbo[skyStart], (vcount - skyStart) * sizeof(Vertex));
 
 		float t = (hackFrames > 0) ? 0.25f : 1.0f;
@@ -1350,9 +2401,10 @@ int main(int argc, char** argv) {
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uFogClr, fogC[0], fogC[1], fogC[2], 1.0f);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, wTint[0] * t, wTint[1] * t, wTint[2] * t, 1.0f);
 		envPlain();
-		drawRange(0, wallStart);                         // ground, roofs, road markings, skyline
+		drawRange(0, globalEnd);                         // ground + skyline
+		drawCells(cellAStart, cellACount, vis);          // roofs, road markings, crossings, signal poles
 		if (gWin) { envTextured(); C3D_TexBind(0, &texDay); }
-		drawRange(wallStart, wallEnd - wallStart);       // textured facades
+		drawCells(cellWStart, cellWCount, vis);          // textured facades
 		envPlain();
 		drawRange(staticCount, litStart - staticCount);  // shadows, cars, pedestrians, player
 
@@ -1368,19 +2420,19 @@ int main(int argc, char** argv) {
 			C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, glow * t * 1.8f, glow * t * 1.8f, glow * t * 1.8f, 1.0f);
 			envTextured();
 			C3D_TexBind(0, &texNight);
-			drawRange(wallStart, wallEnd - wallStart);
+			drawCells(cellWStart, cellWCount, vis);
 			envPlain();
 			C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
 			               GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
 		}
 
-		// 4) blended sky and rain: depth-tested but not depth-written, no fog
+		// 4) blended sky, rain, flashes and smoke: depth-tested but not depth-written, no fog
 		C3D_DepthTest(true, GPU_GREATER, GPU_WRITE_COLOR);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uFog, 0.0f, 0.0f, 0.0f, 0.0f);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, t, t, t, 1.0f);
 		drawRange(skyStart, dropStart - skyStart);
 
-		// 5) lens droplets, 2D overlay
+		// 5) lens droplets, crosshair and fade, 2D overlay
 		if (vcount > dropStart) {
 			C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
 			C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, uProj, &ortho);
@@ -1397,20 +2449,23 @@ int main(int argc, char** argv) {
 		if (title) drawTitleBottom(frame);
 		else {
 			drawMap(px, pz, frame, phoneTimer, face);
-			drawPause(pauseDim, menuState, sel, weather, frame);
+			drawWheel(wheelAmt, wheelSel, curWeapon, frame);
+			drawPause(pauseDim, menuState, sel, menuState == 3 ? camStyle : weather, frame);
 		}
+		if (fadeA > 0.01f) C2D_DrawRectSolid(0.0f, 0.0f, 0.9f, 320.0f, 240.0f, C2D_Color32(0, 0, 0, (u8)(fadeA * 255.0f)));
 		C2D_Flush();
 		C3D_FrameEnd(0);
 
 		frame++;
 		if (++fpsFrames >= 30) { // frame-rate readout, refreshed twice a second
 			u64 now = osGetTime();
-			if (now > fpsT0) gFpsValue = (int)(30000ULL / (now - fpsT0) + (u64)0);
+			if (now > fpsT0) gFpsValue = (int)(30000ULL / (now - fpsT0));
 			if (gFpsValue > 60) gFpsValue = 60;
 			fpsT0 = now; fpsFrames = 0;
 		}
 	}
 
+	shutdownAudio();
 	if (texOK) { C3D_TexDelete(&texDay); C3D_TexDelete(&texNight); }
 	linearFree(vbo);
 	shaderProgramFree(&program);
@@ -1419,6 +2474,7 @@ int main(int argc, char** argv) {
 	C2D_TextBufDelete(gDyn);
 	C2D_Fini();
 	C3D_Fini();
+	romfsExit();
 	gfxExit();
 	return 0;
 }
