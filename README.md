@@ -20,9 +20,20 @@ A pedestrian goes down after 4 hits (a shotgun blast counts as one hit); rocket 
 crates on the sidewalks refill ammo. Camera styles (CAMERA menu): Default, Watch Dogs (close over-the-shoulder), First Person.
 Touch HACK LIGHTS / BLACKOUT on the bottom screen to use the phone.
 
+## City layout
+The city is 8 x 8 blocks with 40 m between road centre lines (wide streets, wide sidewalks). Each block is a glass tower on a plaza, low-rise brick
+houses with gaps between them, a mid-rise with a car park, a park (grass, paths, pond, trees) or a fountain plaza. Downtown (the Loop) is tallest, Grant
+Park and the lake are on the east side. Block types are chosen in `pickBlock()` and built in `layoutBlock()` in `main.c`.
+
+## Pedestrians
+Each pedestrian gets a random look in `styleNpc()`: 10 skin tones, 9 hair colours, hair styles (short, long, afro, bun, bald), caps, beanies and head
+scarves, 8 outfits (tee, long sleeves, shorts, dress, hoodie, suit, coat, tank), shoes, backpacks / bags, sunglasses, beards, and different heights and builds.
+
 ## Sound and music
 * The title music is `assets/title.mp3`, converted to `romfs/title.pcm` (32 kHz stereo) and streamed from the app's romfs. To use a different
   song, replace `assets/title.mp3` and run `tools/convert_audio.sh` (needs ffmpeg), then rebuild.
+* If `title.pcm` can't be found (romfs or `sdmc:/3ds/Chicago3DS/title.pcm`), a built-in synthesized theme plays instead. The title screen's top line says which
+  one is active, or "NO SOUND" if `dspfirm.cdc` is missing.
 * Gunshots, explosions, footsteps, traffic, rain, crickets, birdsong, horns and sirens are generated in code.
 * Audio needs the DSP firmware dump at `sdmc:/3ds/dspfirm.cdc` (create it once with the DSP1 homebrew). Without it the game runs silently.
 
@@ -47,4 +58,4 @@ The output should be `chicago3ds.3dsx`. Copy it to your SD card and launch it wi
 ## Build with GitHub Actions
 Upload this folder's contents to a GitHub repository, preserving the `.github/workflows/build.yml` path. Push to the repository or open Actions and run **Build 3DSX** manually. Download the `chicago3ds` artifact from the completed workflow run.
 
-Note: this archive has been reorganized to match the existing Makefile. A successful build still needs to be confirmed in a devkitPro environment.
+Note: the latest changes (open city, NPC variety, music fallback) were type-checked and run on a PC, but not compiled with devkitPro or tried on a 3DS. Build with GitHub Actions or locally and check the title screen status line.
