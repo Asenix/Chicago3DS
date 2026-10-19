@@ -19,26 +19,43 @@
 	GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | \
 	GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO))
 
-#define GRID      8
-#define PITCH     24.0f
-#define BLDG_W    16.0f
+#define GRID      8          // 8 x 8 city blocks
+#define ROAD_SP   40.0f      // distance between road centre lines
+#define ROAD_HW   5.5f       // half width of the asphalt
+#define SW_W      2.5f       // sidewalk width
+#define SW_OFF    (ROAD_HW + SW_W * 0.5f) // pedestrians walk this far from the road centre line
+#define XW        (ROAD_HW + 1.2f)        // crosswalks sit this far from the junction centre
+#define LANE      2.8f       // car lane offset from the road centre line
+#define BLK_H     (ROAD_SP * 0.5f - ROAD_HW)  // half size of a block (sidewalk included)
+#define LOT_H     (BLK_H - SW_W)              // half size of the buildable lot
+#define CITY_H    (GRID * ROAD_SP * 0.5f)     // half size of the whole city (160)
+#define ROAD_END  (CITY_H + 10.0f)            // traffic and pedestrians wrap here
 #define FLOOR_H   3.5f
-#define MAX_VERTS 26000
+#define MAX_VERTS 40000
+#define MAX_BLD   420
+#define MAX_PATCH 520
 #define RAIN_N    140
 #define N_DROPS   11
-#define N_CARS    20
-#define N_PEDS    14
+#define N_CARS    22
+#define N_PEDS    20
 #define N_STARS   70
 #define ROADS     7
 #define PLAYER_R  0.6f
 #define TEX_N     128
 
 typedef struct { float pos[3]; float clr[4]; float uv[2]; } Vertex;
-typedef struct { float x0, z0, x1, z1, h; } Building;
+// kind: 0 building, 1 tree, 2 fountain. deco bits: 1 rooftop unit, 2 antenna spire, 4 fountain spout
+typedef struct { float x0, z0, x1, z1, h; int kind, deco; float r, g, b, uo, vo; } Building;
+typedef struct { float x0, z0, x1, z1, y, r, g, b; } Patch;   // flat coloured ground rectangle
 
 static Vertex*  vbo;
 static int      vcount = 0, staticCount = 0, wallStart = 0, wallEnd = 0;
-static Building bldg[GRID * GRID];
+static Building bldg[MAX_BLD];
+static int      nBld = 0;
+static Patch    patch[MAX_PATCH];
+static int      nPatch = 0;
+enum { BT_TOWER, BT_LOW, BT_MID, BT_PARK, BT_PLAZA };
+static int      blkType[GRID][GRID];
 
 // quality switches (pause menu > GRAPHICS)
 static int gFog = 1, gWin = 1, gFps = 1;
@@ -192,8 +209,11 @@ static int initWindowTex(void) {
 }
 
 // ---- city -------------------------------------------------------------------------
-// Roads run along x = ROAD_C(k) and z = ROAD_C(k), k = 0..6. Intersections are (a, b).
-#define ROAD_C(k) (-72.0f + 24.0f * (float)(k))
+// Roads run along x = ROAD_C(k) and z = ROAD_C(k), k = 0..6 (40 m apart). Intersections are (a, b).
+// Between the roads lie 8 x 8 city blocks. Every block is one of: glass tower on a plaza, low-rise
+// brick houses with gaps between them, a mid-rise with a car park, a park (grass, paths, trees, pond)
+// or a fountain plaza - so the streets open up instead of forming one wall of buildings.
+#define ROAD_C(k) (-(float)(ROADS - 1) * 0.5f * ROAD_SP + ROAD_SP * (float)(k))
 
 // Textured facade: 4 walls, tile = 16 m wide x 14 m tall, shifted per building so no two look alike.
 static void wallFace(const float a[3], const float b[3], const float c[3], const float d[3],
@@ -211,92 +231,325 @@ static void addWalls(float x0, float z0, float x1, float z1, float h, float r, f
                      float uo, float vo) {
 	float p000[3] = {x0, 0, z0}, p100[3] = {x1, 0, z0}, p110[3] = {x1, h, z0}, p010[3] = {x0, h, z0};
 	float p001[3] = {x0, 0, z1}, p101[3] = {x1, 0, z1}, p111[3] = {x1, h, z1}, p011[3] = {x0, h, z1};
-	float u = (x1 - x0) / 16.0f, v = h / (4.0f * FLOOR_H);
+	float u = (x1 - x0) / 16.0f, w = (z1 - z0) / 16.0f, v = h / (4.0f * FLOOR_H);
 	wallFace(p000, p100, p110, p010, r * 0.55f, g * 0.55f, b * 0.55f, uo,         uo + u,         vo, vo + v);
 	wallFace(p101, p001, p011, p111, r * 0.78f, g * 0.78f, b * 0.78f, uo + 0.25f, uo + 0.25f + u, vo, vo + v);
-	wallFace(p001, p000, p010, p011, r * 0.60f, g * 0.60f, b * 0.60f, uo + 0.50f, uo + 0.50f + u, vo, vo + v);
-	wallFace(p100, p101, p111, p110, r * 0.88f, g * 0.88f, b * 0.88f, uo + 0.75f, uo + 0.75f + u, vo, vo + v);
+	wallFace(p001, p000, p010, p011, r * 0.60f, g * 0.60f, b * 0.60f, uo + 0.50f, uo + 0.50f + w, vo, vo + v);
+	wallFace(p100, p101, p111, p110, r * 0.88f, g * 0.88f, b * 0.88f, uo + 0.75f, uo + 0.75f + w, vo, vo + v);
 }
 
 #define CELLS 16 // 4x4 districts of 2x2 blocks; each gets its own vertex ranges so it can be skipped when out of view
+#define CELL_W (CITY_H * 0.5f)
 static int cellAStart[CELLS], cellACount[CELLS], cellWStart[CELLS], cellWCount[CELLS];
 static int globalEnd = 0; // ground + skyline, always drawn
 
 static int cellOf(float x, float z) {
-	int ix = (int)floorf((x + 96.0f) / 48.0f), iz = (int)floorf((z + 96.0f) / 48.0f);
+	int ix = (int)floorf((x + CITY_H) / CELL_W), iz = (int)floorf((z + CITY_H) / CELL_W);
 	ix = ix < 0 ? 0 : (ix > 3 ? 3 : ix);
 	iz = iz < 0 ? 0 : (iz > 3 ? 3 : iz);
 	return iz * 4 + ix;
 }
 
-static void buildCity(void) {
-	float ext = GRID * PITCH * 0.5f, G = ext + 300.0f;
-	// asphalt ground, extends far so fog can melt it into the horizon
-	float g0[3] = {-G, 0, -G}, g1[3] = {G, 0, -G}, g2[3] = {G, 0, G}, g3[3] = {-G, 0, G};
-	quad(g0, g3, g2, g1, 0.16f, 0.17f, 0.19f);
+static unsigned lrnd(unsigned* s) { // tiny LCG for layout decisions
+	*s = *s * 1664525u + 1013904223u;
+	return *s >> 8;
+}
 
-	// distant skyline ring (never reachable, heavily fogged)
-	for (int i = 0; i < 48; i++) {
+static void addP(float x0, float z0, float x1, float z1, float y, float r, float g, float b) {
+	if (nPatch >= MAX_PATCH) return;
+	Patch* p = &patch[nPatch++];
+	p->x0 = x0; p->z0 = z0; p->x1 = x1; p->z1 = z1; p->y = y; p->r = r; p->g = g; p->b = b;
+}
+
+static Building* addB(int kind, float x0, float z0, float x1, float z1, float h, float r, float g, float b, unsigned hs) {
+	if (nBld >= MAX_BLD) return NULL;
+	Building* p = &bldg[nBld++];
+	p->x0 = x0; p->z0 = z0; p->x1 = x1; p->z1 = z1; p->h = h; p->kind = kind; p->deco = 0;
+	p->r = r; p->g = g; p->b = b;
+	p->uo = (float)((hs >> 20) & 3) * 0.25f; p->vo = (float)((hs >> 24) & 3) * 0.25f;
+	return p;
+}
+
+static void addTree(float x, float z, unsigned hs) {
+	static const float leaf[4][3] = {{0.16f, 0.42f, 0.18f}, {0.22f, 0.50f, 0.22f}, {0.12f, 0.34f, 0.20f}, {0.30f, 0.52f, 0.20f}};
+	float top = 4.6f + (float)(hs % 25) * 0.1f;
+	int roll = (int)((hs >> 8) % 100);
+	float r, g, b;
+	if (roll < 12)      { r = 0.86f; g = 0.44f; b = 0.12f; } // October: a few orange maples
+	else if (roll < 20) { r = 0.86f; g = 0.72f; b = 0.20f; } // and some yellow ones
+	else { const float* l = leaf[(hs >> 12) & 3]; r = l[0]; g = l[1]; b = l[2]; }
+	Building* t = addB(1, x - 0.3f, z - 0.3f, x + 0.3f, z + 0.3f, top, r, g, b, hs);
+	if (t && ((hs >> 16) & 1)) t->deco = 8; // round (diamond) crown instead of a cone
+}
+
+static float dtFactor(float bx, float bz) { // 1 in the Loop, fading to 0 far away: taller buildings downtown
+	float dx = bx - 40.0f, dz = bz - 100.0f, v = 1.0f - sqrtf(dx * dx + dz * dz) / 170.0f;
+	return v < 0.0f ? 0.0f : v;
+}
+
+static int pickBlock(int i, int j) {
+	float bx = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)i, bz = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)j;
+	int r = (int)(hash2(i * 31 + 7, j * 17 + 3) % 100);
+	if (i >= 6 && j >= 5) return r < 72 ? BT_PARK : BT_PLAZA;           // Grant Park by the lake
+	if (i >= 2 && i <= 3 && j >= 2 && j <= 3 && r < 62) return BT_PARK; // Lincoln Park
+	float dt = dtFactor(bx, bz);
+	if (dt > 0.45f) {                                                    // downtown
+		if (r < 62) return BT_TOWER;
+		if (r < 70) return BT_PLAZA;
+		if (r < 88) return BT_MID;
+		return BT_LOW;
+	}
+	if (r < 16) return BT_PARK;
+	if (r < 24) return BT_PLAZA;
+	if (r < 32) return BT_TOWER;
+	if (r < 54) return BT_MID;
+	return BT_LOW;
+}
+
+static void layoutBlock(int i, int j) {
+	const float bx = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)i, bz = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)j;
+	unsigned st = hash2(i * 131 + 5, j * 71 + 9);
+	const float L = LOT_H;
+	float dt = dtFactor(bx, bz);
+	addP(bx - BLK_H, bz - BLK_H, bx + BLK_H, bz + BLK_H, 0.04f, 0.47f, 0.47f, 0.49f); // sidewalk all around
+	switch (blkType[i][j]) {
+	case BT_TOWER: {
+		static const float glass[5][3] = {{0.55f, 0.68f, 0.84f}, {0.40f, 0.48f, 0.60f}, {0.70f, 0.74f, 0.80f}, {0.36f, 0.46f, 0.58f}, {0.62f, 0.68f, 0.66f}};
+		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.55f, 0.55f, 0.53f);
+		float w = 11.0f + (float)(lrnd(&st) % 5), d = 11.0f + (float)(lrnd(&st) % 5);
+		float ox = ((int)(lrnd(&st) % 5) - 2) * 0.7f, oz = ((int)(lrnd(&st) % 5) - 2) * 0.7f;
+		int nf = 9 + (int)(dt * 16.0f) + (int)(lrnd(&st) % 8);
+		if (nf > 30) nf = 30;
+		const float* c = glass[lrnd(&st) % 5];
+		Building* b = addB(0, bx + ox - w * 0.5f, bz + oz - d * 0.5f, bx + ox + w * 0.5f, bz + oz + d * 0.5f, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
+		if (b) b->deco = 1 | (nf >= 24 ? 2 : 0);
+		for (int k = 0; k < 4; k++)
+			if (lrnd(&st) % 100 < 50)
+				addTree(bx + ((k & 1) ? 10.6f : -10.6f) + (float)((int)(lrnd(&st) % 3) - 1) * 0.4f,
+				        bz + ((k & 2) ? 10.6f : -10.6f) + (float)((int)(lrnd(&st) % 3) - 1) * 0.4f, lrnd(&st));
+		break;
+	}
+	case BT_LOW: {
+		static const float brick[5][3] = {{0.68f, 0.38f, 0.30f}, {0.72f, 0.56f, 0.40f}, {0.60f, 0.54f, 0.50f}, {0.64f, 0.30f, 0.26f}, {0.78f, 0.70f, 0.56f}};
+		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.40f, 0.40f, 0.41f);
+		for (int s = 0; s < 4; s++) {
+			float sx = bx + ((s & 1) ? 6.3f : -6.3f), sz = bz + ((s & 2) ? 6.3f : -6.3f);
+			if (lrnd(&st) % 100 < 78) {
+				float w = 8.0f + (float)(lrnd(&st) % 3), d = 8.0f + (float)(lrnd(&st) % 3);
+				float jx = ((int)(lrnd(&st) % 3) - 1) * 0.5f, jz = ((int)(lrnd(&st) % 3) - 1) * 0.5f;
+				int nf = 2 + (int)(lrnd(&st) % 4) + (int)(dt * 3.0f);
+				const float* c = brick[lrnd(&st) % 5];
+				Building* b = addB(0, sx + jx - w * 0.5f, sz + jz - d * 0.5f, sx + jx + w * 0.5f, sz + jz + d * 0.5f, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
+				if (b && lrnd(&st) % 3 == 0) b->deco = 1;
+			} else {
+				addTree(sx, sz, lrnd(&st));
+			}
+		}
+		break;
+	}
+	case BT_MID: {
+		static const float stone[4][3] = {{0.76f, 0.72f, 0.64f}, {0.66f, 0.62f, 0.58f}, {0.58f, 0.60f, 0.66f}, {0.72f, 0.60f, 0.50f}};
+		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.42f, 0.42f, 0.43f);
+		int horiz = (int)(lrnd(&st) & 1);
+		float len = 20.0f + (float)(lrnd(&st) % 3), dep = 8.0f + (float)(lrnd(&st) % 3);
+		int nf = 4 + (int)(dt * 6.0f) + (int)(lrnd(&st) % 5);
+		const float* c = stone[lrnd(&st) % 4];
+		float sgn = (lrnd(&st) & 1) ? 1.0f : -1.0f;      // which side of the block the building hugs
+		float a0 = sgn * (L - 0.5f), a1 = sgn * (L - 0.5f - dep);
+		float lo = a0 < a1 ? a0 : a1, hi = a0 < a1 ? a1 : a0;
+		Building* b;
+		if (horiz) b = addB(0, bx - len * 0.5f, bz + lo, bx + len * 0.5f, bz + hi, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
+		else       b = addB(0, bx + lo, bz - len * 0.5f, bx + hi, bz + len * 0.5f, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
+		if (b) b->deco = 1;
+		// the other half of the lot: a car park with a few trees
+		float p0 = -sgn * 1.5f, p1 = -sgn * (L - 0.5f);
+		float plo = p0 < p1 ? p0 : p1, phi = p0 < p1 ? p1 : p0;
+		if (horiz) addP(bx - L + 1.0f, bz + plo, bx + L - 1.0f, bz + phi, 0.08f, 0.17f, 0.17f, 0.19f);
+		else       addP(bx + plo, bz - L + 1.0f, bx + phi, bz + L - 1.0f, 0.08f, 0.17f, 0.17f, 0.19f);
+		for (int k = 0; k < 2; k++) {
+			float t = (-6.0f + 12.0f * (float)k), n = -sgn * (L - 1.5f);
+			addTree(horiz ? bx + t : bx + n, horiz ? bz + n : bz + t, lrnd(&st));
+		}
+		break;
+	}
+	case BT_PARK: {
+		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.20f, 0.40f, 0.20f);
+		int pond = (lrnd(&st) % 3 == 0);
+		if (pond) addP(bx - 5.5f, bz - 4.0f, bx + 5.5f, bz + 4.0f, 0.07f, 0.14f, 0.32f, 0.50f);
+		addP(bx - 1.0f, bz - L, bx + 1.0f, bz + L, 0.08f, 0.60f, 0.56f, 0.48f); // paths cross in the middle (a bridge over the pond)
+		addP(bx - L, bz - 1.0f, bx + L, bz + 1.0f, 0.08f, 0.60f, 0.56f, 0.48f);
+		float pvx = 0.0f, pvz = 0.0f;
+		int pav = (lrnd(&st) % 4 == 0 && !pond);
+		if (pav) {
+			pvx = bx + ((lrnd(&st) & 1) ? 7.5f : -7.5f); pvz = bz + ((lrnd(&st) & 1) ? 7.5f : -7.5f);
+			addB(0, pvx - 2.2f, pvz - 2.2f, pvx + 2.2f, pvz + 2.2f, 3.4f, 0.86f, 0.84f, 0.78f, st);
+		}
+		int placed = 0;
+		for (int tries = 0; tries < 40 && placed < 6; tries++) {
+			float x = bx + (float)((int)(lrnd(&st) % 23) - 11), z = bz + (float)((int)(lrnd(&st) % 23) - 11);
+			if (fabsf(x - bx) < 2.8f || fabsf(z - bz) < 2.8f) continue;
+			if (pond && fabsf(x - bx) < 7.0f && fabsf(z - bz) < 5.5f) continue;
+			if (pav && fabsf(x - pvx) < 4.0f && fabsf(z - pvz) < 4.0f) continue;
+			addTree(x, z, lrnd(&st));
+			placed++;
+		}
+		break;
+	}
+	default: { // BT_PLAZA
+		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.62f, 0.60f, 0.56f);
+		addP(bx - 8.0f, bz - 8.0f, bx + 8.0f, bz + 8.0f, 0.07f, 0.50f, 0.48f, 0.46f);
+		Building* f = addB(2, bx - 3.2f, bz - 3.2f, bx + 3.2f, bz + 3.2f, 0.8f, 0.45f, 0.62f, 0.78f, st);
+		if (f) f->deco = 4;
+		for (int k = 0; k < 4; k++)
+			if (k == 0 || k == 3 || (lrnd(&st) & 1))
+				addTree(bx + ((k & 1) ? 10.4f : -10.4f), bz + ((k & 2) ? 10.4f : -10.4f), lrnd(&st));
+		if (lrnd(&st) & 1) addB(0, bx - 2.2f, bz + 8.5f, bx + 2.2f, bz + 11.0f, 3.2f, 0.80f, 0.74f, 0.62f, st); // kiosk
+		break;
+	}
+	}
+}
+
+// Thin post drawn as two crossed quads (12 vertices instead of a 30-vertex box).
+static void addPost(float cx, float cz, float hw, float y0, float y1, float r, float g, float b) {
+	float a0[3] = {cx - hw, y0, cz}, a1[3] = {cx + hw, y0, cz}, a2[3] = {cx + hw, y1, cz}, a3[3] = {cx - hw, y1, cz};
+	quad(a0, a1, a2, a3, r, g, b);
+	float c0[3] = {cx, y0, cz - hw}, c1[3] = {cx, y0, cz + hw}, c2[3] = {cx, y1, cz + hw}, c3[3] = {cx, y1, cz - hw};
+	quad(c0, c1, c2, c3, r * 0.8f, g * 0.8f, b * 0.8f);
+}
+
+static void tri(const float a[3], const float b[3], const float c[3], float r, float g, float bl) {
+	addV(a[0], a[1], a[2], r, g, bl); addV(b[0], b[1], b[2], r, g, bl); addV(c[0], c[1], c[2], r, g, bl);
+}
+
+// Low-poly tree: square trunk plus a cone (or a diamond) crown.
+static void addTreeGeom(const Building* t) {
+	float cx = (t->x0 + t->x1) * 0.5f, cz = (t->z0 + t->z1) * 0.5f, top = t->h;
+	unsigned hh = hash2((int)(cx * 10.0f), (int)(cz * 10.0f));
+	float rad = 1.3f + (float)(hh % 7) * 0.12f, base = 1.9f;
+	addPost(cx, cz, 0.22f, 0.0f, base + 0.6f, 0.36f, 0.26f, 0.18f);
+	float px[4][3] = {{cx - rad, base, cz}, {cx, base, cz - rad}, {cx + rad, base, cz}, {cx, base, cz + rad}};
+	const float shade[4] = {0.62f, 0.60f, 0.95f, 0.80f};
+	float apex[3] = {cx, top, cz};
+	if (t->deco & 8) { // diamond crown: widest point part-way up, a point below as well
+		float mid = base + (top - base) * 0.45f, low[3] = {cx, base - 0.15f, cz};
+		for (int k = 0; k < 4; k++) {
+			float a[3] = {px[k][0], mid, px[k][2]}, b[3] = {px[(k + 1) & 3][0], mid, px[(k + 1) & 3][2]};
+			tri(a, b, apex, t->r * shade[k], t->g * shade[k], t->b * shade[k]);
+			tri(a, b, low, t->r * shade[k] * 0.8f, t->g * shade[k] * 0.8f, t->b * shade[k] * 0.8f);
+		}
+	} else {
+		for (int k = 0; k < 4; k++)
+			tri(px[k], px[(k + 1) & 3], apex, t->r * shade[k] * 0.9f, t->g * shade[k] * 0.9f, t->b * shade[k] * 0.9f);
+	}
+}
+
+static void buildCity(void) {
+	nBld = 0; nPatch = 0;
+	for (int i = 0; i < GRID; i++) for (int j = 0; j < GRID; j++) blkType[i][j] = pickBlock(i, j);
+	for (int i = 0; i < GRID; i++) for (int j = 0; j < GRID; j++) layoutBlock(i, j);
+
+	// ground outside the city, in 40 m tiles (fog is computed per vertex, so big quads would look washed out).
+	// East of the city is Lake Michigan.
+	const float T = 40.0f, GE = 320.0f, GF = 1200.0f;
+	for (float x = -GE; x < GE - 0.1f; x += T) {
+		for (float z = -GE; z < GE - 0.1f; z += T) {
+			float cx = x + T * 0.5f, cz = z + T * 0.5f;
+			if (fabsf(cx) < CITY_H && fabsf(cz) < CITY_H) continue; // the city itself covers this
+			int water = cx > CITY_H + 40.0f;
+			float r = water ? 0.12f : 0.34f, g = water ? 0.30f : 0.35f, b = water ? 0.50f : 0.36f;
+			float a0[3] = {x, 0, z}, a1[3] = {x + T, 0, z}, a2[3] = {x + T, 0, z + T}, a3[3] = {x, 0, z + T};
+			quad(a0, a3, a2, a1, r, g, b);
+		}
+	}
+	{ // far away, completely fogged: four big slabs around the tiled area
+		float s0[3] = {-GF, 0, -GF}, s1[3] = {GF, 0, -GF}, s2[3] = {GF, 0, -GE}, s3[3] = {-GF, 0, -GE};
+		quad(s0, s3, s2, s1, 0.34f, 0.35f, 0.36f);
+		float n0[3] = {-GF, 0, GE}, n1[3] = {GF, 0, GE}, n2[3] = {GF, 0, GF}, n3[3] = {-GF, 0, GF};
+		quad(n0, n3, n2, n1, 0.34f, 0.35f, 0.36f);
+		float w0[3] = {-GF, 0, -GE}, w1[3] = {-GE, 0, -GE}, w2[3] = {-GE, 0, GE}, w3[3] = {-GF, 0, GE};
+		quad(w0, w3, w2, w1, 0.34f, 0.35f, 0.36f);
+		float e0[3] = {GE, 0, -GE}, e1[3] = {GF, 0, -GE}, e2[3] = {GF, 0, GE}, e3[3] = {GE, 0, GE};
+		quad(e0, e3, e2, e1, 0.12f, 0.30f, 0.50f);
+	}
+	// asphalt, in 20 m pieces for the same reason
+	for (int k = 0; k < ROADS; k++) {
+		float c0 = ROAD_C(k);
+		for (float s = -ROAD_END; s < ROAD_END - 0.1f; s += 20.0f) {
+			float v0[3] = {c0 - ROAD_HW, 0.02f, s}, v1[3] = {c0 + ROAD_HW, 0.02f, s};
+			float v2[3] = {c0 + ROAD_HW, 0.02f, s + 20.0f}, v3[3] = {c0 - ROAD_HW, 0.02f, s + 20.0f};
+			quad(v0, v3, v2, v1, 0.17f, 0.18f, 0.20f);
+			float h0[3] = {s, 0.02f, c0 - ROAD_HW}, h1[3] = {s, 0.02f, c0 + ROAD_HW};
+			float h2[3] = {s + 20.0f, 0.02f, c0 + ROAD_HW}, h3[3] = {s + 20.0f, 0.02f, c0 - ROAD_HW};
+			quad(h0, h3, h2, h1, 0.17f, 0.18f, 0.20f);
+		}
+	}
+
+	// distant skyline ring (never reachable, heavily fogged); none over the lake
+	for (int i = 0; i < 56; i++) {
 		unsigned h = hash2(i, 31337);
-		float ang = (float)i * 6.2832f / 48.0f + (float)(h & 15) * 0.004f;
-		float rad = 150.0f + (float)((h >> 4) % 50);
-		float w   = 9.0f + (float)((h >> 10) % 9);
-		float hh  = 22.0f + (float)((h >> 14) % 70);
+		float ang = (float)i * 6.2832f / 56.0f + (float)(h & 15) * 0.004f;
+		float rad = 235.0f + (float)((h >> 4) % 60);
+		float w   = 9.0f + (float)((h >> 10) % 11);
+		float hh  = 25.0f + (float)((h >> 14) % 85);
 		float cx = sinf(ang) * rad, cz = cosf(ang) * rad;
+		if (cx > 150.0f) continue;
 		float tone = 0.42f + (float)((h >> 20) % 20) / 100.0f;
 		addBoxG(cx - w, cz - w, cx + w, cz + w, 0.0f, hh, tone * 0.95f, tone, tone * 1.08f, 0.5f, 1.0f);
 	}
 	globalEnd = vcount;
 
-	// building footprints
-	for (int i = 0; i < GRID; i++) {
-		for (int j = 0; j < GRID; j++) {
-			float cx = (i - (GRID - 1) * 0.5f) * PITCH;
-			float cz = (j - (GRID - 1) * 0.5f) * PITCH;
-			unsigned h = hash2(i, j);
-			Building* b = &bldg[i * GRID + j];
-			b->x0 = cx - BLDG_W * 0.5f; b->x1 = cx + BLDG_W * 0.5f;
-			b->z0 = cz - BLDG_W * 0.5f; b->z1 = cz + BLDG_W * 0.5f;
-			b->h  = FLOOR_H * (float)(2 + (h % 12));
-		}
-	}
-
-	// per district: sidewalks, roofs, rooftop units, road markings, crossings, signal poles
+	// per district: sidewalks and lots, roofs, trees, road markings, crossings, signal poles
 	for (int c = 0; c < CELLS; c++) {
 		cellAStart[c] = vcount;
-		for (int i = 0; i < GRID; i++) {
-			for (int j = 0; j < GRID; j++) {
-				const Building* b = &bldg[i * GRID + j];
-				float cx = (b->x0 + b->x1) * 0.5f, cz = (b->z0 + b->z1) * 0.5f;
-				if (cellOf(cx, cz) != c) continue;
-				unsigned h = hash2(i, j);
-				float s0[3] = {b->x0 - 1.5f, 0.03f, b->z0 - 1.5f}, s1[3] = {b->x1 + 1.5f, 0.03f, b->z0 - 1.5f};
-				float s2[3] = {b->x1 + 1.5f, 0.03f, b->z1 + 1.5f}, s3[3] = {b->x0 - 1.5f, 0.03f, b->z1 + 1.5f};
-				quad(s0, s3, s2, s1, 0.45f, 0.45f, 0.47f);
-
-				float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
-				float r0[3] = {b->x0, b->h, b->z0}, r1[3] = {b->x1, b->h, b->z0};
-				float r2[3] = {b->x1, b->h, b->z1}, r3[3] = {b->x0, b->h, b->z1};
-				quad(r0, r1, r2, r3, 0.30f + tone * 0.15f, 0.31f + tone * 0.15f, 0.33f + tone * 0.15f);
-				float ux = cx + ((int)((h >> 3) % 9) - 4) * 1.1f, uz = cz + ((int)((h >> 7) % 9) - 4) * 1.1f;
-				addBoxG(ux - 0.9f, uz - 0.9f, ux + 0.9f, uz + 0.9f, b->h, b->h + 1.1f, 0.52f, 0.54f, 0.57f, 0.8f, 1.0f);
+		for (int n = 0; n < nPatch; n++) {
+			const Patch* p = &patch[n];
+			if (cellOf((p->x0 + p->x1) * 0.5f, (p->z0 + p->z1) * 0.5f) != c) continue;
+			float s0[3] = {p->x0, p->y, p->z0}, s1[3] = {p->x1, p->y, p->z0};
+			float s2[3] = {p->x1, p->y, p->z1}, s3[3] = {p->x0, p->y, p->z1};
+			quad(s0, s3, s2, s1, p->r, p->g, p->b);
+		}
+		for (int n = 0; n < nBld; n++) {
+			const Building* b = &bldg[n];
+			float cx = (b->x0 + b->x1) * 0.5f, cz = (b->z0 + b->z1) * 0.5f;
+			if (cellOf(cx, cz) != c) continue;
+			if (b->kind == 1) { addTreeGeom(b); continue; }
+			if (b->kind == 2) { // fountain: basin with a spout
+				addBoxY(b->x0, b->z0, b->x1, b->z1, 0.0f, b->h, b->r, b->g, b->b);
+				addBoxY(cx - 0.3f, cz - 0.3f, cx + 0.3f, cz + 0.3f, b->h, b->h + 2.6f, 0.75f, 0.88f, 1.0f);
+				continue;
+			}
+			float rr = b->r * 0.42f, rg = b->g * 0.42f, rb = b->b * 0.42f;
+			float r0[3] = {b->x0, b->h, b->z0}, r1[3] = {b->x1, b->h, b->z0};
+			float r2[3] = {b->x1, b->h, b->z1}, r3[3] = {b->x0, b->h, b->z1};
+			quad(r0, r1, r2, r3, rr + 0.08f, rg + 0.08f, rb + 0.08f);
+			float hw = (b->x1 - b->x0) * 0.5f, hd = (b->z1 - b->z0) * 0.5f;
+			unsigned h = hash2((int)(cx * 3.0f), (int)(cz * 3.0f));
+			if (b->deco & 1) {
+				float uw = hw < hd ? hw : hd;
+				uw = uw * 0.22f; if (uw > 1.5f) uw = 1.5f;
+				float ux = cx + ((int)((h >> 3) % 9) - 4) * hw * 0.09f, uz = cz + ((int)((h >> 7) % 9) - 4) * hd * 0.09f;
+				addBoxG(ux - uw, uz - uw, ux + uw, uz + uw, b->h, b->h + 1.2f, 0.52f, 0.54f, 0.57f, 0.8f, 1.0f);
+			}
+			if (b->deco & 2) { // antenna mast on the tallest towers
+				float ah = 7.0f + (float)((h >> 12) % 6);
+				addBoxG(cx - 0.18f, cz - 0.18f, cx + 0.18f, cz + 0.18f, b->h + 1.0f, b->h + 1.0f + ah, 0.30f, 0.30f, 0.33f, 0.9f, 1.0f);
 			}
 		}
 		for (int k = 0; k < ROADS; k++) {
 			float c0 = ROAD_C(k);
-			for (float s = -ext; s < ext; s += 6.0f) {
-				float m = s + 1.25f;
+			for (float s = -CITY_H; s < CITY_H; s += 7.0f) {
+				float m = s + 1.5f;
 				int skip = 0;
-				for (int q = 0; q < ROADS; q++) if (fabsf(m - ROAD_C(q)) < 4.8f) skip = 1;
+				for (int q = 0; q < ROADS; q++) if (fabsf(m - ROAD_C(q)) < XW + 2.2f) skip = 1;
 				if (skip) continue;
 				if (cellOf(c0, m) == c) { // dash on the road running along z
-					float a[3] = {c0 - 0.12f, 0.05f, s}, b[3] = {c0 + 0.12f, 0.05f, s};
-					float cc[3] = {c0 + 0.12f, 0.05f, s + 2.5f}, d[3] = {c0 - 0.12f, 0.05f, s + 2.5f};
+					float a[3] = {c0 - 0.14f, 0.05f, s}, b[3] = {c0 + 0.14f, 0.05f, s};
+					float cc[3] = {c0 + 0.14f, 0.05f, s + 3.0f}, d[3] = {c0 - 0.14f, 0.05f, s + 3.0f};
 					quad(a, b, cc, d, 0.85f, 0.72f, 0.16f);
 				}
 				if (cellOf(m, c0) == c) { // dash on the road running along x
-					float e[3] = {s, 0.05f, c0 - 0.12f}, f[3] = {s, 0.05f, c0 + 0.12f};
-					float g[3] = {s + 2.5f, 0.05f, c0 + 0.12f}, hh[3] = {s + 2.5f, 0.05f, c0 - 0.12f};
+					float e[3] = {s, 0.05f, c0 - 0.14f}, f[3] = {s, 0.05f, c0 + 0.14f};
+					float g[3] = {s + 3.0f, 0.05f, c0 + 0.14f}, hh[3] = {s + 3.0f, 0.05f, c0 - 0.14f};
 					quad(e, f, g, hh, 0.85f, 0.72f, 0.16f);
 				}
 			}
@@ -308,26 +561,26 @@ static void buildCity(void) {
 				for (int arm = 0; arm < 4; arm++) {
 					float sg = (arm & 1) ? 1.0f : -1.0f;
 					for (int st = -1; st <= 1; st++) {
-						float off = st * 1.7f;
+						float off = st * 3.6f;
 						float p0[3], p1[3], p2[3], p3[3];
-						if (arm < 2) { // vertical road arm: bars run along z
-							float zz = zc + sg * 3.6f, xx = xc + off;
-							p0[0] = xx - 0.4f; p0[1] = 0.05f; p0[2] = zz - 0.8f;
-							p1[0] = xx + 0.4f; p1[1] = 0.05f; p1[2] = zz - 0.8f;
-							p2[0] = xx + 0.4f; p2[1] = 0.05f; p2[2] = zz + 0.8f;
-							p3[0] = xx - 0.4f; p3[1] = 0.05f; p3[2] = zz + 0.8f;
-						} else {       // horizontal road arm: bars run along x
-							float xx = xc + sg * 3.6f, zz = zc + off;
-							p0[0] = xx - 0.8f; p0[1] = 0.05f; p0[2] = zz - 0.4f;
-							p1[0] = xx + 0.8f; p1[1] = 0.05f; p1[2] = zz - 0.4f;
-							p2[0] = xx + 0.8f; p2[1] = 0.05f; p2[2] = zz + 0.4f;
-							p3[0] = xx - 0.8f; p3[1] = 0.05f; p3[2] = zz + 0.4f;
+						if (arm < 2) { // crosswalk over the vertical road: bars run along z
+							float zz = zc + sg * XW, xx = xc + off;
+							p0[0] = xx - 0.8f; p0[1] = 0.05f; p0[2] = zz - 1.2f;
+							p1[0] = xx + 0.8f; p1[1] = 0.05f; p1[2] = zz - 1.2f;
+							p2[0] = xx + 0.8f; p2[1] = 0.05f; p2[2] = zz + 1.2f;
+							p3[0] = xx - 0.8f; p3[1] = 0.05f; p3[2] = zz + 1.2f;
+						} else {       // crosswalk over the horizontal road: bars run along x
+							float xx = xc + sg * XW, zz = zc + off;
+							p0[0] = xx - 1.2f; p0[1] = 0.05f; p0[2] = zz - 0.8f;
+							p1[0] = xx + 1.2f; p1[1] = 0.05f; p1[2] = zz - 0.8f;
+							p2[0] = xx + 1.2f; p2[1] = 0.05f; p2[2] = zz + 0.8f;
+							p3[0] = xx - 1.2f; p3[1] = 0.05f; p3[2] = zz + 0.8f;
 						}
 						quad(p0, p1, p2, p3, 0.78f, 0.78f, 0.76f);
 					}
 				}
-				float x = xc + 3.4f, z = zc + 3.4f;
-				addBoxG(x - 0.15f, z - 0.15f, x + 0.15f, z + 0.15f, 0.0f, 4.0f, 0.2f, 0.2f, 0.22f, 0.8f, 1.0f);
+				float x = xc + SW_OFF + 0.7f, z = zc + SW_OFF + 0.7f;
+				addPost(x, z, 0.16f, 0.0f, 4.0f, 0.2f, 0.2f, 0.22f);
 			}
 		}
 		cellACount[c] = vcount - cellAStart[c];
@@ -337,19 +590,11 @@ static void buildCity(void) {
 	wallStart = vcount;
 	for (int c = 0; c < CELLS; c++) {
 		cellWStart[c] = vcount;
-		for (int i = 0; i < GRID; i++) {
-			for (int j = 0; j < GRID; j++) {
-				const Building* b = &bldg[i * GRID + j];
-				if (cellOf((b->x0 + b->x1) * 0.5f, (b->z0 + b->z1) * 0.5f) != c) continue;
-				unsigned h = hash2(i, j);
-				float tone = 0.45f + (float)((h >> 8) % 30) / 100.0f;
-				float tint = (float)((h >> 16) % 3);
-				float r  = tone * (tint == 0 ? 1.00f : 0.85f);
-				float g  = tone * (tint == 1 ? 1.00f : 0.90f);
-				float bl = tone * (tint == 2 ? 1.05f : 0.95f);
-				addWalls(b->x0, b->z0, b->x1, b->z1, b->h, r, g, bl,
-				         (float)((h >> 20) & 3) * 0.25f, (float)((h >> 24) & 3) * 0.25f);
-			}
+		for (int n = 0; n < nBld; n++) {
+			const Building* b = &bldg[n];
+			if (b->kind != 0) continue;
+			if (cellOf((b->x0 + b->x1) * 0.5f, (b->z0 + b->z1) * 0.5f) != c) continue;
+			addWalls(b->x0, b->z0, b->x1, b->z1, b->h, b->r, b->g, b->b, b->uo, b->vo);
 		}
 		cellWCount[c] = vcount - cellWStart[c];
 	}
@@ -537,8 +782,108 @@ static void ambSetVol(int i, float v) {
 }
 
 // ---- title music streaming thread ----
-static volatile int musicWant = 0, musicQuit = 0;
+static volatile int musicWant = 0, musicQuit = 0, musicFail = 0;
 static Thread musicThread = NULL;
+// what the title screen reports about the music: 0 not started, 1 streaming title.pcm,
+// 2 built-in synthesized theme (title.pcm missing), 3 no audio at all (DSP firmware missing)
+static int gMusicMode = 0;
+static Snd themeSnd;
+static ndspWaveBuf themeWB;
+static float themeGain = -1.0f;
+#define THEME_CH 13
+
+// title.pcm is looked for inside the app (romfs) first, then on the SD card.
+static FILE* openMusicFile(void) {
+	static const char* paths[] = {
+		"romfs:/title.pcm", "sdmc:/3ds/Chicago3DS/title.pcm", "sdmc:/3ds/chicago3ds/title.pcm", "sdmc:/Chicago3DS/title.pcm"
+	};
+	for (int i = 0; i < 4; i++) {
+		FILE* f = fopen(paths[i], "rb");
+		if (!f) continue;
+		u8 probe[4];
+		if (fread(probe, 1, 4, f) == 4) { fseek(f, 0, SEEK_SET); return f; }
+		fclose(f);
+	}
+	return NULL;
+}
+
+// ---- built-in title theme (used when title.pcm cannot be found) ----------------------------
+// A slow synth piece in A minor: pad chords, a plucked arpeggio, bass and a soft beat. About 20 s, looped.
+static float sineTab[1025];
+
+static float tabSin(float cycles) {
+	cycles -= floorf(cycles);
+	float x = cycles * 1024.0f;
+	int i = (int)x;
+	float f = x - (float)i;
+	return sineTab[i] * (1.0f - f) + sineTab[i + 1] * f;
+}
+
+static float midiHz(int m) { return 440.0f * powf(2.0f, (float)(m - 69) / 12.0f); }
+
+static Snd synthTitleTheme(void) {
+	static const int chord[8][3] = {{57, 60, 64}, {53, 57, 60}, {48, 52, 55}, {55, 59, 62}, {57, 60, 64}, {53, 57, 60}, {50, 53, 57}, {52, 56, 59}};
+	static const int bassN[8]    = {33, 29, 36, 31, 33, 29, 26, 28};
+	static const int arpPat[8]   = {0, 1, 2, 1, 2, 1, 0, 1};
+	for (int i = 0; i <= 1024; i++) sineTab[i] = sinf(2.0f * PI_F * (float)i / 1024.0f);
+	const float beat = 60.0f / 96.0f, barLen = 4.0f * beat;
+	int n = (int)(barLen * 8.0f * (float)SFX_RATE);
+	Snd s = newSnd(n);
+	if (!s.data) return s;
+	float padPh[3][2] = {{0, 0}, {0, 0}, {0, 0}}, bassPh = 0.0f, arpPh = 0.0f, kickPh = 0.0f, lp = 0.0f;
+	unsigned st = 4242u;
+	for (int i = 0; i < n; i++) {
+		float t = (float)i / (float)SFX_RATE;
+		int ci = (int)(t / barLen);
+		if (ci > 7) ci = 7;
+		float ct = t - (float)ci * barLen, v = 0.0f;
+
+		// pad: slow swell in, soft release out (silent at the bar lines, so the loop point is seamless)
+		float padEnv = fminf(1.0f, ct / 0.7f) * fminf(1.0f, (barLen - ct) / 0.6f);
+		for (int k = 0; k < 3; k++) {
+			float hz = midiHz(chord[ci][k]);
+			padPh[k][0] += hz / SFX_RATE;
+			padPh[k][1] += hz * 1.004f / SFX_RATE;
+			v += 0.065f * padEnv * (tabSin(padPh[k][0]) + tabSin(padPh[k][1]));
+		}
+		// bass: plucked on beats 1 and 3
+		float bt = fmodf(ct, 2.0f * beat);
+		bassPh += midiHz(bassN[ci]) / SFX_RATE;
+		v += 0.30f * expf(-bt * 2.4f) * (tabSin(bassPh) + 0.30f * tabSin(bassPh * 2.0f));
+		// arpeggio: eighth notes, one octave and a half above the pad
+		float eighth = beat * 0.5f;
+		int step = (int)(ct / eighth);
+		if (step > 7) step = 7;
+		float at = ct - (float)step * eighth;
+		arpPh += midiHz(chord[ci][arpPat[step]] + 24) / SFX_RATE;
+		v += 0.16f * expf(-at * 8.0f) * (tabSin(arpPh) + 0.25f * tabSin(arpPh * 3.0f));
+		// soft kick on beats 1 and 3, hat on the off-beats
+		kickPh += (46.0f + 70.0f * expf(-bt * 28.0f)) / SFX_RATE;
+		v += 0.30f * expf(-bt * 11.0f) * tabSin(kickPh);
+		float w = nrand(&st);
+		lp += (w - lp) * 0.35f;
+		v += 0.05f * (w - lp) * expf(-fmodf(ct + eighth, beat) * 55.0f) * ((step & 1) ? 1.0f : 0.0f);
+		s.data[i] = pcm(v * 0.85f);
+	}
+	DSP_FlushDataCache(s.data, (u32)s.n * 2);
+	return s;
+}
+
+static void startTheme(void) {
+	if (themeSnd.data) return;
+	themeSnd = synthTitleTheme();
+	if (!themeSnd.data) return;
+	memset(&themeWB, 0, sizeof themeWB);
+	themeWB.data_vaddr = themeSnd.data;
+	themeWB.nsamples = (u32)themeSnd.n;
+	themeWB.looping = true;
+	float mix[12];
+	memset(mix, 0, sizeof mix);
+	ndspChnSetMix(THEME_CH, mix);
+	ndspChnWaveBufAdd(THEME_CH, &themeWB);
+	themeGain = 0.0f;
+	gMusicMode = 2;
+}
 
 static void musicSetMix(float g) {
 	float mix[12];
@@ -573,8 +918,7 @@ static void musicThreadFn(void* arg) {
 	memset(wbs, 0, sizeof wbs);
 	while (!musicQuit) {
 		if (musicWant && !playing) {
-			f = fopen("romfs:/title.pcm", "rb");
-			if (!f) f = fopen("sdmc:/3ds/Chicago3DS/title.pcm", "rb");
+			f = openMusicFile();
 			if (f && bufs[0] && bufs[1] && bufs[2]) {
 				ndspChnWaveBufClear(0);
 				memset(wbs, 0, sizeof wbs);
@@ -589,7 +933,8 @@ static void musicThreadFn(void* arg) {
 				playing = 1;
 			} else {
 				if (f) { fclose(f); f = NULL; }
-				musicWant = 0; // no music file found: stay quiet
+				musicWant = 0; // no music file found: the main thread switches to the built-in theme
+				musicFail = 1;
 			}
 		}
 		if (playing) {
@@ -616,16 +961,16 @@ static void musicThreadFn(void* arg) {
 }
 
 static void initAudio(void) {
-	if (R_FAILED(ndspInit())) return; // dspfirm.cdc missing
+	if (R_FAILED(ndspInit())) { gMusicMode = 3; return; } // dspfirm.cdc missing: the whole game stays silent
 	sndOK = 1;
 	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
-	for (int ch = 0; ch < 13; ch++) {
+	for (int ch = 0; ch < 14; ch++) {
 		ndspChnReset(ch);
 		ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
 	}
 	ndspChnSetRate(0, (float)MUS_RATE);
 	ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
-	for (int ch = 1; ch < 13; ch++) {
+	for (int ch = 1; ch < 14; ch++) {
 		ndspChnSetRate(ch, (float)SFX_RATE);
 		ndspChnSetFormat(ch, NDSP_FORMAT_MONO_PCM16);
 	}
@@ -640,9 +985,16 @@ static void initAudio(void) {
 		ambSetVol(i, 0.0f);
 		ndspChnWaveBufAdd(1 + i, &ambWB[i]);
 	}
-	s32 prio = 0;
-	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-	musicThread = threadCreate(musicThreadFn, NULL, 32 * 1024, prio - 1, -1, false);
+	// the real title music if title.pcm can be found, otherwise the built-in theme
+	FILE* probe = openMusicFile();
+	if (probe) {
+		fclose(probe);
+		s32 prio = 0;
+		svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+		musicThread = threadCreate(musicThreadFn, NULL, 64 * 1024, prio - 1, -1, false);
+		if (musicThread) gMusicMode = 1;
+	}
+	if (gMusicMode != 1) startTheme();
 }
 
 static void shutdownAudio(void) {
@@ -677,7 +1029,7 @@ static void initCars(void) {
 		c->axis  = i & 1;
 		c->road  = (h >> 3) % ROADS;
 		c->dir   = ((h >> 9) & 1) ? 1 : -1;
-		c->s     = -90.0f + (float)((h >> 12) % 180);
+		c->s     = -CITY_H + (float)((h >> 12) % (int)(2.0f * CITY_H));
 		c->speed = 0.14f + (float)((h >> 20) % 10) * 0.012f;
 		c->brake = 0;
 		const float* p = pal[(h >> 5) % 6];
@@ -689,13 +1041,13 @@ static void updateCars(int frame, float px, float pz) {
 	if (hackTimer > 0) hackTimer--;
 	for (int i = 0; i < N_CARS; i++) {
 		Car* c = &cars[i];
-		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float lane = ROAD_C(c->road) + c->dir * LANE;
 		int stop = 0;
 
 		// red/yellow light just ahead
 		for (int k = 0; k < ROADS; k++) {
 			float gap = (ROAD_C(k) - c->s) * c->dir;
-			if (gap > 3.0f && gap < 5.0f) {
+			if (gap > ROAD_HW + 4.2f && gap < ROAD_HW + 6.2f) {
 				int a = (c->axis == 0) ? k : c->road;
 				int b = (c->axis == 0) ? c->road : k;
 				if (lightState(a, b, c->axis, frame) != 0) stop = 1;
@@ -707,7 +1059,7 @@ static void updateCars(int frame, float px, float pz) {
 			const Car* o = &cars[j];
 			if (o->axis == c->axis && o->road == c->road && o->dir == c->dir) {
 				float gap = (o->s - c->s) * c->dir;
-				if (gap > 0.0f && gap < 5.0f) stop = 1;
+				if (gap > 0.0f && gap < 7.0f) stop = 1;
 			}
 		}
 		// player standing in the way
@@ -717,18 +1069,18 @@ static void updateCars(int frame, float px, float pz) {
 
 		c->brake = stop;
 		if (!stop) c->s += c->dir * c->speed;
-		if (c->s >  100.0f) c->s = -100.0f;
-		if (c->s < -100.0f) c->s =  100.0f;
+		if (c->s >  CITY_H) c->s = -CITY_H;
+		if (c->s < -CITY_H) c->s =  CITY_H;
 	}
 }
 
 static int blocked(float x, float z) {
-	for (int i = 0; i < GRID * GRID; i++) {
+	for (int i = 0; i < nBld; i++) {
 		const Building* b = &bldg[i];
 		if (x > b->x0 - PLAYER_R && x < b->x1 + PLAYER_R &&
 		    z > b->z0 - PLAYER_R && z < b->z1 + PLAYER_R) return 1;
 	}
-	float lim = GRID * PITCH * 0.5f + 20.0f;
+	float lim = CITY_H + 20.0f;
 	return (x < -lim || x > lim || z < -lim || z > lim);
 }
 
@@ -737,6 +1089,7 @@ static int blocked(float x, float z) {
 // facing -Z. Each part swings about its joint (X axis), then the whole body leans
 // and turns to its heading.
 static float gPx, gPz, gFace, gLean, gBob;
+static float gSx = 1.0f, gSy = 1.0f; // body scale: width, height (pedestrians come in different builds)
 
 static void addPart(float jx, float jy, float jz, float ox, float oy, float oz,
                     float hx, float hy, float hz, float swing, float r, float g, float b) {
@@ -749,7 +1102,7 @@ static void addPart(float jx, float jy, float jz, float ox, float oy, float oz,
 		float y = oy + ((i & 2) ? hy : -hy);
 		float z = oz + ((i & 4) ? hz : -hz);
 		float y1 = y * cs - z * sn, z1 = y * sn + z * cs;      // joint swing
-		x += jx; y1 += jy; z1 += jz;
+		x = (x + jx) * gSx; y1 = (y1 + jy) * gSy; z1 = (z1 + jz) * gSy;
 		float y2 = y1 * cl - z1 * sl, z2 = y1 * sl + z1 * cl;  // body lean
 		P[i][0] = gPx + x * cf + z2 * sf;
 		P[i][1] = y2 + gBob;
@@ -764,8 +1117,8 @@ static void addPart(float jx, float jy, float jz, float ox, float oy, float oz,
 }
 
 static void addShadow(float x, float z, float hx, float hz, float a) {
-	float p0[3] = {x - hx, 0.07f, z - hz}, p1[3] = {x + hx, 0.07f, z - hz};
-	float p2[3] = {x + hx, 0.07f, z + hz}, p3[3] = {x - hx, 0.07f, z + hz};
+	float p0[3] = {x - hx, 0.10f, z - hz}, p1[3] = {x + hx, 0.10f, z - hz};
+	float p2[3] = {x + hx, 0.10f, z + hz}, p3[3] = {x - hx, 0.10f, z + hz};
 	gAlpha = a;
 	quad(p0, p1, p2, p3, 0.0f, 0.0f, 0.0f);
 	gAlpha = 1.0f;
@@ -773,17 +1126,65 @@ static void addShadow(float x, float z, float hx, float hz, float a) {
 
 // ---- pedestrians -------------------------------------------------------------
 // They walk the sidewalks and wait at the kerb until the cross traffic has a red light.
-typedef struct { int axis, road, side, dir, walk, hp, dead, deadT, panic; float s, speed, ph; float shirt[3], pants[3], skin[3]; } Ped;
+// Each one gets its own look: 10 skin tones, 9 hair colours, 9 hair styles / head coverings, 8 outfits,
+// accessories, and a different height and build.
+enum { HS_BALD, HS_SHORT, HS_LONG, HS_AFRO, HS_BUN, HS_CAP, HS_BEANIE, HS_SCARF };
+enum { OF_TEE, OF_LONG, OF_SHORTS, OF_DRESS, OF_HOODIE, OF_SUIT, OF_COAT, OF_TANK };
+enum { AC_PACK = 1, AC_BAG = 2, AC_SHADES = 4, AC_BEARD = 8 };
+typedef struct {
+	int axis, road, side, dir, walk, hp, dead, deadT, panic, hair, outfit, acc;
+	float s, speed, ph, off, scale, width;
+	float shirt[3], pants[3], skin[3], hairC[3], shoe[3], trim[3];
+} Ped;
 static Ped peds[N_PEDS];
 
+static void styleNpc(Ped* p, unsigned h) {
+	static const float skinPal[10][3] = {
+		{0.96f, 0.80f, 0.69f}, {0.92f, 0.74f, 0.60f}, {0.86f, 0.66f, 0.50f}, {0.78f, 0.58f, 0.40f}, {0.70f, 0.50f, 0.34f},
+		{0.60f, 0.42f, 0.28f}, {0.50f, 0.34f, 0.23f}, {0.40f, 0.27f, 0.19f}, {0.31f, 0.20f, 0.14f}, {0.82f, 0.62f, 0.48f}
+	};
+	static const float hairPal[9][3] = {
+		{0.07f, 0.06f, 0.06f}, {0.20f, 0.12f, 0.08f}, {0.34f, 0.22f, 0.12f}, {0.56f, 0.40f, 0.22f}, {0.82f, 0.68f, 0.36f},
+		{0.58f, 0.24f, 0.12f}, {0.62f, 0.62f, 0.64f}, {0.88f, 0.88f, 0.88f}, {0.65f, 0.22f, 0.55f}
+	};
+	static const float shirtPal[16][3] = {
+		{0.80f, 0.20f, 0.20f}, {0.20f, 0.45f, 0.80f}, {0.90f, 0.75f, 0.20f}, {0.88f, 0.88f, 0.86f}, {0.25f, 0.65f, 0.40f}, {0.65f, 0.30f, 0.70f},
+		{0.92f, 0.52f, 0.15f}, {0.15f, 0.60f, 0.62f}, {0.92f, 0.55f, 0.70f}, {0.14f, 0.20f, 0.42f}, {0.52f, 0.54f, 0.58f}, {0.10f, 0.10f, 0.12f},
+		{0.50f, 0.14f, 0.20f}, {0.44f, 0.48f, 0.24f}, {0.55f, 0.75f, 0.92f}, {0.94f, 0.88f, 0.72f}
+	};
+	static const float pantsPal[10][3] = {
+		{0.18f, 0.26f, 0.45f}, {0.10f, 0.13f, 0.25f}, {0.08f, 0.08f, 0.09f}, {0.58f, 0.50f, 0.36f}, {0.35f, 0.35f, 0.38f},
+		{0.30f, 0.34f, 0.20f}, {0.30f, 0.20f, 0.12f}, {0.82f, 0.82f, 0.80f}, {0.40f, 0.12f, 0.18f}, {0.22f, 0.30f, 0.50f}
+	};
+	static const float shoePal[6][3] = {
+		{0.08f, 0.08f, 0.09f}, {0.90f, 0.90f, 0.90f}, {0.75f, 0.15f, 0.15f}, {0.35f, 0.22f, 0.12f}, {0.14f, 0.18f, 0.36f}, {0.45f, 0.45f, 0.47f}
+	};
+	static const float suitPal[3][3] = {{0.12f, 0.14f, 0.26f}, {0.09f, 0.09f, 0.10f}, {0.34f, 0.35f, 0.38f}};
+	static const int styles[16]  = {HS_SHORT, HS_SHORT, HS_SHORT, HS_LONG, HS_LONG, HS_AFRO, HS_BUN, HS_CAP, HS_CAP, HS_BEANIE, HS_SCARF, HS_BALD, HS_SHORT, HS_LONG, HS_AFRO, HS_BALD};
+	static const int outfits[12] = {OF_TEE, OF_TEE, OF_LONG, OF_LONG, OF_SHORTS, OF_DRESS, OF_HOODIE, OF_HOODIE, OF_SUIT, OF_COAT, OF_TANK, OF_TEE};
+	unsigned a = hash2((int)h, 1001), b = hash2((int)h, 2002), c = hash2((int)h, 3003);
+	int sk = (int)(a % 10), hc = (int)((a >> 8) % 9);
+	if (sk >= 5 && hc >= 3 && hc <= 5) hc -= 3; // blond / red hair is rarer with the darker skin tones
+	p->hair   = styles[b % 16];
+	p->outfit = outfits[(b >> 4) % 12];
+	for (int q = 0; q < 3; q++) {
+		p->skin[q]  = skinPal[sk][q];
+		p->hairC[q] = hairPal[hc][q];
+		p->shirt[q] = shirtPal[(b >> 8) % 16][q];
+		p->pants[q] = pantsPal[(b >> 12) % 10][q];
+		p->shoe[q]  = shoePal[(b >> 16) % 6][q];
+		p->trim[q]  = shirtPal[c % 16][q];
+	}
+	if (p->outfit == OF_SUIT) for (int q = 0; q < 3; q++) { p->shirt[q] = suitPal[(c >> 4) % 3][q]; p->pants[q] = p->shirt[q]; }
+	p->acc = 0;
+	if ((c >> 8) % 5 == 0) p->acc |= AC_PACK; else if ((c >> 8) % 5 == 1) p->acc |= AC_BAG;
+	if ((c >> 12) % 6 == 0) p->acc |= AC_SHADES;
+	if ((c >> 16) % 7 == 0 && (p->hair == HS_SHORT || p->hair == HS_BALD || p->hair == HS_CAP) && p->outfit != OF_DRESS) p->acc |= AC_BEARD;
+	p->scale = 0.90f + (float)((c >> 20) % 17) * 0.01f;
+	p->width = 0.88f + (float)((c >> 24) % 28) * 0.01f;
+}
+
 static void initPeds(void) {
-	static const float shirt[6][3] = {
-		{0.80f, 0.20f, 0.20f}, {0.20f, 0.45f, 0.80f}, {0.90f, 0.75f, 0.20f},
-		{0.85f, 0.85f, 0.85f}, {0.25f, 0.65f, 0.40f}, {0.65f, 0.30f, 0.70f}
-	};
-	static const float skin[4][3] = {
-		{0.85f, 0.66f, 0.52f}, {0.62f, 0.45f, 0.34f}, {0.95f, 0.80f, 0.68f}, {0.45f, 0.32f, 0.24f}
-	};
 	for (int i = 0; i < N_PEDS; i++) {
 		unsigned h = hash2(i, 777);
 		Ped* p = &peds[i];
@@ -791,25 +1192,26 @@ static void initPeds(void) {
 		p->road  = (h >> 3) % ROADS;
 		p->side  = ((h >> 8) & 1) ? 1 : -1;
 		p->dir   = ((h >> 9) & 1) ? 1 : -1;
-		p->s     = -90.0f + (float)((h >> 12) % 180);
+		p->s     = -CITY_H + (float)((h >> 12) % (int)(2.0f * CITY_H));
 		p->speed = 0.035f + (float)((h >> 20) % 5) * 0.006f;
 		p->ph    = (float)(h % 100) * 0.1f;
+		p->off   = ((float)((h >> 24) % 19) - 9.0f) * 0.1f; // not everybody walks in a straight line along the kerb
 		p->walk  = 1; p->hp = 4; p->dead = 0; p->deadT = 0; p->panic = 0;
-		const float* c = shirt[(h >> 5) % 6];
-		const float* k = skin[(h >> 14) % 4];
-		for (int q = 0; q < 3; q++) { p->shirt[q] = c[q]; p->skin[q] = k[q]; p->pants[q] = 0.10f + 0.06f * (float)((h >> (16 + q)) & 3); }
+		styleNpc(p, h);
 	}
 }
 
-// A killed pedestrian is replaced by a fresh one somewhere else after a few seconds.
+// A killed pedestrian is replaced by a fresh one (with a new look) somewhere else after a few seconds.
 static void respawnPed(Ped* p, int salt) {
 	unsigned h = hash2(salt, 9001 + salt * 7);
 	p->axis = (int)((h >> 11) & 1);
 	p->road = (int)(h % ROADS);
 	p->side = ((h >> 8) & 1) ? 1 : -1;
 	p->dir  = ((h >> 9) & 1) ? 1 : -1;
-	p->s    = -90.0f + (float)((h >> 12) % 180);
+	p->s    = -CITY_H + (float)((h >> 12) % (int)(2.0f * CITY_H));
+	p->off  = ((float)((h >> 24) % 19) - 9.0f) * 0.1f;
 	p->hp = 4; p->dead = 0; p->deadT = 0; p->panic = 0; p->walk = 1;
+	styleNpc(p, h);
 }
 
 static void updatePeds(int frame) {
@@ -824,7 +1226,7 @@ static void updatePeds(int frame) {
 		if (p->panic <= 0) { // a frightened pedestrian ignores the signals
 			for (int m = 0; m < ROADS; m++) {
 				float gap = (ROAD_C(m) - p->s) * p->dir;
-				if (gap > 2.9f && gap < 3.5f) {
+				if (gap > ROAD_HW + 0.4f && gap < ROAD_HW + 1.0f) {
 					int st = (p->axis == 0) ? lightState(m, p->road, 1, frame) : lightState(p->road, m, 0, frame);
 					if (st != 2) wait = 1;
 				}
@@ -833,13 +1235,13 @@ static void updatePeds(int frame) {
 		float sp = p->speed * (p->panic > 0 ? 2.4f : 1.0f);
 		p->walk = !wait;
 		if (!wait) { p->s += p->dir * sp; p->ph += sp * 1.3f + 0.02f; }
-		if (p->s >  100.0f) p->s = -100.0f;
-		if (p->s < -100.0f) p->s =  100.0f;
+		if (p->s >  CITY_H) p->s = -CITY_H;
+		if (p->s < -CITY_H) p->s =  CITY_H;
 	}
 }
 
 static void pedPos(const Ped* p, float* x, float* z) {
-	float lat = ROAD_C(p->road) + p->side * 3.3f;
+	float lat = ROAD_C(p->road) + p->side * (SW_OFF + p->off);
 	*x = (p->axis == 0) ? p->s : lat;
 	*z = (p->axis == 0) ? lat : p->s;
 }
@@ -860,10 +1262,71 @@ static void drawPed(const Ped* p) {
 		gBob = p->walk ? fabsf(cosf(p->ph)) * 0.03f : 0.0f;
 		s = p->walk ? sinf(p->ph) * (p->panic > 0 ? 0.8f : 0.5f) : 0.0f;
 	}
-	addPart(-0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f,  s, p->pants[0], p->pants[1], p->pants[2]);
-	addPart( 0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f, -s, p->pants[0], p->pants[1], p->pants[2]);
-	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, p->shirt[0], p->shirt[1], p->shirt[2]);
-	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.00f, 0.0f, 0.13f, 0.14f, 0.13f, 0.0f, p->skin[0], p->skin[1], p->skin[2]);
+	gSy = p->scale; gSx = p->scale * p->width;
+	const float* sh = p->shirt; const float* pa = p->pants; const float* sk = p->skin;
+	const float* hr = p->hairC; const float* so = p->shoe; const float* tr = p->trim;
+	float dx = x - gCamX, dz = z - gCamZ;
+	int near = (dx * dx + dz * dz) < 45.0f * 45.0f; // small details are skipped on far-away people
+	int of = p->outfit;
+	int longLegs = (of == OF_TEE || of == OF_LONG || of == OF_HOODIE || of == OF_SUIT || of == OF_COAT);
+	int longSleeves = (of == OF_LONG || of == OF_HOODIE || of == OF_SUIT || of == OF_COAT);
+	int shortSleeves = (of == OF_TEE || of == OF_SHORTS || of == OF_DRESS);
+
+	// legs, shoes
+	for (int side = -1; side <= 1; side += 2) {
+		float sw = (side < 0) ? s : -s, jx = 0.15f * (float)side;
+		if (longLegs) addPart(jx, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f, sw, pa[0], pa[1], pa[2]);
+		else          addPart(jx, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f, sw, sk[0], sk[1], sk[2]);
+		if (of == OF_SHORTS || of == OF_TANK)
+			addPart(jx, 0.90f, 0.0f, 0.0f, -0.19f, 0.0f, 0.10f, 0.21f, 0.11f, sw, pa[0], pa[1], pa[2]);
+		if (near) addPart(jx, 0.90f, 0.0f, 0.0f, -0.86f, -0.03f, 0.095f, 0.05f, 0.13f, sw, so[0], so[1], so[2]);
+	}
+	if (of == OF_DRESS) addPart(0.0f, 0.90f, 0.0f, 0.0f, -0.17f, 0.0f, 0.25f, 0.20f, 0.15f, 0.0f, sh[0] * 0.85f, sh[1] * 0.85f, sh[2] * 0.85f);
+
+	// torso
+	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, sh[0], sh[1], sh[2]);
+	if (of == OF_COAT) addPart(0.0f, 0.90f, 0.0f, 0.0f, -0.10f, 0.0f, 0.28f, 0.30f, 0.15f, 0.0f, sh[0], sh[1], sh[2]);
+	if (near && of == OF_SUIT) addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.45f, -0.141f, 0.07f, 0.30f, 0.005f, 0.0f, 0.92f, 0.92f, 0.92f);
+	if (near && of == OF_HOODIE) addPart(0.0f, 1.62f, 0.0f, 0.0f, -0.10f, 0.12f, 0.15f, 0.10f, 0.07f, 0.0f, sh[0], sh[1], sh[2]);
+	if (near && (p->acc & AC_PACK)) addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.40f, 0.22f, 0.19f, 0.27f, 0.09f, 0.0f, tr[0], tr[1], tr[2]);
+	if (near && (p->acc & AC_BAG))  addPart(0.0f, 0.90f, 0.0f, 0.34f, 0.08f, 0.0f, 0.06f, 0.13f, 0.14f, 0.0f, tr[0], tr[1], tr[2]);
+
+	// arms
+	for (int side = -1; side <= 1; side += 2) {
+		float sw = (side < 0) ? -s : s, jx = 0.36f * (float)side;
+		if (longSleeves) {
+			addPart(jx, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.065f, 0.30f, 0.065f, sw, sh[0], sh[1], sh[2]);
+			if (near) addPart(jx, 1.50f, 0.0f, 0.0f, -0.58f, 0.0f, 0.07f, 0.05f, 0.07f, sw, sk[0], sk[1], sk[2]);
+		} else {
+			addPart(jx, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.065f, 0.30f, 0.065f, sw, sk[0], sk[1], sk[2]);
+			if (shortSleeves) addPart(jx, 1.50f, 0.0f, 0.0f, -0.10f, 0.0f, 0.075f, 0.14f, 0.075f, sw, sh[0], sh[1], sh[2]);
+		}
+	}
+
+	// head, hair or head covering, face details
+	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.00f, 0.0f, 0.13f, 0.14f, 0.13f, 0.0f, sk[0], sk[1], sk[2]);
+	switch (p->hair) {
+	case HS_SHORT: addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.05f, 0.04f, 0.14f, 0.10f, 0.11f, 0.0f, hr[0], hr[1], hr[2]); break;
+	case HS_LONG:  addPart(0.0f, 1.62f, 0.0f, 0.0f, -0.02f, 0.045f, 0.145f, 0.17f, 0.105f, 0.0f, hr[0], hr[1], hr[2]); break;
+	case HS_AFRO:  addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.07f, 0.05f, 0.20f, 0.15f, 0.17f, 0.0f, hr[0], hr[1], hr[2]); break;
+	case HS_BUN:
+		addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.05f, 0.04f, 0.14f, 0.10f, 0.11f, 0.0f, hr[0], hr[1], hr[2]);
+		if (near) addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.22f, 0.06f, 0.06f, 0.06f, 0.06f, 0.0f, hr[0], hr[1], hr[2]);
+		break;
+	case HS_CAP:
+		addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.13f, 0.0f, 0.15f, 0.045f, 0.15f, 0.0f, tr[0], tr[1], tr[2]);
+		if (near) addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.10f, -0.17f, 0.11f, 0.015f, 0.06f, 0.0f, tr[0] * 0.8f, tr[1] * 0.8f, tr[2] * 0.8f);
+		break;
+	case HS_BEANIE: addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.10f, 0.0f, 0.15f, 0.08f, 0.15f, 0.0f, tr[0], tr[1], tr[2]); break;
+	case HS_SCARF:
+		addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.0f, 0.04f, 0.155f, 0.17f, 0.11f, 0.0f, tr[0], tr[1], tr[2]);
+		if (near) addPart(0.0f, 1.62f, 0.0f, 0.0f, -0.20f, 0.02f, 0.20f, 0.07f, 0.14f, 0.0f, tr[0], tr[1], tr[2]);
+		break;
+	default: break;
+	}
+	if (near && (p->acc & AC_BEARD))  addPart(0.0f, 1.62f, 0.0f, 0.0f, -0.09f, -0.115f, 0.10f, 0.055f, 0.03f, 0.0f, hr[0], hr[1], hr[2]);
+	if (near && (p->acc & AC_SHADES)) addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.03f, -0.13f, 0.115f, 0.028f, 0.012f, 0.0f, 0.04f, 0.04f, 0.05f);
+	gSx = 1.0f; gSy = 1.0f;
 }
 
 // Rebuilds the dynamic tail of the vertex buffer: shadows, cars, pedestrians (only those near the camera).
@@ -871,7 +1334,7 @@ static void drawDynamic(void) {
 	vcount = staticCount;
 	for (int i = 0; i < N_CARS; i++) {
 		const Car* c = &cars[i];
-		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float cx = (c->axis == 0) ? c->s : lane, cz = (c->axis == 0) ? lane : c->s;
 		if (!inView(cx, cz)) continue;
 		addShadow(cx, cz, (c->axis == 0) ? 2.4f : 1.3f, (c->axis == 0) ? 1.3f : 2.4f, 0.38f);
@@ -883,7 +1346,7 @@ static void drawDynamic(void) {
 	}
 	for (int i = 0; i < N_CARS; i++) {
 		const Car* c = &cars[i];
-		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float hx = (c->axis == 0) ? 2.1f : 1.0f, hz = (c->axis == 0) ? 1.0f : 2.1f;
 		float cx = (c->axis == 0) ? c->s : lane, cz = (c->axis == 0) ? lane : c->s;
 		if (!inView(cx, cz)) continue;
@@ -905,7 +1368,7 @@ static void drawLights(int frame, float night) {
 	int start = vcount;
 	for (int i = 0; i < N_CARS; i++) {
 		const Car* c = &cars[i];
-		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float wx = (c->axis == 0) ? c->s : lane, wz = (c->axis == 0) ? lane : c->s;
 		if (!inView(wx, wz)) continue;
 		float ax = (c->axis == 0) ? (float)c->dir : 0.0f, az = (c->axis == 0) ? 0.0f : (float)c->dir;
@@ -922,7 +1385,7 @@ static void drawLights(int frame, float night) {
 	}
 	for (int a = 0; a < ROADS; a++) {
 		for (int b = 0; b < ROADS; b++) {
-			float x = ROAD_C(a) + 3.4f, z = ROAD_C(b) + 3.4f;
+			float x = ROAD_C(a) + SW_OFF + 0.7f, z = ROAD_C(b) + SW_OFF + 0.7f;
 			if (!inView(x, z)) continue;
 			int hacked = (hackTimer > 0 && a == hackA && b == hackB);
 			for (int axis = 0; axis < 2; axis++) {
@@ -1096,14 +1559,14 @@ static float castRay(const float o[3], const float d[3], float maxT, int* ped) {
 		float t = -o[1] / d[1];
 		if (t > 0.0f && t < best) best = t;
 	}
-	for (int i = 0; i < GRID * GRID; i++) {
+	for (int i = 0; i < nBld; i++) {
 		const Building* b = &bldg[i];
 		float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
 		if (t >= 0.0f && t < best) best = t;
 	}
 	for (int i = 0; i < N_CARS; i++) {
 		const Car* c = &cars[i];
-		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float hx = (c->axis == 0) ? 2.1f : 1.0f, hz = (c->axis == 0) ? 1.0f : 2.1f;
 		float cx = (c->axis == 0) ? c->s : lane, cz = (c->axis == 0) ? lane : c->s;
 		float t = rayBox(o, d, cx - hx, 0.15f, cz - hz, cx + hx, 1.66f, cz + hz);
@@ -1276,8 +1739,8 @@ static Crate crates[N_CRATES];
 static void initCrates(void) {
 	for (int i = 0; i < N_CRATES; i++) {
 		unsigned h = hash2(i, 4401);
-		float lat = ROAD_C((int)(h % ROADS)) + (((h >> 8) & 1) ? 3.3f : -3.3f);
-		float s = -80.0f + (float)((h >> 12) % 160);
+		float lat = ROAD_C((int)(h % ROADS)) + (((h >> 8) & 1) ? SW_OFF : -SW_OFF);
+		float s = -CITY_H + 10.0f + (float)((h >> 12) % (int)(2.0f * CITY_H - 20.0f));
 		crates[i].x = ((h >> 20) & 1) ? lat : s;
 		crates[i].z = ((h >> 20) & 1) ? s : lat;
 		crates[i].active = 1;
@@ -1444,6 +1907,14 @@ static void updateAudio(int inGame, int paused) {
 	static float g = 0.0f;
 	static int hornT = 400, sirenT = 1800;
 	if (!sndOK) return;
+	if (musicFail) { musicFail = 0; if (gMusicMode == 1) startTheme(); } // title.pcm turned out to be unreadable
+	if (themeSnd.data) {
+		themeGain += ((musicWant ? 1.0f : 0.0f) - themeGain) * 0.06f;
+		float mix[12];
+		memset(mix, 0, sizeof mix);
+		mix[0] = mix[1] = themeGain * 0.80f;
+		ndspChnSetMix(THEME_CH, mix);
+	}
 	g += ((inGame ? (paused ? 0.35f : 1.0f) : 0.0f) - g) * 0.05f;
 	ambSetVol(0, 0.30f * g);
 	ambSetVol(1, wRain * 0.50f * g);
@@ -1499,7 +1970,7 @@ static void drawHud2D(float aim, int armed, float fade) {
 
 // ---- bottom screen: street map ----------------------------------------------
 // North is up (-Z). The map scrolls so the player circle always stays in the centre.
-#define MAP_S   3.0f    // pixels per world unit
+#define MAP_S   2.4f    // pixels per world unit
 #define MAP_CX  160.0f
 #define MAP_CY  88.0f
 #define MAP_H   176.0f  // map viewport height; buttons and the city text sit below it
@@ -1590,6 +2061,7 @@ static void drawCentered(const C2D_Text* t, float cx, float y, float scale, u32 
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static int roadIdx(float v) { return clampi((int)floorf((v - ROAD_C(0)) / ROAD_SP + 0.5f), 0, ROADS - 1); }
 
 static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	const u32 cBg    = C2D_Color32(0x12, 0x15, 0x1d, 0xFF);
@@ -1604,13 +2076,32 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, MAP_H, cBg);
 
 	// roads (the whole city ground), then the city blocks on top
-	float ext = GRID * PITCH * 0.5f + 12.0f;
+	float ext = CITY_H + 12.0f;
+	const u32 cPark  = C2D_Color32(0x1d, 0x4a, 0x2c, 0xFF);
+	const u32 cPlaza = C2D_Color32(0x3a, 0x3f, 0x4c, 0xFF);
+	const u32 cBld   = C2D_Color32(0x2f, 0x37, 0x4b, 0xFF);
+	const u32 cTree  = C2D_Color32(0x2a, 0x7a, 0x3c, 0xFF);
 	fillClipped(MAP_CX + (-ext - px) * MAP_S, MAP_CY + (-ext - pz) * MAP_S,
 	            MAP_CX + ( ext - px) * MAP_S, MAP_CY + ( ext - pz) * MAP_S, cRoad);
-	for (int i = 0; i < GRID * GRID; i++) {
+	for (int i = 0; i < GRID; i++) {
+		for (int j = 0; j < GRID; j++) {
+			float bx = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)i, bz = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)j;
+			int t = blkType[i][j];
+			fillClipped(MAP_CX + (bx - BLK_H - px) * MAP_S, MAP_CY + (bz - BLK_H - pz) * MAP_S,
+			            MAP_CX + (bx + BLK_H - px) * MAP_S, MAP_CY + (bz + BLK_H - pz) * MAP_S,
+			            t == BT_PARK ? cPark : (t == BT_PLAZA ? cPlaza : cBlock));
+		}
+	}
+	for (int i = 0; i < nBld; i++) {
 		const Building* b = &bldg[i];
-		fillClipped(MAP_CX + (b->x0 - 1.5f - px) * MAP_S, MAP_CY + (b->z0 - 1.5f - pz) * MAP_S,
-		            MAP_CX + (b->x1 + 1.5f - px) * MAP_S, MAP_CY + (b->z1 + 1.5f - pz) * MAP_S, cBlock);
+		if (b->kind == 1) {
+			float cx = MAP_CX + ((b->x0 + b->x1) * 0.5f - px) * MAP_S, cy = MAP_CY + ((b->z0 + b->z1) * 0.5f - pz) * MAP_S;
+			if (cx > 3.0f && cx < 317.0f && cy > 3.0f && cy < MAP_H - 3.0f)
+				C2D_DrawRectSolid(cx - 2.0f, cy - 2.0f, 0.5f, 4.0f, 4.0f, cTree);
+			continue;
+		}
+		fillClipped(MAP_CX + (b->x0 - px) * MAP_S, MAP_CY + (b->z0 - pz) * MAP_S,
+		            MAP_CX + (b->x1 - px) * MAP_S, MAP_CY + (b->z1 - pz) * MAP_S, b->kind == 2 ? cPark : cBld);
 	}
 	// road centre lines
 	for (int k = 0; k < ROADS; k++) {
@@ -1622,7 +2113,7 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	// traffic
 	for (int i = 0; i < N_CARS; i++) {
 		const Car* c = &cars[i];
-		float lane = ROAD_C(c->road) + c->dir * 1.3f;
+		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float wx = (c->axis == 0) ? c->s : lane, wz = (c->axis == 0) ? lane : c->s;
 		float sx = MAP_CX + (wx - px) * MAP_S, sy = MAP_CY + (wz - pz) * MAP_S;
 		if (sx > 2.0f && sx < 318.0f && sy > 2.0f && sy < MAP_H - 2.0f)
@@ -1729,10 +2220,10 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	drawCentered(&btnBlackout, 239.0f, (float)BTN_Y0 + 3.0f, 0.45f, cText);
 
 	// where in Chicago the player is
-	int ni = clampi((int)floorf((px + 96.0f) / 48.0f), 0, 3);
-	int nj = clampi((int)floorf((pz + 96.0f) / 48.0f), 0, 3);
-	int a  = clampi((int)floorf((px + 72.0f) / 24.0f + 0.5f), 0, ROADS - 1);
-	int b  = clampi((int)floorf((pz + 72.0f) / 24.0f + 0.5f), 0, ROADS - 1);
+	int ni = clampi((int)floorf((px + CITY_H) / CELL_W), 0, 3);
+	int nj = clampi((int)floorf((pz + CITY_H) / CELL_W), 0, 3);
+	int a  = roadIdx(px);
+	int b  = roadIdx(pz);
 	char line1[64], line2[96];
 	snprintf(line1, sizeof line1, "%s, Chicago, IL", hoods[nj][ni]);
 	snprintf(line2, sizeof line2, "Near %s & %s", vNames[a], hNames[b]);
@@ -1747,7 +2238,15 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 
 static void drawTitleBottom(int frame) {
 	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, 240.0f, C2D_Color32(0x0b, 0x0d, 0x14, 0xFF));
-	C2D_Text t1, t2, t3, t4, t5;
+	C2D_Text t1, t2, t3, t4, t5, t6;
+	{
+		const char* msg = gMusicMode == 1 ? "MUSIC: title.pcm" :
+		                  gMusicMode == 2 ? "MUSIC: built-in theme  (title.pcm not found)" :
+		                  gMusicMode == 3 ? "NO SOUND: put dspfirm.cdc in SD:/3ds/" : "MUSIC: starting...";
+		C2D_TextParse(&t6, gDyn, msg);
+		C2D_TextOptimize(&t6);
+		drawCentered(&t6, 160.0f, 6.0f, 0.34f, gMusicMode == 3 ? C2D_Color32(0xFF, 0x80, 0x70, 0xFF) : C2D_Color32(0x6b, 0x73, 0x8c, 0xFF));
+	}
 	C2D_TextParse(&t1, gDyn, "CHICAGO 3DS");
 	C2D_TextParse(&t2, gDyn, "a low-poly hacking sandbox");
 	C2D_TextParse(&t3, gDyn, "PRESS A or TAP TO START");
@@ -2247,12 +2746,8 @@ int main(int argc, char** argv) {
 			phoneTimer--;
 			if (phoneTimer == 80) {
 				if (pending == 1) {
-					hackA = (int)floorf((px + 72.0f) / 24.0f + 0.5f);
-					hackB = (int)floorf((pz + 72.0f) / 24.0f + 0.5f);
-					if (hackA < 0) hackA = 0;
-					if (hackA > ROADS - 1) hackA = ROADS - 1;
-					if (hackB < 0) hackB = 0;
-					if (hackB > ROADS - 1) hackB = ROADS - 1;
+					hackA = roadIdx(px);
+					hackB = roadIdx(pz);
 					hackTimer = 600;
 				} else if (pending == 2) {
 					hackFrames = 180;
@@ -2293,8 +2788,8 @@ int main(int argc, char** argv) {
 		}
 		if (title) { // slow cinematic orbit around the city
 			orbit += 0.006f;
-			cyaw = orbit; cpitch = 0.55f; cy = 55.0f;
-			cx = sinf(orbit) * 95.0f; cz = cosf(orbit) * 95.0f;
+			cyaw = orbit; cpitch = 0.6f; cy = 140.0f;
+			cx = sinf(orbit) * 200.0f; cz = cosf(orbit) * 200.0f;
 		}
 		if (shake > 0.01f) { cx += rnd() * shake * 0.15f; cy += rnd() * shake * 0.15f; cz += rnd() * shake * 0.15f; }
 
@@ -2312,9 +2807,9 @@ int main(int argc, char** argv) {
 		gCone = !title;
 		unsigned char vis[CELLS]; // which districts the camera can see (the title orbit sees them all)
 		for (int c = 0; c < CELLS; c++) {
-			float dx = ((float)(c & 3) - 1.5f) * 48.0f - cx, dz = ((float)(c >> 2) - 1.5f) * 48.0f - cz;
+			float dx = ((float)(c & 3) - 1.5f) * CELL_W - cx, dz = ((float)(c >> 2) - 1.5f) * CELL_W - cz;
 			float d = sqrtf(dx * dx + dz * dz), dot = dx * gFwdX + dz * gFwdZ;
-			vis[c] = (title || d < 70.0f || dot + 40.0f > 0.62f * d) ? 1 : 0;
+			vis[c] = (title || d < 100.0f || dot + 70.0f > 0.62f * d) ? 1 : 0;
 		}
 
 		// ---- shooting (the crosshair ray starts at the camera; the bullet leaves the barrel) ----
@@ -2376,8 +2871,9 @@ int main(int argc, char** argv) {
 		float t = (hackFrames > 0) ? 0.25f : 1.0f;
 		float fogC[3] = { wSky[0], wSky[1], wSky[2] };
 		if (hackFrames > 0) { fogC[0] = 0.03f; fogC[1] = 0.03f; fogC[2] = 0.06f; }
-		float fogK = 1.0f / (wFogE - wFogS);
-		float fogA = gFog ? -fogK : 0.0f, fogB = gFog ? -wFogS * fogK : 0.0f;
+		float fS = title ? wFogS + 140.0f : wFogS, fE = title ? wFogE + 260.0f : wFogE; // the title orbit is far above the city
+		float fogK = 1.0f / (fE - fS);
+		float fogA = gFog ? -fogK : 0.0f, fogB = gFog ? -fS * fogK : 0.0f;
 		float glow = wNight + 0.35f * wDusk + 0.12f * wRain;
 		if (glow > 1.0f) glow = 1.0f;
 
