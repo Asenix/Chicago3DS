@@ -40,8 +40,7 @@ $(TARGET).elf: build/main.o build/vshader.o
 	arm-none-eabi-gcc $(LDFLAGS) $^ $(LIBS) -o $@
 
 $(TARGET).smdh:
-	bannertool makesmdh -s "$(APP_TITLE)" -l "$(APP_DESCRIPTION)" -p "$(APP_AUTHOR)" -i "$(APP_ICON)" -o $@
-
+	smdhtool --create "$(APP_TITLE)" "$(APP_DESCRIPTION)" "$(APP_AUTHOR)" "$(APP_ICON)" $@
 $(TARGET).3dsx: $(TARGET).elf $(TARGET).smdh
 	3dsxtool $(TARGET).elf $@ --smdh=$(TARGET).smdh --romfs=romfs
 
