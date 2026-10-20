@@ -38,6 +38,9 @@
 #define N_DROPS   11
 #define N_CARS    22
 #define N_PEDS    20
+static int gTraffic = 1;   // cars and pedestrians exist in Free Roam only
+#define NCARS (gTraffic ? N_CARS : 0)
+#define NPEDS (gTraffic ? N_PEDS : 0)
 #define N_STARS   70
 #define ROADS     7
 #define PLAYER_R  0.6f
@@ -610,7 +613,7 @@ static void buildCity(void) {
 #define MUS_RATE 32000
 #define PI_F     3.14159265f
 enum { SFX_PISTOL, SFX_SMG, SFX_SHOTGUN, SFX_ROCKET, SFX_EXPLODE, SFX_HIT, SFX_CLICK, SFX_SWITCH,
-       SFX_PICKUP, SFX_HORN, SFX_STEP, SFX_SIREN, SFX_COUNT };
+       SFX_PICKUP, SFX_HORN, SFX_STEP, SFX_SIREN, SFX_BEEP, SFX_GO, SFX_HURT, SFX_LEVEL, SFX_HEAL, SFX_COUNT };
 typedef struct { s16* data; int n; } Snd;
 static Snd sfx[SFX_COUNT], ambSnd[4]; // ambience: 0 city, 1 rain, 2 night crickets, 3 daytime birds
 static int sndOK = 0;
@@ -638,7 +641,7 @@ static Snd newSnd(int n) {
 }
 
 static Snd synthSfx(int id) {
-	static const float dur[SFX_COUNT] = {0.22f, 0.13f, 0.55f, 0.90f, 1.40f, 0.12f, 0.05f, 0.12f, 0.25f, 0.55f, 0.09f, 3.60f};
+	static const float dur[SFX_COUNT] = {0.22f, 0.13f, 0.55f, 0.90f, 1.40f, 0.12f, 0.05f, 0.12f, 0.25f, 0.55f, 0.09f, 3.60f, 0.22f, 0.65f, 0.16f, 0.90f, 0.60f};
 	int n = (int)(dur[id] * SFX_RATE);
 	Snd s = newSnd(n);
 	if (!s.data) return s;
@@ -695,6 +698,24 @@ static Snd synthSfx(int id) {
 			v = e * 0.35f * (sinf(ph) + 0.3f * sinf(2.0f * ph));
 			break;
 		}
+		case SFX_BEEP: // countdown tick
+			v = 0.6f * sinf(2.0f * PI_F * 880.0f * t) * fminf(1.0f, t * 200.0f) * expf(-t * 7.0f);
+			break;
+		case SFX_GO:   // countdown GO
+			v = 0.6f * (sinf(2.0f * PI_F * 1320.0f * t) + 0.4f * sinf(2.0f * PI_F * 1980.0f * t)) * fminf(1.0f, t * 200.0f) * expf(-t * 4.5f);
+			break;
+		case SFX_HURT: // the player gets hit
+			v = 0.9f * sinf(2.0f * PI_F * (150.0f - 220.0f * t) * t) * expf(-t * 18.0f) + 0.5f * lp * expf(-t * 25.0f);
+			break;
+		case SFX_LEVEL: { // rising arpeggio
+			int k = (int)(t / 0.12f); if (k > 4) k = 4;
+			static const float nf[5] = {392.0f, 494.0f, 587.0f, 784.0f, 988.0f};
+			v = 0.5f * sinf(2.0f * PI_F * nf[k] * t) * expf(-fmodf(t, 0.12f) * 6.0f) * (k == 4 ? expf(-(t - 0.48f) * 3.5f) : 1.0f);
+			break;
+		}
+		case SFX_HEAL:
+			v = 0.45f * sinf(2.0f * PI_F * (440.0f + 500.0f * t) * t) * sinf(PI_F * t / dur[id]);
+			break;
 		}
 		s.data[i] = pcm(v * 0.7f); // headroom so the shots don't clip
 	}
@@ -1039,7 +1060,7 @@ static void initCars(void) {
 
 static void updateCars(int frame, float px, float pz) {
 	if (hackTimer > 0) hackTimer--;
-	for (int i = 0; i < N_CARS; i++) {
+	for (int i = 0; i < NCARS; i++) {
 		Car* c = &cars[i];
 		float lane = ROAD_C(c->road) + c->dir * LANE;
 		int stop = 0;
@@ -1054,7 +1075,7 @@ static void updateCars(int frame, float px, float pz) {
 			}
 		}
 		// car ahead in the same lane
-		for (int j = 0; j < N_CARS && !stop; j++) {
+		for (int j = 0; j < NCARS && !stop; j++) {
 			if (j == i) continue;
 			const Car* o = &cars[j];
 			if (o->axis == c->axis && o->road == c->road && o->dir == c->dir) {
@@ -1074,21 +1095,22 @@ static void updateCars(int frame, float px, float pz) {
 	}
 }
 
-static int blocked(float x, float z) {
+static int blockedR(float x, float z, float r) {
 	for (int i = 0; i < nBld; i++) {
 		const Building* b = &bldg[i];
-		if (x > b->x0 - PLAYER_R && x < b->x1 + PLAYER_R &&
-		    z > b->z0 - PLAYER_R && z < b->z1 + PLAYER_R) return 1;
+		if (x > b->x0 - r && x < b->x1 + r && z > b->z0 - r && z < b->z1 + r) return 1;
 	}
 	float lim = CITY_H + 20.0f;
 	return (x < -lim || x > lim || z < -lim || z > lim);
 }
+static int blocked(float x, float z) { return blockedR(x, z, PLAYER_R); }
 
 // ---- characters ------------------------------------------------------------
 // Blocky low-poly person built from rotated boxes. Body space: feet at the origin,
 // facing -Z. Each part swings about its joint (X axis), then the whole body leans
 // and turns to its heading.
 static float gPx, gPz, gFace, gLean, gBob;
+static float gBaseY = 0.0f;                  // height of the floor under the bodies being drawn (target-practice room)
 static float gSx = 1.0f, gSy = 1.0f; // body scale: width, height (pedestrians come in different builds)
 
 static void addPart(float jx, float jy, float jz, float ox, float oy, float oz,
@@ -1117,12 +1139,27 @@ static void addPart(float jx, float jy, float jz, float ox, float oy, float oz,
 }
 
 static void addShadow(float x, float z, float hx, float hz, float a) {
-	float p0[3] = {x - hx, 0.10f, z - hz}, p1[3] = {x + hx, 0.10f, z - hz};
-	float p2[3] = {x + hx, 0.10f, z + hz}, p3[3] = {x - hx, 0.10f, z + hz};
+	float p0[3] = {x - hx, 0.10f + gBaseY, z - hz}, p1[3] = {x + hx, 0.10f + gBaseY, z - hz};
+	float p2[3] = {x + hx, 0.10f + gBaseY, z + hz}, p3[3] = {x - hx, 0.10f + gBaseY, z + hz};
 	gAlpha = a;
 	quad(p0, p1, p2, p3, 0.0f, 0.0f, 0.0f);
 	gAlpha = 1.0f;
 }
+
+// ---- weapon definitions ----
+typedef struct {
+	const char* name;
+	int startAmmo, pickupAmmo, cooldown, autoFire;
+	float len, thick, r, g, b;
+} WDef;
+enum { WP_FISTS, WP_PISTOL, WP_SMG, WP_SHOTGUN, WP_ROCKET, WP_COUNT };
+static const WDef wdef[WP_COUNT] = {
+	{"FISTS",    0,  0,  0, 0, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f},
+	{"PISTOL",  48, 24, 14, 0, 0.30f, 0.05f, 0.14f, 0.14f, 0.16f},
+	{"SMG",    120, 60,  4, 1, 0.50f, 0.06f, 0.10f, 0.10f, 0.12f},
+	{"SHOTGUN", 16,  8, 38, 0, 0.85f, 0.06f, 0.30f, 0.20f, 0.12f},
+	{"ROCKET",   4,  2, 72, 0, 0.95f, 0.12f, 0.22f, 0.30f, 0.18f}
+};
 
 // ---- pedestrians -------------------------------------------------------------
 // They walk the sidewalks and wait at the kerb until the cross traffic has a red light.
@@ -1216,7 +1253,7 @@ static void respawnPed(Ped* p, int salt) {
 
 static void updatePeds(int frame) {
 	static int respawns = 0;
-	for (int i = 0; i < N_PEDS; i++) {
+	for (int i = 0; i < NPEDS; i++) {
 		Ped* p = &peds[i];
 		if (p->dead) {
 			if (++p->deadT > 360) respawnPed(p, ++respawns + i);
@@ -1246,21 +1283,20 @@ static void pedPos(const Ped* p, float* x, float* z) {
 	*z = (p->axis == 0) ? lat : p->s;
 }
 
-static void drawPed(const Ped* p) {
-	float x, z;
-	pedPos(p, &x, &z);
-	float mx = (p->axis == 0) ? (float)p->dir : 0.0f, mz = (p->axis == 0) ? 0.0f : (float)p->dir;
-	gPx = x; gPz = z; gFace = atan2f(-mx, -mz);
+// Draws one person. gun = weapon id held (0 = none), aim = how far the gun is raised (0 hip .. 1 aiming).
+static void drawBody(const Ped* p, float x, float z, float face, float ph, int walk, int panic, int dead, int deadT, int gun, float aim) {
+	gPx = x; gPz = z; gFace = face;
 	float s;
-	if (p->dead) { // topples over backwards and stays down
-		float fall = (float)p->deadT * 0.09f;
+	if (dead) { // topples over backwards and stays down
+		float fall = (float)deadT * 0.09f;
 		gLean = fall < 1.45f ? fall : 1.45f;
-		gBob = 0.15f * (gLean / 1.45f);
+		gBob = gBaseY + 0.15f * (gLean / 1.45f);
 		s = 0.0f;
+		gun = 0;
 	} else {
 		gLean = 0.0f;
-		gBob = p->walk ? fabsf(cosf(p->ph)) * 0.03f : 0.0f;
-		s = p->walk ? sinf(p->ph) * (p->panic > 0 ? 0.8f : 0.5f) : 0.0f;
+		gBob = gBaseY + (walk ? fabsf(cosf(ph)) * 0.03f : 0.0f);
+		s = walk ? sinf(ph) * (panic ? 0.8f : 0.5f) : 0.0f;
 	}
 	gSy = p->scale; gSx = p->scale * p->width;
 	const float* sh = p->shirt; const float* pa = p->pants; const float* sk = p->skin;
@@ -1294,6 +1330,7 @@ static void drawPed(const Ped* p) {
 	// arms
 	for (int side = -1; side <= 1; side += 2) {
 		float sw = (side < 0) ? -s : s, jx = 0.36f * (float)side;
+		if (gun > 0) sw = (side < 0) ? 0.25f + 1.20f * aim : 0.35f + 1.20f * aim;
 		if (longSleeves) {
 			addPart(jx, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.065f, 0.30f, 0.065f, sw, sh[0], sh[1], sh[2]);
 			if (near) addPart(jx, 1.50f, 0.0f, 0.0f, -0.58f, 0.0f, 0.07f, 0.05f, 0.07f, sw, sk[0], sk[1], sk[2]);
@@ -1301,6 +1338,12 @@ static void drawPed(const Ped* p) {
 			addPart(jx, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.065f, 0.30f, 0.065f, sw, sk[0], sk[1], sk[2]);
 			if (shortSleeves) addPart(jx, 1.50f, 0.0f, 0.0f, -0.10f, 0.0f, 0.075f, 0.14f, 0.075f, sw, sh[0], sh[1], sh[2]);
 		}
+	}
+
+	if (gun > 0) { // the weapon in the right hand
+		const WDef* w = &wdef[gun];
+		float rs = 0.35f + 1.20f * aim;
+		addPart(0.36f, 1.50f, 0.0f, 0.0f, -0.58f - w->len * 0.35f, 0.0f, w->thick * 0.5f, w->len * 0.5f, w->thick * 0.9f, rs, w->r, w->g, w->b);
 	}
 
 	// head, hair or head covering, face details
@@ -1329,22 +1372,29 @@ static void drawPed(const Ped* p) {
 	gSx = 1.0f; gSy = 1.0f;
 }
 
+static void drawPed(const Ped* p) {
+	float x, z;
+	pedPos(p, &x, &z);
+	float mx = (p->axis == 0) ? (float)p->dir : 0.0f, mz = (p->axis == 0) ? 0.0f : (float)p->dir;
+	drawBody(p, x, z, atan2f(-mx, -mz), p->ph, p->walk, p->panic > 0, p->dead, p->deadT, 0, 0.0f);
+}
+
 // Rebuilds the dynamic tail of the vertex buffer: shadows, cars, pedestrians (only those near the camera).
 static void drawDynamic(void) {
 	vcount = staticCount;
-	for (int i = 0; i < N_CARS; i++) {
+	for (int i = 0; i < NCARS; i++) {
 		const Car* c = &cars[i];
 		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float cx = (c->axis == 0) ? c->s : lane, cz = (c->axis == 0) ? lane : c->s;
 		if (!inView(cx, cz)) continue;
 		addShadow(cx, cz, (c->axis == 0) ? 2.4f : 1.3f, (c->axis == 0) ? 1.3f : 2.4f, 0.38f);
 	}
-	for (int i = 0; i < N_PEDS; i++) {
+	for (int i = 0; i < NPEDS; i++) {
 		float x, z;
 		pedPos(&peds[i], &x, &z);
 		if (inView(x, z)) addShadow(x, z, 0.38f, 0.30f, 0.34f);
 	}
-	for (int i = 0; i < N_CARS; i++) {
+	for (int i = 0; i < NCARS; i++) {
 		const Car* c = &cars[i];
 		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float hx = (c->axis == 0) ? 2.1f : 1.0f, hz = (c->axis == 0) ? 1.0f : 2.1f;
@@ -1355,7 +1405,7 @@ static void drawDynamic(void) {
 		addBoxG(cx - gx, cz - gz, cx + gx, cz + gz, 1.05f, 1.55f, 0.07f, 0.09f, 0.13f, 0.9f, 1.0f); // glass
 		addBoxG(cx - gx, cz - gz, cx + gx, cz + gz, 1.55f, 1.66f, c->r * 0.9f, c->g * 0.9f, c->b * 0.9f, 1.0f, 1.0f); // roof
 	}
-	for (int i = 0; i < N_PEDS; i++) {
+	for (int i = 0; i < NPEDS; i++) {
 		float x, z;
 		pedPos(&peds[i], &x, &z);
 		if (inView(x, z)) drawPed(&peds[i]);
@@ -1366,7 +1416,7 @@ static void drawDynamic(void) {
 // Emissive geometry (signal heads, head/tail lights): drawn with its own tint so it stays bright at night.
 static void drawLights(int frame, float night) {
 	int start = vcount;
-	for (int i = 0; i < N_CARS; i++) {
+	for (int i = 0; i < NCARS; i++) {
 		const Car* c = &cars[i];
 		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float wx = (c->axis == 0) ? c->s : lane, wz = (c->axis == 0) ? lane : c->s;
@@ -1406,20 +1456,202 @@ static void drawLights(int frame, float night) {
 static void addBillboard(float X, float Y, float Z, float hw, float hh, float rx, float rz,
                          float r, float g, float b, float a);
 
-// ---- weapons ---------------------------------------------------------------
+// ---- game modes: shared state ----------------------------------------------------------------
+enum { M_FREE, M_DM, M_BR, M_TP };
+enum { GS_COUNTDOWN, GS_PLAY, GS_OVER };
+static int   gMode = M_FREE, gState = GS_PLAY, gCount = 0;
+static float plHp = 100.0f;        // player health 0..100
+static int   plSince = 999;        // frames since the player was last hurt
+static int   plHeal = 0, plMedkits = 0, plRegen = 0, plFlash = 0;
+static float plHitAng[4], plHitZ[4]; // where the last hits came from (x, z of the attacker)
+static int   plHitLife[4];
+static int   ownedW[WP_COUNT];     // weapons the player has
+static float gPlX = 0.0f, gPlZ = 0.0f, gPlYaw = 0.0f, gCamYaw = 0.0f;
+static int   gPlRun = 0;
+static int   gKills = 0, gLevel = 0, gTime = 0, gBanner = 0;
+
+// ---- navigation grid (A* for the computer-controlled fighters) -------------------------------
+#define NAV_C 2.0f
+#define NAV_N 168
+#define NAV_H (NAV_N * NAV_C * 0.5f)
+static u8  navOpen[NAV_N * NAV_N];
+static u16 navG[NAV_N * NAV_N], navStamp[NAV_N * NAV_N];
+static u8  navPar[NAV_N * NAV_N];
+static u32 navHeap[50000];
+static int navHN = 0, navGoalX = 0, navGoalZ = 0;
+static u16 navGen = 0;
+static short navTmpX[600], navTmpZ[600];
+
+static int navCell(float v) {
+	int c = (int)floorf((v + NAV_H) / NAV_C);
+	return c < 0 ? 0 : (c >= NAV_N ? NAV_N - 1 : c);
+}
+static float navWorld(int c) { return -NAV_H + ((float)c + 0.5f) * NAV_C; }
+static int navIsOpen(float x, float z) { return navOpen[navCell(z) * NAV_N + navCell(x)]; }
+
+static int navSnap(int* cx, int* cz);
+static void initNav(void) {
+	memset(navOpen, 1, sizeof navOpen);
+	float lim = CITY_H + 6.0f;
+	for (int cz = 0; cz < NAV_N; cz++)
+		for (int cx = 0; cx < NAV_N; cx++)
+			if (fabsf(navWorld(cx)) > lim || fabsf(navWorld(cz)) > lim) navOpen[cz * NAV_N + cx] = 0;
+	for (int i = 0; i < nBld; i++) { // buildings, trees and fountains with a metre of clearance
+		const Building* b = &bldg[i];
+		const float m = 1.0f;
+		int x0 = navCell(b->x0 - m), x1 = navCell(b->x1 + m), z0 = navCell(b->z0 - m), z1 = navCell(b->z1 + m);
+		for (int cz = z0; cz <= z1; cz++)
+			for (int cx = x0; cx <= x1; cx++) {
+				float wx = navWorld(cx), wz = navWorld(cz);
+				if (wx > b->x0 - m && wx < b->x1 + m && wz > b->z0 - m && wz < b->z1 + m) navOpen[cz * NAV_N + cx] = 0;
+			}
+	}
+	// close off pockets that cannot be reached from the main streets (fenced courtyards etc.)
+	static u8 seen[NAV_N * NAV_N];
+	static u16 q[NAV_N * NAV_N];
+	memset(seen, 0, sizeof seen);
+	int s0 = navCell(0.0f) * NAV_N + navCell(0.0f), qh = 0, qt = 0;
+	int sx = s0 % NAV_N, sz = s0 / NAV_N;
+	navSnap(&sx, &sz);
+	s0 = sz * NAV_N + sx;
+	seen[s0] = 1; q[qt++] = (u16)s0;
+	while (qh < qt) {
+		int i = q[qh++], x = i % NAV_N, z = i / NAV_N;
+		static const int dx[4] = {1, -1, 0, 0}, dz[4] = {0, 0, 1, -1};
+		for (int d = 0; d < 4; d++) {
+			int nx = x + dx[d], nz = z + dz[d];
+			if (nx < 0 || nz < 0 || nx >= NAV_N || nz >= NAV_N) continue;
+			int ni = nz * NAV_N + nx;
+			if (navOpen[ni] && !seen[ni]) { seen[ni] = 1; q[qt++] = (u16)ni; }
+		}
+	}
+	for (int i = 0; i < NAV_N * NAV_N; i++) if (!seen[i]) navOpen[i] = 0;
+}
+
+static int navSnap(int* cx, int* cz) { // nearest open cell
+	if (navOpen[*cz * NAV_N + *cx]) return 1;
+	for (int r = 1; r <= 8; r++)
+		for (int dz = -r; dz <= r; dz++)
+			for (int dx = -r; dx <= r; dx++) {
+				if (abs(dx) != r && abs(dz) != r) continue;
+				int x = *cx + dx, z = *cz + dz;
+				if (x < 0 || z < 0 || x >= NAV_N || z >= NAV_N) continue;
+				if (navOpen[z * NAV_N + x]) { *cx = x; *cz = z; return 1; }
+			}
+	return 0;
+}
+
+static void navPush(u32 k) {
+	if (navHN >= 50000) return;
+	int i = navHN++;
+	while (i > 0) {
+		int p = (i - 1) >> 1;
+		if (navHeap[p] <= k) break;
+		navHeap[i] = navHeap[p];
+		i = p;
+	}
+	navHeap[i] = k;
+}
+
+static u32 navPop(void) {
+	u32 top = navHeap[0], k = navHeap[--navHN];
+	int i = 0;
+	for (;;) {
+		int c = 2 * i + 1;
+		if (c >= navHN) break;
+		if (c + 1 < navHN && navHeap[c + 1] < navHeap[c]) c++;
+		if (navHeap[c] >= k) break;
+		navHeap[i] = navHeap[c];
+		i = c;
+	}
+	if (navHN > 0) navHeap[i] = k;
+	return top;
+}
+
+static int navH(int cx, int cz) { // octile distance to the goal
+	int dx = abs(cx - navGoalX), dz = abs(cz - navGoalZ);
+	return 10 * (dx > dz ? dx : dz) + 4 * (dx < dz ? dx : dz);
+}
+
+// A* over the grid. Writes up to maxN cells (start first) and returns how many; 0 = no route.
+static int navPath(float sx, float sz, float tx, float tz, short* oc, short* oz, int maxN) {
+	static const signed char kDx[8] = {1, -1, 0, 0, 1, 1, -1, -1}, kDz[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+	static const u8 kCost[8] = {10, 10, 10, 10, 14, 14, 14, 14};
+	int scx = navCell(sx), scz = navCell(sz), tcx = navCell(tx), tcz = navCell(tz);
+	if (!navSnap(&scx, &scz) || !navSnap(&tcx, &tcz)) return 0;
+	int start = scz * NAV_N + scx, goal = tcz * NAV_N + tcx;
+	if (start == goal) { oc[0] = (short)tcx; oz[0] = (short)tcz; return 1; }
+	if (++navGen == 0) { memset(navStamp, 0, sizeof navStamp); navGen = 1; }
+	navGoalX = tcx; navGoalZ = tcz;
+	navHN = 0;
+	navG[start] = 0; navStamp[start] = navGen; navPar[start] = 255;
+	int bestIdx = start, bestH = navH(scx, scz), expanded = 0, found = 0;
+	navPush(((u32)bestH << 16) | (u32)start);
+	while (navHN > 0) {
+		u32 key = navPop();
+		int idx = (int)(key & 0xFFFFu), cx = idx % NAV_N, cz = idx / NAV_N, h = navH(cx, cz);
+		if ((key >> 16) != (u32)(navG[idx] + h)) continue; // stale entry
+		if (idx == goal) { found = 1; break; }
+		if (h < bestH) { bestH = h; bestIdx = idx; }
+		if (++expanded > 6000) break;
+		for (int d = 0; d < 8; d++) {
+			int nx = cx + kDx[d], nz = cz + kDz[d];
+			if (nx < 0 || nz < 0 || nx >= NAV_N || nz >= NAV_N) continue;
+			int nidx = nz * NAV_N + nx;
+			if (!navOpen[nidx]) continue;
+			if (d >= 4 && (!navOpen[cz * NAV_N + nx] || !navOpen[nz * NAV_N + cx])) continue; // no corner cutting
+			int ng = navG[idx] + kCost[d];
+			if (navStamp[nidx] != navGen || ng < navG[nidx]) {
+				navStamp[nidx] = navGen; navG[nidx] = (u16)ng; navPar[nidx] = (u8)d;
+				int f = ng + navH(nx, nz);
+				if (f > 65535) continue;
+				navPush(((u32)f << 16) | (u32)nidx);
+			}
+		}
+	}
+	int cur = found ? goal : bestIdx, L = 0;
+	while (cur != start && L < 598) {
+		navTmpX[L] = (short)(cur % NAV_N); navTmpZ[L] = (short)(cur / NAV_N); L++;
+		int d = navPar[cur];
+		cur = (cur / NAV_N - kDz[d]) * NAV_N + (cur % NAV_N - kDx[d]);
+	}
+	navTmpX[L] = (short)(start % NAV_N); navTmpZ[L] = (short)(start / NAV_N); L++;
+	int n = 0;
+	for (int i = L - 1; i >= 0 && n < maxN; i--) { oc[n] = navTmpX[i]; oz[n] = navTmpZ[i]; n++; }
+	return n;
+}
+
+static int navSegClear(float ax, float az, float bx, float bz) { // straight line over open cells only
+	float dx = bx - ax, dz = bz - az, L = sqrtf(dx * dx + dz * dz);
+	int n = (int)L + 1;
+	for (int i = 1; i <= n; i++) {
+		float t = (float)i / (float)n;
+		if (!navIsOpen(ax + dx * t, az + dz * t)) return 0;
+	}
+	return 1;
+}
+
+// ---- computer-controlled fighters ----------------------------------------------------------
+#define MAX_BOTS 14
+#define PATH_N   40
 typedef struct {
-	const char* name;
-	int startAmmo, pickupAmmo, cooldown, autoFire;
-	float len, thick, r, g, b;
-} WDef;
-enum { WP_FISTS, WP_PISTOL, WP_SMG, WP_SHOTGUN, WP_ROCKET, WP_COUNT };
-static const WDef wdef[WP_COUNT] = {
-	{"FISTS",    0,  0,  0, 0, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f},
-	{"PISTOL",  48, 24, 14, 0, 0.30f, 0.05f, 0.14f, 0.14f, 0.16f},
-	{"SMG",    120, 60,  4, 1, 0.50f, 0.06f, 0.10f, 0.10f, 0.12f},
-	{"SHOTGUN", 16,  8, 38, 0, 0.85f, 0.06f, 0.30f, 0.20f, 0.12f},
-	{"ROCKET",   4,  2, 72, 0, 0.95f, 0.12f, 0.22f, 0.30f, 0.18f}
-};
+	Ped look;                                   // how this one looks (skin, hair, outfit ...)
+	int active, dead, deadT, gun, medkits, tgt, cool, burst, healT, thinkT, losT, los, pathN, pathI, repathT, strafeT, walk;
+	float x, z, face, ph, hp, hpMax, goalX, goalZ, strafe, skill, aim, tdist;
+	int own[WP_COUNT], ammoB[WP_COUNT];
+	short pcx[PATH_N], pcz[PATH_N];
+} Bot;
+static Bot bots[MAX_BOTS];
+
+// damage a computer-controlled fighter takes from one hit of each weapon, and how far each gun reaches
+static const int   kDmg[WP_COUNT]   = {8, 22, 12, 11, 100};
+static const float kRange[WP_COUNT] = {2.0f, 45.0f, 40.0f, 22.0f, 60.0f};
+static int gExplSrc = -1;                           // who fired the rocket that is exploding: -1 player, 0.. a fighter
+static void damageBot(int i, int dmg, int src);     // src: -1 player, >= 0 fighter, -3 storm
+static void damagePlayer(int dmg, float fromX, float fromZ, int src);
+static void splashDamage(float x, float z, int src);
+
+// ---- weapons ---------------------------------------------------------------
 static int   ammo[WP_COUNT], curWeapon = WP_PISTOL, fireCool = 0;
 static float kick = 0.0f, shake = 0.0f, recoilAnim = 0.0f;
 static int   hitMark = 0, killMark = 0;
@@ -1499,7 +1731,7 @@ typedef struct { float x, y, z, size, grow, life, maxLife, r, g, b; } Fx;
 static Fx fxs[N_FX];
 static int fxNext = 0;
 typedef struct { float a[3], b[3]; int life; } Tracer;
-#define N_TR 12
+#define N_TR 32
 static Tracer trs[N_TR];
 static int trNext = 0;
 typedef struct { int alive, life; float p[3], v[3]; } Rocket;
@@ -1564,7 +1796,7 @@ static float castRay(const float o[3], const float d[3], float maxT, int* ped) {
 		float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
 		if (t >= 0.0f && t < best) best = t;
 	}
-	for (int i = 0; i < N_CARS; i++) {
+	for (int i = 0; i < NCARS; i++) {
 		const Car* c = &cars[i];
 		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float hx = (c->axis == 0) ? 2.1f : 1.0f, hz = (c->axis == 0) ? 1.0f : 2.1f;
@@ -1572,12 +1804,18 @@ static float castRay(const float o[3], const float d[3], float maxT, int* ped) {
 		float t = rayBox(o, d, cx - hx, 0.15f, cz - hz, cx + hx, 1.66f, cz + hz);
 		if (t >= 0.0f && t < best) best = t;
 	}
-	for (int i = 0; i < N_PEDS; i++) {
+	for (int i = 0; i < NPEDS; i++) {
 		if (peds[i].dead) continue;
 		float x, z;
 		pedPos(&peds[i], &x, &z);
 		float t = rayCyl(o, d, x, z, 0.45f, 0.0f, 1.8f);
 		if (t >= 0.0f && t < best) { best = t; *ped = i; }
+	}
+	for (int i = 0; i < MAX_BOTS; i++) { // computer-controlled fighters are reported as 100 + index
+		const Bot* b = &bots[i];
+		if (!b->active || b->dead) continue;
+		float t = rayCyl(o, d, b->x, b->z, 0.45f, 0.0f, 1.8f);
+		if (t >= 0.0f && t < best) { best = t; *ped = 100 + i; }
 	}
 	return best;
 }
@@ -1603,13 +1841,13 @@ static void explode(float x, float y, float z) {
 	float sh = 1.4f / (1.0f + dist * 0.08f);
 	if (sh > shake) shake = sh;
 	playSfx(SFX_EXPLODE, 1.0f);
-	for (int i = 0; i < N_PEDS; i++) {
+	for (int i = 0; i < NPEDS; i++) {
 		if (peds[i].dead) continue;
 		float px, pz;
 		pedPos(&peds[i], &px, &pz);
 		float ex = px - x, ey = 0.9f - y, ez = pz - z;
 		if (ex * ex + ey * ey + ez * ez < 7.5f * 7.5f) hurtPed(i, 99);
-	}
+	}	splashDamage(x, z, gExplSrc);
 }
 
 static void normalize3(float v[3]) {
@@ -1639,6 +1877,7 @@ static void fireWeapon(const float cam[3], const float fwd[3], const float muz[3
 	float spread = (w == WP_PISTOL) ? 0.004f : (w == WP_SMG) ? 0.014f : 0.055f;
 	float range = (w == WP_SHOTGUN) ? 35.0f : 90.0f;
 	unsigned hitMask = 0;
+	float botDmg[MAX_BOTS] = {0};
 	for (int k = 0; k < pellets; k++) {
 		float d[3] = {fwd[0] + rnd() * spread, fwd[1] + rnd() * spread, fwd[2] + rnd() * spread};
 		normalize3(d);
@@ -1646,10 +1885,14 @@ static void fireWeapon(const float cam[3], const float fwd[3], const float muz[3
 		float t = castRay(cam, d, range, &pi);
 		float P[3] = {cam[0] + d[0] * t, cam[1] + d[1] * t, cam[2] + d[2] * t};
 		if (k < 3) addTracer(muz, P);
-		if (pi >= 0) hitMask |= 1u << pi;
+		if (pi >= 100) { // a fighter: shotgun pellets lose punch with distance
+			botDmg[pi - 100] += (float)kDmg[w] * (w == WP_SHOTGUN ? 1.0f - 0.7f * t / range : 1.0f);
+			addFx(P[0], P[1], P[2], 0.3f, 0.0f, 5.0f, 0.9f, 0.1f, 0.1f);
+		} else if (pi >= 0) hitMask |= 1u << pi;
 		else if (t < range - 0.01f) addFx(P[0], P[1], P[2], 0.22f, 0.0f, 5.0f, 1.0f, 0.9f, 0.6f); // impact spark
 	}
 	for (int i = 0; i < N_PEDS; i++) if (hitMask & (1u << i)) hurtPed(i, 1);
+	for (int i = 0; i < MAX_BOTS; i++) if (botDmg[i] > 0.0f) damageBot(i, (int)(botDmg[i] + 0.5f), -1);
 	playSfx(w == WP_PISTOL ? SFX_PISTOL : (w == WP_SMG ? SFX_SMG : SFX_SHOTGUN), w == WP_SMG ? 0.55f : 0.8f);
 	kick += (w == WP_PISTOL) ? 0.012f : (w == WP_SMG) ? 0.008f : 0.05f;
 }
@@ -1662,6 +1905,7 @@ static void updateRocket(void) {
 	int pi;
 	float t = castRay(rocket.p, d, spd, &pi);
 	if (t < spd - 0.001f || rocket.p[1] < 0.1f || --rocket.life <= 0) {
+		gExplSrc = -1;
 		explode(rocket.p[0] + d[0] * t, rocket.p[1] + d[1] * t, rocket.p[2] + d[2] * t);
 		rocket.alive = 0;
 		return;
@@ -1818,6 +2062,808 @@ static void addBillboard(float X, float Y, float Z, float hw, float hh, float rx
 }
 
 static float starOff[N_STARS][3];
+// ---- game modes: fighters, loot, storm, Deathmatch and Battle Royale ---------------------------
+static float rnd01(void) { return rnd() * 0.5f + 0.5f; }
+static const char* kNames[16] = {"RILEY", "JAX", "MONA", "DEX", "SAGE", "KOA", "NOVA", "ZED", "LUCA", "IVY", "REX", "TESS", "ONYX", "WREN", "BLAZE", "CLEO"};
+
+#define FEED_N 4
+static char feedTxt[FEED_N][40];
+static int  feedLife[FEED_N];
+static void feedAdd(const char* a, const char* how, const char* b) {
+	for (int i = FEED_N - 1; i > 0; i--) { memcpy(feedTxt[i], feedTxt[i - 1], 40); feedLife[i] = feedLife[i - 1]; }
+	snprintf(feedTxt[0], 40, "%s %s %s", a, how, b);
+	feedLife[0] = 420;
+}
+static int  gToast = 0;
+static char gToastTxt[40];
+static void toast(const char* s) { snprintf(gToastTxt, sizeof gToastTxt, "%s", s); gToast = 150; }
+
+static int gOverT = 0, gPlace = 0, gWon = 0, gGo = 0, gLastMenu = 3, plUnseen = 0, plMoving = 0;
+static int gCratesOn = 1;
+
+// ---- loot ----
+enum { LK_WEAPON, LK_AMMO, LK_MEDKIT };
+typedef struct { float x, z; int kind, w, active; } Loot;
+#define N_LOOT 110
+static Loot loot[N_LOOT];
+
+static int losClear(float ax, float az, float bx, float bz) {
+	float dx = bx - ax, dz = bz - az, L = sqrtf(dx * dx + dz * dz);
+	if (L < 0.5f) return 1;
+	float o[3] = {ax, 1.3f, az}, d[3] = {dx / L, 0.0f, dz / L};
+	float x0 = fminf(ax, bx) - 1.0f, x1 = fmaxf(ax, bx) + 1.0f, z0 = fminf(az, bz) - 1.0f, z1 = fmaxf(az, bz) + 1.0f;
+	for (int i = 0; i < nBld; i++) {
+		const Building* b = &bldg[i];
+		if (b->x1 < x0 || b->x0 > x1 || b->z1 < z0 || b->z0 > z1) continue;
+		float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
+		if (t >= 0.0f && t < L) return 0;
+	}
+	return 1;
+}
+
+// A random open spot on the street grid, optionally far from / hidden from a point.
+static int pickSpot(float* ox, float* oz, float fx, float fz, float minD, float maxD, int hidden) {
+	for (int k = 0; k < 120; k++) {
+		float x = rnd() * (CITY_H - 6.0f), z = rnd() * (CITY_H - 6.0f);
+		if (!navIsOpen(x, z) || !navIsOpen(x + 2.0f, z) || !navIsOpen(x - 2.0f, z) || !navIsOpen(x, z + 2.0f) || !navIsOpen(x, z - 2.0f)) continue;
+		float d = sqrtf((x - fx) * (x - fx) + (z - fz) * (z - fz));
+		if (d < minD || d > maxD) continue;
+		if (hidden && losClear(x, z, fx, fz)) continue;
+		*ox = x; *oz = z;
+		return 1;
+	}
+	*ox = ROAD_C((int)(rnd01() * 6.99f)); *oz = ROAD_C((int)(rnd01() * 6.99f)); // any junction
+	return 0;
+}
+
+// ---- player health ----
+static void plDie(int cause) {
+	if (gState != GS_PLAY) return;
+	gState = GS_OVER; gOverT = 0; gWon = 0;
+	int alive = 0;
+	for (int i = 0; i < MAX_BOTS; i++) if (bots[i].active && !bots[i].dead) alive++;
+	gPlace = alive + 1;
+	(void)cause;
+}
+
+static void damagePlayer(int dmg, float fx, float fz, int src) {
+	if (gState != GS_PLAY || plHp <= 0.0f) return;
+	plHp -= (float)dmg; plSince = 0; plFlash = 14; plHeal = 0;
+	if (src != -3) { // remember where the shot came from for the red direction markers
+		int slot = 0;
+		for (int i = 1; i < 4; i++) if (plHitLife[i] < plHitLife[slot]) slot = i;
+		plHitAng[slot] = fx; plHitZ[slot] = fz; plHitLife[slot] = 70;
+	}
+	playSfx(SFX_HURT, 0.8f);
+	if (plHp <= 0.0f) { plHp = 0.0f; plDie(src); }
+}
+
+static void botName(int i, char* out, int n) { snprintf(out, (size_t)n, "%s", kNames[i & 15]); }
+
+// ---- loot drops ----
+static void dropLoot(float x, float z, int kind, int w) {
+	for (int i = 0; i < N_LOOT; i++) if (!loot[i].active) {
+		loot[i].x = x + rnd() * 0.8f; loot[i].z = z + rnd() * 0.8f; loot[i].kind = kind; loot[i].w = w; loot[i].active = 1;
+		return;
+	}
+}
+
+static const int dmLevelAt[6] = {0, 10, 25, 30, 45, 50}; // kills needed to reach levels 0..5
+static int levelFor(int kills) { int l = 0; for (int i = 1; i < 6; i++) if (kills >= dmLevelAt[i]) l = i; return l; }
+static const int   dmCool[6] = {46, 34, 26, 20, 15, 11};     // frames between shots
+static const float dmAcc[6]  = {0.30f, 0.38f, 0.46f, 0.54f, 0.60f, 0.68f};
+static const int   dmHp[6]   = {50, 60, 70, 80, 95, 110};
+static const int   dmMax[6]  = {3, 4, 5, 6, 7, 8};
+static const int   dmBurst[6] = {1, 2, 2, 3, 3, 4};
+static const int   dmGun[6]  = {WP_PISTOL, WP_PISTOL, WP_SMG, WP_SMG, WP_SMG, WP_SMG};
+
+static void damageBot(int i, int dmg, int src) {
+	Bot* b = &bots[i];
+	if (!b->active || b->dead || gState == GS_OVER) return;
+	b->hp -= (float)dmg;
+	if (src == -1) { hitMark = 8; playSfx(SFX_HIT, 0.5f); }
+	addFx(b->x, 1.2f, b->z, 0.45f, 0.02f, 8.0f, 0.8f, 0.05f, 0.05f);
+	if (b->hp > 0.0f) { if (gMode == M_BR) b->tdist = 0.0f; return; }
+	b->dead = 1; b->deadT = 0; b->walk = 0; b->hp = 0.0f;
+	char nm[16]; botName(i, nm, 16);
+	if (src == -1) {
+		gKills++; killMark = 16;
+		if (gMode == M_BR) feedAdd("YOU", ">", nm);
+		if (gMode == M_DM) {
+			for (int w = 1; w < WP_COUNT; w++) { ammo[w] += (wdef[w].pickupAmmo + 1) / 2; if (ammo[w] > 999) ammo[w] = 999; }
+			int nl = levelFor(gKills);
+			if (nl > gLevel) { gLevel = nl; gBanner = 220; playSfx(SFX_LEVEL, 0.9f); }
+		}
+	} else if (gMode == M_BR) {
+		if (src == -3) feedAdd(nm, "> STORM", "");
+		else { char a[16]; botName(src, a, 16); feedAdd(a, ">", nm); bots[src].look.hp++; }
+	}
+	if (gMode == M_BR) { // drop what it was carrying
+		for (int w = WP_COUNT - 1; w >= 1; w--) if (b->own[w]) { dropLoot(b->x, b->z, LK_WEAPON, w); break; }
+		if (b->medkits > 0) dropLoot(b->x, b->z, LK_MEDKIT, 0);
+		dropLoot(b->x, b->z, LK_AMMO, 0);
+	}
+}
+
+static void splashDamage(float x, float z, int src) {
+	for (int i = 0; i < MAX_BOTS; i++) {
+		Bot* b = &bots[i];
+		if (!b->active || b->dead || i == src) continue;
+		float d = sqrtf((b->x - x) * (b->x - x) + (b->z - z) * (b->z - z));
+		if (d < 6.5f) damageBot(i, (int)(100.0f * (1.0f - d / 7.5f)) + 8, src);
+	}
+	if (gState == GS_PLAY && gMode != M_FREE) {
+		float d = sqrtf((gPlX - x) * (gPlX - x) + (gPlZ - z) * (gPlZ - z));
+		if (d < (src == -1 ? 3.5f : 6.0f)) damagePlayer(src == -1 ? 35 : (gMode == M_DM ? 30 : 60), x, z, src);
+	}
+}
+
+// ---- fighters ----
+static int botsAlive(void) { int n = 0; for (int i = 0; i < MAX_BOTS; i++) if (bots[i].active && !bots[i].dead) n++; return n; }
+
+static void botInit(Bot* b, int idx, float x, float z) {
+	Ped keep = b->look;
+	memset(b, 0, sizeof *b);
+	b->look = keep;
+	styleNpc(&b->look, hash2(idx * 31 + (int)(rnd01() * 1000.0f), 4242));
+	b->look.hp = 0; // kills counter (battle royale)
+	b->active = 1; b->x = x; b->z = z; b->face = rnd() * 3.14f;
+	b->hp = b->hpMax = 100.0f; b->tgt = -2; b->skill = 0.5f;
+	b->thinkT = idx * 3; b->strafe = 1.0f;
+}
+
+static void botSetPath(Bot* b, float tx, float tz) {
+	b->pathN = navPath(b->x, b->z, tx, tz, b->pcx, b->pcz, PATH_N);
+	b->pathI = (b->pathN > 1) ? 1 : 0;
+	b->goalX = tx; b->goalZ = tz; b->repathT = 45;
+}
+
+// walk along the path; returns 1 while moving
+static int botStep(Bot* b, float speed) {
+	for (int k = 0; k < 3 && b->pathI + 1 < b->pathN; k++) { // cut corners when the straight line is clear
+		float wx = navWorld(b->pcx[b->pathI + 1]), wz = navWorld(b->pcz[b->pathI + 1]);
+		if (navSegClear(b->x, b->z, wx, wz)) b->pathI++; else break;
+	}
+	if (b->pathI >= b->pathN) return 0;
+	float wx = navWorld(b->pcx[b->pathI]), wz = navWorld(b->pcz[b->pathI]);
+	float dx = wx - b->x, dz = wz - b->z, d = sqrtf(dx * dx + dz * dz);
+	if (d < 0.7f) { b->pathI++; return b->pathI < b->pathN; }
+	float nx = b->x + dx / d * speed, nz = b->z + dz / d * speed;
+	if (navIsOpen(nx, nz)) { b->x = nx; b->z = nz; }
+	else if (navIsOpen(nx, b->z)) b->x = nx;
+	else if (navIsOpen(b->x, nz)) b->z = nz;
+	else { b->repathT = 0; return 0; }
+	b->ph += speed * 1.3f + 0.02f;
+	return 1;
+}
+
+static void turnTo(float* face, float want, float k) {
+	float dl = want - *face;
+	while (dl >  3.14159f) dl -= 6.28318f;
+	while (dl < -3.14159f) dl += 6.28318f;
+	*face += dl * k;
+}
+
+static int botBestGun(const Bot* b, float dist) {
+	int best = 0, sc = -1;
+	static const int rank[WP_COUNT] = {0, 1, 3, 2, 4};
+	for (int w = 1; w < WP_COUNT; w++) {
+		if (!b->own[w] || b->ammoB[w] <= 0) continue;
+		if (dist > kRange[w]) continue;
+		if (w == WP_ROCKET && dist < 9.0f) continue;
+		if (rank[w] > sc) { sc = rank[w]; best = w; }
+	}
+	return best;
+}
+
+// One shot from fighter b at a target: tgt -1 = the player, >= 0 = another fighter.
+static void botFire(int bi, int tgt, float tx, float tz, float dist, float baseAcc, int dmgOverride) {
+	Bot* b = &bots[bi];
+	int gun = b->gun;
+	float mx = b->x - sinf(b->face) * 0.9f, mz = b->z - cosf(b->face) * 0.9f;
+	float muz[3] = {mx, 1.25f, mz}, P[3] = {tx, 1.1f, tz};
+	float acc = baseAcc * (1.0f - 0.45f * dist / kRange[gun]);
+	if (tgt == -1 && plMoving) acc *= 0.8f;
+	int hit = rnd01() < acc;
+	if (!hit) { P[0] += rnd() * 1.6f; P[1] = 0.3f + rnd01() * 1.5f; P[2] += rnd() * 1.6f; }
+	if (gun == WP_ROCKET) {
+		gExplSrc = bi;
+		explode(P[0], 0.5f, P[2]);
+		gExplSrc = -1;
+	} else {
+		addTracer(muz, P);
+		if (!hit) addFx(P[0], P[1], P[2], 0.22f, 0.0f, 5.0f, 1.0f, 0.9f, 0.6f);
+		float dv = sqrtf((tx - gCamX) * (tx - gCamX) + (tz - gCamZ) * (tz - gCamZ));
+		float vol = 0.9f / (1.0f + dv * 0.05f);
+		playSfx(gun == WP_PISTOL ? SFX_PISTOL : (gun == WP_SMG ? SFX_SMG : SFX_SHOTGUN), vol * (gun == WP_SMG ? 0.6f : 0.9f));
+		if (hit) {
+			int dmg = dmgOverride > 0 ? dmgOverride : kDmg[gun];
+			if (gun == WP_SHOTGUN && dmgOverride <= 0) dmg = (int)((float)kDmg[gun] * 4.0f * (1.0f - 0.8f * dist / kRange[gun]));
+			if (tgt == -1) damagePlayer(dmg, b->x, b->z, bi);
+			else damageBot(tgt, dmg, bi);
+		}
+	}
+	addFx(muz[0], muz[1], muz[2], 0.3f, 0.0f, 2.0f, 1.0f, 0.85f, 0.4f);
+	if (b->ammoB[gun] > 0 && gMode == M_BR) b->ammoB[gun]--;
+}
+
+// ---- Battle Royale storm ----
+static float zCx, zCz, zR, zFx, zFz, zFr, zTx, zTz, zTr;
+static int   zPhase, zT, zDmgT;
+static const int   zWait[5]   = {1500, 1200, 900, 700, 500};
+static const int   zShrink[5] = {1800, 1500, 1200, 900, 700};
+static const float zRad[6]    = {235.0f, 120.0f, 70.0f, 38.0f, 18.0f, 6.0f};
+static void stormStart(void) {
+	zPhase = 0; zT = 0; zDmgT = 0;
+	zCx = zFx = zTx = 0.0f; zCz = zFz = zTz = 0.0f; zR = zFr = zRad[0]; zTr = zRad[1];
+	float a = rnd() * 3.1f, r = 40.0f * rnd01();
+	zTx = sinf(a) * r; zTz = cosf(a) * r;
+}
+static int stormShrinking(void) { return zPhase < 5 && zT >= zWait[zPhase]; }
+static float stormDps(void) { return zPhase >= 5 ? 9.0f : 1.5f + 1.5f * (float)zPhase; }
+static void stormUpdate(void) {
+	if (zPhase >= 5) return;
+	zT++;
+	if (zT >= zWait[zPhase]) {
+		float k = (float)(zT - zWait[zPhase]) / (float)zShrink[zPhase];
+		if (k >= 1.0f) {
+			zPhase++; zT = 0; zCx = zFx = zTx; zCz = zFz = zTz; zR = zFr = zTr;
+			if (zPhase < 5) {
+				zTr = zRad[zPhase + 1];
+				float a = rnd() * 6.28f, r = (zR - zTr) * 0.8f * rnd01();
+				zTx = zCx + sinf(a) * r; zTz = zCz + cosf(a) * r;
+			} else { zR = zRad[5]; }
+		} else {
+			zR = zFr + (zTr - zFr) * k; zCx = zFx + (zTx - zFx) * k; zCz = zFz + (zTz - zFz) * k;
+		}
+	}
+}
+static int outsideStorm(float x, float z) { float dx = x - zCx, dz = z - zCz; return dx * dx + dz * dz > zR * zR; }
+
+// ---- loot pickups ----
+static void giveWeaponBot(Bot* b, int w) { b->own[w] = 1; b->ammoB[w] += wdef[w].pickupAmmo + (w == WP_PISTOL ? 12 : 0); }
+static void lootPickBot(Bot* b, Loot* l) {
+	l->active = 0;
+	if (l->kind == LK_WEAPON) giveWeaponBot(b, l->w);
+	else if (l->kind == LK_AMMO) { for (int w = 1; w < WP_COUNT; w++) if (b->own[w]) b->ammoB[w] += wdef[w].pickupAmmo; }
+	else if (b->medkits < 3) b->medkits++;
+}
+static void lootPickPlayer(Loot* l) {
+	if (l->kind == LK_AMMO) {
+		int any = 0;
+		for (int w = 1; w < WP_COUNT; w++) if (ownedW[w]) any = 1;
+		if (!any) return;
+		for (int w = 1; w < WP_COUNT; w++) if (ownedW[w]) { ammo[w] += wdef[w].pickupAmmo; if (ammo[w] > 999) ammo[w] = 999; }
+		toast("AMMO");
+	} else if (l->kind == LK_MEDKIT) {
+		if (plMedkits >= 4) return;
+		plMedkits++; toast("MEDKIT ADDED TO WHEEL");
+	} else {
+		int w = l->w, had = ownedW[w];
+		ownedW[w] = 1; ammo[w] += wdef[w].pickupAmmo + (w == WP_PISTOL ? 12 : 0);
+		char t[40]; snprintf(t, sizeof t, "%s%s", had ? "AMMO: " : "FOUND ", wdef[w].name); toast(t);
+		if (curWeapon == WP_FISTS) curWeapon = w;
+	}
+	l->active = 0;
+	playSfx(SFX_PICKUP, 0.7f);
+}
+
+// ---- fighter thinking ----
+static void botUseMedkit(Bot* b) { b->medkits--; b->healT = 130; }
+
+static void botBR(int bi) {
+	Bot* b = &bots[bi];
+	float speed = 0.075f;
+	// choose a target: nearest fighter (or the player) that can be seen
+	if (b->thinkT-- <= 0) {
+		b->thinkT = 9 + (bi & 3);
+		int best = -2; float bd = 1e9f;
+		for (int k = -1; k < MAX_BOTS; k++) {
+			float tx, tz;
+			if (k == -1) { if (gState != GS_PLAY || plHp <= 0.0f) continue; tx = gPlX; tz = gPlZ; }
+			else { if (k == bi || !bots[k].active || bots[k].dead) continue; tx = bots[k].x; tz = bots[k].z; }
+			float d = sqrtf((tx - b->x) * (tx - b->x) + (tz - b->z) * (tz - b->z));
+			if (d < bd && d < 48.0f && losClear(b->x, b->z, tx, tz)) { bd = d; best = k; }
+		}
+		if (best != b->tgt) b->aim = 0.0f;
+		b->tgt = best; b->tdist = bd;
+	}
+	if (b->healT > 0) { // standing still, using a medkit
+		b->healT--; b->hp += 0.4f; if (b->hp > b->hpMax) b->hp = b->hpMax; b->walk = 0; return;
+	}
+	float tx = 0, tz = 0;
+	int seen = 0;
+	if (b->tgt >= -1) {
+		if (b->tgt == -1) { tx = gPlX; tz = gPlZ; seen = (gState == GS_PLAY && plHp > 0.0f); }
+		else if (bots[b->tgt].active && !bots[b->tgt].dead) { tx = bots[b->tgt].x; tz = bots[b->tgt].z; seen = 1; }
+		if (!seen) b->tgt = -2;
+	}
+	float dist = seen ? sqrtf((tx - b->x) * (tx - b->x) + (tz - b->z) * (tz - b->z)) : 0.0f;
+	if (b->medkits > 0 && b->hp < 55.0f && (!seen || dist > 22.0f)) { botUseMedkit(b); return; }
+	int gun = seen ? botBestGun(b, dist) : 0;
+	if (!gun) { // keep the best gun it has for show
+		for (int w = WP_COUNT - 1; w >= 1; w--) if (b->own[w] && b->ammoB[w] > 0) { gun = w; break; }
+	}
+	b->gun = gun;
+	int canShoot = seen && gun && botBestGun(b, dist) != 0;
+	b->walk = 0;
+	if (canShoot) {
+		b->face = atan2f(-(tx - b->x), -(tz - b->z));
+		if (b->aim < 1.0f) b->aim += 0.03f;
+		if (b->cool > 0) b->cool--;
+		else if (b->aim > 0.8f) {
+			botFire(bi, b->tgt, tx, tz, dist, 0.35f + 0.25f * b->skill, 0);
+			b->cool = 22 + (int)(rnd01() * 18.0f) + (gun == WP_SHOTGUN ? 30 : 0) + (gun == WP_ROCKET ? 70 : 0) - (gun == WP_SMG ? 14 : 0);
+		}
+		float want = gun == WP_SHOTGUN ? 8.0f : 16.0f;
+		if (dist > want + 6.0f) { // close in
+			if (b->repathT-- <= 0 || b->pathI >= b->pathN) botSetPath(b, tx, tz);
+			b->walk = botStep(b, speed);
+		} else { // sidestep
+			if (b->strafeT-- <= 0) { b->strafeT = 40 + (int)(rnd01() * 50.0f); b->strafe = -b->strafe; }
+			float sx = cosf(b->face) * b->strafe * speed * 0.6f, sz = -sinf(b->face) * b->strafe * speed * 0.6f;
+			if (navIsOpen(b->x + sx, b->z + sz)) { b->x += sx; b->z += sz; b->walk = 1; b->ph += 0.1f; }
+			else b->strafe = -b->strafe;
+		}
+		return;
+	}
+	if (b->aim > 0.0f) b->aim -= 0.05f;
+	if (b->aim < 0.0f) b->aim = 0.0f;
+	// no fight: head for the storm's safe zone, otherwise pick up loot, otherwise roam
+	float gx = 0, gz = 0;
+	int have = 0, anyGun = 0;
+	for (int w = 1; w < WP_COUNT; w++) if (b->own[w] && b->ammoB[w] > 0) anyGun = 1;
+	int lowAmmo = 0;
+	for (int w = 1; w < WP_COUNT; w++) if (b->own[w] && b->ammoB[w] < 8 && w != WP_ROCKET) lowAmmo = 1;
+	{
+		float cxs = stormShrinking() ? zTx : zCx, czs = stormShrinking() ? zTz : zCz, rs = stormShrinking() ? zTr : zR;
+		if (outsideStorm(b->x, b->z) || (b->x - cxs) * (b->x - cxs) + (b->z - czs) * (b->z - czs) > rs * rs * 0.8f) { gx = cxs; gz = czs; have = 1; }
+	}
+	float bestD = have ? 15.0f : 1e9f; int bl = -1;
+	for (int i = 0; i < N_LOOT; i++) {
+		const Loot* l = &loot[i];
+		if (!l->active) continue;
+		int want = 0;
+		if (l->kind == LK_WEAPON) want = !anyGun || !b->own[l->w] || l->w == WP_ROCKET;
+		else if (l->kind == LK_AMMO) want = anyGun && lowAmmo;
+		else want = b->medkits < 2 && (b->hp < 90.0f || b->medkits == 0);
+		if (!want || outsideStorm(l->x, l->z)) continue;
+		float d = sqrtf((l->x - b->x) * (l->x - b->x) + (l->z - b->z) * (l->z - b->z));
+		if (!anyGun && l->kind == LK_WEAPON) d *= 0.5f;
+		if (d < bestD) { bestD = d; bl = i; }
+	}
+	if (bl >= 0) { gx = loot[bl].x; gz = loot[bl].z; have = 1; }
+	if (!have) { // roam towards the middle of the next safe circle
+		if (b->pathI >= b->pathN || b->repathT <= -200) { float a = rnd() * 6.28f, r = rnd01() * (zR > 30.0f ? 30.0f : zR); gx = zCx + sinf(a) * r; gz = zCz + cosf(a) * r; have = 1; }
+		else { b->repathT--; b->walk = botStep(b, speed); return; }
+	}
+	if (b->repathT-- <= 0 || b->pathI >= b->pathN || fabsf(gx - b->goalX) > 3.0f || fabsf(gz - b->goalZ) > 3.0f) {
+		if (b->thinkT == 0 || b->pathI >= b->pathN || bl >= 0) botSetPath(b, gx, gz);
+	}
+	b->walk = botStep(b, speed);
+	if (b->walk) turnTo(&b->face, atan2f(-(navWorld(b->pcx[b->pathI < b->pathN ? b->pathI : b->pathN - 1]) - b->x), -(navWorld(b->pcz[b->pathI < b->pathN ? b->pathI : b->pathN - 1]) - b->z)), 0.2f);
+	for (int i = 0; i < N_LOOT; i++) { // pick up what it is standing on
+		Loot* l = &loot[i];
+		if (!l->active) continue;
+		float dx = l->x - b->x, dz = l->z - b->z;
+		if (dx * dx + dz * dz < 1.4f * 1.4f) {
+			int w = (l->kind == LK_WEAPON) ? (!anyGun || !b->own[l->w] || l->w == WP_ROCKET) : (l->kind == LK_AMMO ? anyGun : b->medkits < 3);
+			if (w) { lootPickBot(b, l); break; }
+		}
+	}
+}
+
+static void botDM(int bi) {
+	Bot* b = &bots[bi];
+	int L = gLevel;
+	float speed = 0.085f + 0.008f * (float)L;
+	if (b->thinkT-- <= 0) {
+		b->thinkT = 8 + (bi & 3);
+		int was = b->los;
+		float dx = gPlX - b->x, dz = gPlZ - b->z;
+		b->tdist = sqrtf(dx * dx + dz * dz);
+		b->los = b->tdist < 52.0f && losClear(b->x, b->z, gPlX, gPlZ);
+		if (b->los && !was) b->aim = 0.0f;
+	}
+	b->gun = dmGun[L];
+	float dist = b->tdist;
+	b->walk = 0;
+	if (b->los) {
+		b->face = atan2f(-(gPlX - b->x), -(gPlZ - b->z));
+		if (b->aim < 1.0f) b->aim += 0.025f + 0.004f * (float)L;
+		if (b->cool > 0) b->cool--;
+		else if (b->aim > 0.75f && gState == GS_PLAY) {
+			botFire(bi, -1, gPlX, gPlZ, dist, dmAcc[L], 10);
+			if (--b->burst > 0) b->cool = dmCool[L] / 3 + 2;
+			else { b->burst = dmBurst[L]; b->cool = dmCool[L] * 2 + (int)(rnd01() * 20.0f); }
+		}
+		if (dist > 20.0f) {
+			if (b->repathT-- <= 0 || b->pathI >= b->pathN) botSetPath(b, gPlX, gPlZ);
+			b->walk = botStep(b, speed);
+		} else {
+			if (b->strafeT-- <= 0) { b->strafeT = 30 + (int)(rnd01() * 40.0f); b->strafe = -b->strafe; }
+			float sx = cosf(b->face) * b->strafe * speed * 0.7f, sz = -sinf(b->face) * b->strafe * speed * 0.7f;
+			if (navIsOpen(b->x + sx, b->z + sz)) { b->x += sx; b->z += sz; b->walk = 1; b->ph += 0.1f; }
+			else b->strafe = -b->strafe;
+		}
+	} else {
+		if (b->aim > 0.0f) b->aim -= 0.04f;
+		if (b->aim < 0.0f) b->aim = 0.0f;
+		if (b->repathT-- <= 0 || b->pathI >= b->pathN) botSetPath(b, gPlX, gPlZ);
+		b->walk = botStep(b, speed * 1.2f);
+		if (b->walk && b->pathI < b->pathN) {
+			float wx = navWorld(b->pcx[b->pathI]), wz = navWorld(b->pcz[b->pathI]);
+			turnTo(&b->face, atan2f(-(wx - b->x), -(wz - b->z)), 0.2f);
+		}
+	}
+}
+
+static void spawnDmBot(void) {
+	for (int i = 0; i < MAX_BOTS; i++) if (!bots[i].active) {
+		float x, z;
+		if (!pickSpot(&x, &z, gPlX, gPlZ, 26.0f, 60.0f, 1)) pickSpot(&x, &z, gPlX, gPlZ, 20.0f, 80.0f, 0);
+		botInit(&bots[i], i, x, z);
+		bots[i].hp = bots[i].hpMax = (float)dmHp[gLevel];
+		bots[i].gun = dmGun[gLevel]; bots[i].burst = dmBurst[gLevel]; bots[i].cool = 70;
+		return;
+	}
+}
+
+static void healPlayerStep(void) {
+	if (plHeal > 0) { float h = plHeal > 0 ? 0.4f : 0.0f; plHp += h; plHeal -= 1; if (plHp > 100.0f) plHp = 100.0f; if (plHeal < 0) plHeal = 0; }
+}
+static void useMedkit(void) {
+	if (plMedkits > 0 && plHp < 100.0f && plHeal == 0 && gState == GS_PLAY) {
+		plMedkits--; plHeal = 125; playSfx(SFX_HEAL, 0.8f);
+	}
+}
+
+// ---- Target Practice: a darts-style shooting range ---------------------------------------------
+#define TP_RX 1000.0f          // the range sits far outside the city
+#define TP_RZ 0.0f
+static const float tpZ[4] = {2.0f, 9.0f, 2.0f, 2.0f}; // where each shooter stands (the player stands furthest back so the rivals are in view)
+#define TP_BZ (-8.06f)         // the boards hang on this plane
+#define TP_BY 2.0f             // board centre height
+#define TP_BR 1.8f             // board radius
+#define TP_RING 0.18f          // width of one scoring ring
+#define TP_PL 1                // the player's lane
+#define TP_ROUNDS 5
+static const float tpLane[4] = {-6.6f, -2.2f, 2.2f, 6.6f};
+static const float tpSigma[4] = {0.50f, 0.0f, 0.42f, 0.34f};
+static const char* tpName[4] = {"RILEY", "YOU", "MONA", "JAX"};
+typedef struct { float x, y; int s; } Mark;
+static Mark tpMarks[4][16];
+static int  tpMarkN[4], tpScore[4], tpRound, tpTurn, tpPhase, tpTimer, tpShotsLeft, tpLastShot = -1, tpLastLane = 0, tpShotNo, tpRoundScore[4][TP_ROUNDS], gDraw;
+static float tpAim[4];
+
+static int tpRegister(int lane, float lx, float ly) { // offset from the board centre in metres -> score
+	float d = sqrtf(lx * lx + ly * ly);
+	int s = d < TP_BR ? 10 - (int)(d / TP_RING) : 0;
+	if (s < 0) s = 0;
+	if (tpMarkN[lane] < 16) { tpMarks[lane][tpMarkN[lane]].x = lx; tpMarks[lane][tpMarkN[lane]].y = ly; tpMarks[lane][tpMarkN[lane]].s = s; tpMarkN[lane]++; }
+	tpScore[lane] += s; tpRoundScore[lane][tpRound] += s;
+	tpLastShot = s; tpLastLane = lane;
+	return s;
+}
+
+static void tpPlayerShot(const float cam[3], const float fwd[3], const float muz[3]) {
+	float P[3] = {cam[0] + fwd[0] * 40.0f, cam[1] + fwd[1] * 40.0f, cam[2] + fwd[2] * 40.0f};
+	int s = 0;
+	if (fwd[2] < -1e-3f) {
+		float t = (TP_BZ - cam[2]) / fwd[2];
+		if (t > 0.0f) {
+			P[0] = cam[0] + fwd[0] * t; P[1] = cam[1] + fwd[1] * t; P[2] = TP_BZ;
+			float lx = P[0] - (TP_RX + tpLane[TP_PL]), ly = P[1] - TP_BY;
+			if (lx * lx + ly * ly < 2.6f * 2.6f && P[1] > 0.0f) s = tpRegister(TP_PL, lx, ly);
+			else { tpLastShot = 0; tpLastLane = TP_PL; }
+		}
+	}
+	addTracer(muz, P);
+	addFx(muz[0], muz[1], muz[2], 0.3f, 0.0f, 2.0f, 1.0f, 0.85f, 0.4f);
+	addFx(P[0], P[1], P[2], 0.25f, 0.0f, 6.0f, 1.0f, 0.9f, 0.6f);
+	playSfx(SFX_PISTOL, 0.8f);
+	recoilAnim = 1.0f; kick += 0.012f;
+	tpShotsLeft--; tpShotNo++;
+	char t[40]; snprintf(t, sizeof t, s >= 10 ? "BULLSEYE! +10" : (s > 0 ? "+%d" : "MISS"), s); toast(t);
+	if (s >= 10) playSfx(SFX_PICKUP, 0.7f);
+}
+
+static float gauss(void) { return rnd() + rnd() + rnd(); }
+
+static void tpNpcShot(int lane) {
+	float lx = gauss() * tpSigma[lane], ly = gauss() * tpSigma[lane];
+	int s = tpRegister(lane, lx, ly);
+	float muz[3] = {TP_RX + tpLane[lane] + 0.3f, 1.25f, tpZ[lane] - 0.9f}, P[3] = {TP_RX + tpLane[lane] + lx, TP_BY + ly, TP_BZ};
+	addTracer(muz, P);
+	addFx(muz[0], muz[1], muz[2], 0.3f, 0.0f, 2.0f, 1.0f, 0.85f, 0.4f);
+	addFx(P[0], P[1], P[2], 0.25f, 0.0f, 6.0f, 1.0f, 0.9f, 0.6f);
+	playSfx(SFX_PISTOL, 0.6f);
+	(void)s;
+}
+
+static void tpFinish(void) {
+	gState = GS_OVER; gOverT = 0;
+	int better = 0, same = 0;
+	for (int i = 0; i < 4; i++) if (i != TP_PL) { if (tpScore[i] > tpScore[TP_PL]) better++; else if (tpScore[i] == tpScore[TP_PL]) same++; }
+	gPlace = 1 + better;
+	gWon = (better == 0 && same == 0);
+	gDraw = (better == 0 && same > 0);
+}
+
+static void updateTp(void) {
+	for (int i = 0; i < 4; i++) {
+		float want = (tpPhase == 1 && i == tpTurn && i != TP_PL) || (tpPhase == 0 && i == tpTurn && i != TP_PL && tpTimer < 40) ? 1.0f : 0.0f;
+		tpAim[i] += (want - tpAim[i]) * 0.12f;
+	}
+	if (tpPhase == 0) {
+		if (--tpTimer <= 0) { tpPhase = 1; tpShotsLeft = 3; tpTimer = (tpTurn == TP_PL) ? 900 : 70; fireCool = 20; tpShotNo = 0; }
+	} else if (tpPhase == 1) {
+		if (tpTurn == TP_PL) {
+			if (--tpTimer <= 0 || tpShotsLeft <= 0) { tpPhase = 2; tpTimer = 60; }
+		} else if (--tpTimer <= 0) {
+			tpNpcShot(tpTurn);
+			tpShotsLeft--;
+			tpTimer = 55 + (int)(rnd01() * 30.0f);
+			if (tpShotsLeft <= 0) { tpPhase = 2; tpTimer = 70; }
+		}
+	} else if (--tpTimer <= 0) {
+		if (++tpTurn >= 4) { tpTurn = 0; if (++tpRound >= TP_ROUNDS) { tpRound = TP_ROUNDS - 1; tpFinish(); return; } }
+		tpPhase = 0; tpTimer = 80;
+		tpLastShot = -1;
+	}
+}
+
+static void addBoardBand(float cx, float cy, float z, float r0, float r1, float r, float g, float b) {
+	const int N = 18;
+	for (int k = 0; k < N; k++) {
+		float a0 = (float)k * 6.2832f / N, a1 = (float)(k + 1) * 6.2832f / N;
+		float p0[3] = {cx + r0 * cosf(a0), cy + r0 * sinf(a0), z}, p1[3] = {cx + r1 * cosf(a0), cy + r1 * sinf(a0), z};
+		float p2[3] = {cx + r1 * cosf(a1), cy + r1 * sinf(a1), z}, p3[3] = {cx + r0 * cosf(a1), cy + r0 * sinf(a1), z};
+		quad(p0, p1, p2, p3, r, g, b);
+	}
+}
+
+static void addMarkQuad(float x, float y, float z, float h, float r, float g, float b) {
+	float p0[3] = {x - h, y - h, z}, p1[3] = {x + h, y - h, z}, p2[3] = {x + h, y + h, z}, p3[3] = {x - h, y + h, z};
+	quad(p0, p1, p2, p3, r, g, b);
+}
+
+static void drawTpRoom(int frame) {
+	int start = vcount;
+	const float X = TP_RX, Z = TP_RZ;
+	addBoxY(X - 11.0f, Z - 9.0f, X + 11.0f, Z + 12.5f, -0.4f, 0.0f, 0.13f, 0.15f, 0.20f);                 // floor
+	addBoxY(X - 11.4f, Z - 9.0f, X - 11.0f, Z + 12.5f, 0.0f, 7.0f, 0.16f, 0.18f, 0.26f);                  // side walls
+	addBoxY(X + 11.0f, Z - 9.0f, X + 11.4f, Z + 12.5f, 0.0f, 7.0f, 0.16f, 0.18f, 0.26f);
+	addBoxY(X - 11.4f, Z - 9.0f, X + 11.4f, Z - 8.1f, 0.0f, 7.0f, 0.20f, 0.22f, 0.30f);                  // board wall
+	addBoxY(X - 11.4f, Z + 12.5f, X + 11.4f, Z + 12.9f, 0.0f, 7.0f, 0.16f, 0.18f, 0.26f);                // back wall
+	addBoxY(X - 11.4f, Z - 9.0f, X + 11.4f, Z + 12.9f, 7.0f, 7.4f, 0.12f, 0.14f, 0.20f);                 // ceiling
+	for (int k = 0; k < 4; k++) // ceiling light panels
+		for (int m = 0; m < 3; m++) {
+			float lx = X - 8.25f + 5.5f * (float)k, lz = Z - 4.0f + 7.0f * (float)m;
+			addBoxY(lx - 1.4f, lz - 1.2f, lx + 1.4f, lz + 1.2f, 6.93f, 7.0f, 0.95f, 0.97f, 1.0f);
+		}
+	addBoxY(X - 11.0f, Z - 8.1f, X + 11.0f, Z - 8.0f, 0.0f, 0.12f, 0.0f, 0.75f, 0.85f);                  // neon skirting under the boards
+	for (int k = 0; k < 4; k++) { // lanes: floor pad, guide line to the board, booth divider
+		int act = gState == GS_PLAY && k == tpTurn;
+		float cx = X + tpLane[k], sz = Z + tpZ[k];
+		float cr = k == TP_PL ? 0.0f : 0.9f, cg = k == TP_PL ? 0.9f : 0.4f, cb = k == TP_PL ? 1.0f : 0.8f;
+		float br = act ? 0.75f : 0.22f;
+		addBoxY(cx - 1.0f, sz - 1.0f, cx + 1.0f, sz + 1.2f, 0.0f, 0.03f, cr * br, cg * br, cb * br);
+		addBoxY(cx - 0.03f, Z + TP_BZ + 0.3f, cx + 0.03f, sz - 1.0f, 0.0f, 0.015f, cr * 0.35f, cg * 0.35f, cb * 0.35f);
+		// board: backing plate and rings
+		addBoxY(cx - 2.1f, Z - 8.1f, cx + 2.1f, Z - 8.075f, TP_BY - 2.1f, TP_BY + 2.1f, 0.05f, 0.05f, 0.07f);
+		float by = TP_BY, bz = Z + TP_BZ;
+		addBoardBand(cx, by, bz, 0.0f, TP_RING, 1.0f, 0.82f, 0.15f);
+		static const float rr[6] = {1.0f, 3.0f, 5.0f, 7.0f, 9.0f, 10.0f};
+		for (int q = 0; q < 5; q++) addBoardBand(cx, by, bz, rr[q] * TP_RING, rr[q + 1] * TP_RING, (q & 1) ? 0.92f : 0.85f, (q & 1) ? 0.92f : 0.12f, (q & 1) ? 0.92f : 0.12f);
+		for (int m = 0; m < tpMarkN[k]; m++) {
+			const Mark* mk = &tpMarks[k][m];
+			float r = k == TP_PL ? 0.0f : (k == 0 ? 1.0f : (k == 2 ? 0.2f : 0.9f));
+			float g = k == TP_PL ? 0.9f : (k == 0 ? 0.55f : (k == 2 ? 1.0f : 0.2f));
+			float b = k == TP_PL ? 1.0f : (k == 0 ? 0.0f : (k == 2 ? 0.3f : 0.9f));
+			if (mk->s == 0) { r = g = b = 0.5f; }
+			addMarkQuad(cx + mk->x, by + mk->y, bz + 0.02f, 0.10f, 0.02f, 0.02f, 0.02f);
+			addMarkQuad(cx + mk->x, by + mk->y, bz + 0.03f, 0.07f, r, g, b);
+		}
+		if (k != TP_PL) { // the rival with its gun levelled at its board
+			int ni = k < TP_PL ? k : k - 1;
+			gBaseY = 0.0f;
+			drawBody(&bots[ni].look, cx, sz, 0.0f, 0.0f, 0, 0, 0, 0, WP_PISTOL, tpAim[k]);
+			addShadow(cx, sz, 0.4f, 0.32f, 0.35f);
+		}
+		if (gState == GS_PLAY && k == tpTurn) { // marker over whoever is up
+			float bob = 0.15f * sinf((float)frame * 0.12f);
+			addBoxY(cx - 0.18f, sz - 0.18f, cx + 0.18f, sz + 0.18f, 2.55f + bob, 2.9f + bob, cr, cg, cb);
+		}
+	}
+	GSPGPU_FlushDataCache(&vbo[start], (vcount - start) * sizeof(Vertex));
+}
+
+// ---- drawing the fighters, loot and the storm ----------------------------------------------------
+static void drawBots(void) {
+	int start = vcount;
+	for (int i = 0; i < MAX_BOTS; i++) {
+		const Bot* b = &bots[i];
+		if (!b->active || !inView(b->x, b->z)) continue;
+		if (!b->dead) addShadow(b->x, b->z, 0.38f, 0.30f, 0.34f);
+		drawBody(&b->look, b->x, b->z, b->face, b->ph, b->walk, 0, b->dead, b->deadT, b->dead ? 0 : (b->gun ? b->gun : (gMode == M_DM ? dmGun[gLevel] : 0)), b->aim);
+	}
+	GSPGPU_FlushDataCache(&vbo[start], (vcount - start) * sizeof(Vertex));
+}
+
+static void drawLoot(int frame) {
+	if (gMode != M_BR) return;
+	for (int i = 0; i < N_LOOT; i++) {
+		const Loot* l = &loot[i];
+		if (!l->active || !inView(l->x, l->z)) continue;
+		float y = 0.6f + 0.12f * sinf((float)frame * 0.08f + (float)i), r, g, b;
+		if (l->kind == LK_WEAPON) { r = 0.30f; g = 0.60f; b = 1.0f; if (l->w == WP_SHOTGUN) { r = 1.0f; g = 0.55f; b = 0.1f; } if (l->w == WP_ROCKET) { r = 1.0f; g = 0.15f; b = 0.15f; } if (l->w == WP_PISTOL) { r = 0.8f; g = 0.8f; b = 0.85f; }
+			addBoxY(l->x - 0.45f, l->z - 0.12f, l->x + 0.45f, l->z + 0.12f, y - 0.1f, y + 0.1f, r, g, b);
+			addBoxY(l->x - 0.1f, l->z - 0.12f, l->x + 0.1f, l->z + 0.12f, y - 0.3f, y - 0.1f, r * 0.6f, g * 0.6f, b * 0.6f); }
+		else if (l->kind == LK_AMMO) { r = 1.0f; g = 0.85f; b = 0.2f; addBoxY(l->x - 0.28f, l->z - 0.28f, l->x + 0.28f, l->z + 0.28f, y - 0.25f, y + 0.25f, r, g, b); }
+		else { r = 0.2f; g = 1.0f; b = 0.45f;
+			addBoxY(l->x - 0.32f, l->z - 0.32f, l->x + 0.32f, l->z + 0.32f, y - 0.25f, y + 0.25f, 0.95f, 0.95f, 0.95f);
+			addBoxY(l->x - 0.34f, l->z - 0.07f, l->x + 0.34f, l->z + 0.07f, y - 0.05f, y + 0.05f, 0.9f, 0.1f, 0.1f);
+			addBoxY(l->x - 0.07f, l->z - 0.34f, l->x + 0.07f, l->z + 0.34f, y - 0.05f, y + 0.05f, 0.9f, 0.1f, 0.1f); }
+		addBoxY(l->x - 0.03f, l->z - 0.03f, l->x + 0.03f, l->z + 0.03f, 0.0f, 5.0f, r, g, b);
+	}
+}
+
+static void drawStorm(void) {
+	if (gMode != M_BR) return;
+	const int N = 56;
+	for (int pass = 0; pass < 2; pass++) {
+		if (pass == 1 && zPhase >= 5) break;
+		float cx = pass ? zTx : zCx, cz = pass ? zTz : zCz, R = pass ? zTr : zR;
+		for (int k = 0; k < N; k++) {
+			float a0 = (float)k * 6.2832f / N, a1 = (float)(k + 1) * 6.2832f / N;
+			float x0 = cx + R * sinf(a0), z0 = cz + R * cosf(a0), x1 = cx + R * sinf(a1), z1 = cz + R * cosf(a1);
+			float mx = (x0 + x1) * 0.5f - gCamX, mz = (z0 + z1) * 0.5f - gCamZ;
+			if (mx * mx + mz * mz > 130.0f * 130.0f) continue;
+			float p0[3] = {x0, 0.0f, z0}, p1[3] = {x1, 0.0f, z1}, p2[3] = {x1, 45.0f, z1}, p3[3] = {x0, 45.0f, z0};
+			gAlpha = pass ? 0.22f : 0.38f;
+			if (pass) quad(p0, p1, p2, p3, 0.9f, 0.95f, 1.0f); else quad(p0, p1, p2, p3, 0.65f, 0.15f, 0.95f);
+			gAlpha = 1.0f;
+		}
+	}
+}
+
+// ---- starting, running and leaving a mode ----------------------------------------------------------
+static int gSavedWeather = 0, gSavedCam = 0, gHasSaved = 0, gSpawnT = 0;
+
+static void restoreUserSettings(void) {
+	if (gHasSaved) { weather = gSavedWeather; camStyle = gSavedCam; gHasSaved = 0; }
+}
+
+static void setupMode(int mode) {
+	restoreUserSettings();
+	gRng ^= (unsigned)osGetTime() * 2654435761u;
+	gMode = mode; gState = GS_COUNTDOWN; gCount = 239; gGo = 0; gOverT = 0; gWon = 0; gDraw = 0; gPlace = 0;
+	gKills = 0; gLevel = 0; gTime = 0; gBanner = 0; gSpawnT = 60; gToast = 0;
+	memset(bots, 0, sizeof bots); memset(loot, 0, sizeof loot);
+	memset(feedLife, 0, sizeof feedLife); memset(plHitLife, 0, sizeof plHitLife);
+	memset(fxs, 0, sizeof fxs); memset(trs, 0, sizeof trs);
+	rocket.alive = 0; hitMark = killMark = 0; shake = 0.0f; kick = 0.0f;
+	plHp = 100.0f; plSince = 999; plHeal = 0; plMedkits = 0; plFlash = 0; plUnseen = 0; plMoving = 0;
+	gTraffic = (mode == M_FREE);
+	gCratesOn = (mode == M_FREE || mode == M_DM);
+	for (int w = 0; w < WP_COUNT; w++) { ownedW[w] = 1; ammo[w] = wdef[w].startAmmo; }
+	curWeapon = WP_PISTOL; fireCool = 0;
+	gPlYaw = 0.0f;
+	if (mode == M_FREE) { gPlX = 0.0f; gPlZ = 0.0f; initCrates(); }
+	else if (mode == M_DM) {
+		pickSpot(&gPlX, &gPlZ, 0.0f, 0.0f, 0.0f, 999.0f, 0);
+		gPlYaw = rnd() * 3.14f;
+		initCrates();
+		for (int i = 0; i < dmMax[0]; i++) spawnDmBot();
+	} else if (mode == M_BR) {
+		for (int w = 0; w < WP_COUNT; w++) { ownedW[w] = 0; ammo[w] = 0; }
+		curWeapon = WP_FISTS; ownedW[WP_FISTS] = 1;
+		pickSpot(&gPlX, &gPlZ, 0.0f, 0.0f, 0.0f, 999.0f, 0);
+		gPlYaw = rnd() * 3.14f;
+		int nl = 0;
+		for (int k = 0; k < 64 && nl < 66; k++) { // 24 guns, 26 ammo drops, 16 medkits, spread out
+			float x, z;
+			pickSpot(&x, &z, 0.0f, 0.0f, 0.0f, 999.0f, 0);
+			int ok = 1;
+			for (int j = 0; j < nl; j++) if (fabsf(loot[j].x - x) < 7.0f && fabsf(loot[j].z - z) < 7.0f) ok = 0;
+			if (!ok) continue;
+			loot[nl].x = x; loot[nl].z = z; loot[nl].active = 1;
+			int t = nl % 11;
+			if (t < 4) { loot[nl].kind = LK_WEAPON; float r = rnd01(); loot[nl].w = r < 0.40f ? WP_PISTOL : (r < 0.72f ? WP_SMG : (r < 0.92f ? WP_SHOTGUN : WP_ROCKET)); }
+			else if (t < 8) loot[nl].kind = LK_AMMO;
+			else loot[nl].kind = LK_MEDKIT;
+			nl++;
+		}
+		float mx[MAX_BOTS], mz[MAX_BOTS];
+		for (int i = 0; i < 11; i++) {
+			float x = 0, z = 0;
+			for (int tries = 0; tries < 12; tries++) {
+				pickSpot(&x, &z, gPlX, gPlZ, 28.0f, 999.0f, 0);
+				int ok = 1;
+				for (int j = 0; j < i; j++) if (fabsf(mx[j] - x) + fabsf(mz[j] - z) < 22.0f) ok = 0;
+				if (ok) break;
+			}
+			mx[i] = x; mz[i] = z;
+			botInit(&bots[i], i, x, z);
+			bots[i].skill = 0.3f + 0.6f * rnd01();
+		}
+		stormStart();
+	} else if (mode == M_TP) {
+		memset(tpMarkN, 0, sizeof tpMarkN); memset(tpScore, 0, sizeof tpScore); memset(tpRoundScore, 0, sizeof tpRoundScore); memset(tpAim, 0, sizeof tpAim);
+		tpRound = 0; tpTurn = 0; tpPhase = 0; tpTimer = 90; tpShotsLeft = 0; tpLastShot = -1; tpShotNo = 0;
+		for (int i = 0; i < 3; i++) { botInit(&bots[i], i + 5, 0.0f, 0.0f); bots[i].active = 0; }
+		gPlX = TP_RX + tpLane[TP_PL]; gPlZ = TP_RZ + tpZ[TP_PL]; gPlYaw = 0.0f;
+		gSavedWeather = weather; gSavedCam = camStyle; gHasSaved = 1;
+		weather = W_SUNNY; camStyle = 2;
+		ammo[WP_PISTOL] = 999; curWeapon = WP_PISTOL;
+	}
+}
+
+static void exitMode(void) { // back to the menus: everything returns to Free Roam defaults
+	restoreUserSettings();
+	gMode = M_FREE; gState = GS_PLAY; gTraffic = 1; gCratesOn = 1;
+	memset(bots, 0, sizeof bots);
+	rocket.alive = 0;
+	for (int w = 0; w < WP_COUNT; w++) { ownedW[w] = 1; ammo[w] = wdef[w].startAmmo; }
+	curWeapon = WP_PISTOL;
+}
+
+static void updateMode(float px, float pz, int moving) {
+	gPlX = px; gPlZ = pz; plMoving = moving;
+	for (int i = 0; i < 4; i++) if (plHitLife[i] > 0) plHitLife[i]--;
+	for (int i = 0; i < FEED_N; i++) if (feedLife[i] > 0) feedLife[i]--;
+	if (plFlash > 0) plFlash--;
+	if (gBanner > 0) gBanner--;
+	if (gToast > 0) gToast--;
+	if (gGo > 0) gGo--;
+	if (gState == GS_COUNTDOWN) {
+		if (gCount % 60 == 59 && gCount > 60) playSfx(SFX_BEEP, 0.7f);
+		if (--gCount < 60) { gState = GS_PLAY; gGo = 60; playSfx(SFX_GO, 0.8f); }
+		return;
+	}
+	if (gState == GS_OVER) { gOverT++; return; }
+	if (gMode == M_FREE) return;
+	gTime++;
+	if (gMode == M_TP) { updateTp(); return; }
+	healPlayerStep();
+	if (gMode == M_DM) {
+		int seen = 0;
+		for (int i = 0; i < MAX_BOTS; i++) if (bots[i].active && !bots[i].dead && bots[i].los) seen = 1;
+		plUnseen = seen ? 0 : plUnseen + 1;
+		plSince++;
+		if (plHp < 50.0f && plSince > 150 && plUnseen > 120) { plHp += 0.12f; if (plHp > 50.0f) plHp = 50.0f; } // hiding heals up to half
+		if (botsAlive() < dmMax[gLevel] && --gSpawnT <= 0) { spawnDmBot(); gSpawnT = 100 - 8 * gLevel; }
+		for (int i = 0; i < MAX_BOTS; i++) {
+			Bot* b = &bots[i];
+			if (!b->active) continue;
+			if (b->dead) { if (++b->deadT > 200) b->active = 0; continue; }
+			botDM(i);
+		}
+	} else { // battle royale
+		stormUpdate();
+		if (++zDmgT >= 60) {
+			zDmgT = 0;
+			int d = (int)(stormDps() + 0.5f);
+			if (outsideStorm(px, pz)) damagePlayer(d, 0.0f, 0.0f, -3);
+			for (int i = 0; i < MAX_BOTS; i++) if (bots[i].active && !bots[i].dead && outsideStorm(bots[i].x, bots[i].z)) damageBot(i, d, -3);
+		}
+		for (int i = 0; i < N_LOOT; i++) {
+			Loot* l = &loot[i];
+			if (!l->active || gState != GS_PLAY) continue;
+			float dx = l->x - px, dz = l->z - pz;
+			if (dx * dx + dz * dz < 1.5f * 1.5f) lootPickPlayer(l);
+		}
+		for (int i = 0; i < MAX_BOTS; i++) {
+			Bot* b = &bots[i];
+			if (!b->active) continue;
+			if (b->dead) { if (++b->deadT > 300) b->active = 0; continue; }
+			botBR(i);
+		}
+		if (gState == GS_PLAY && botsAlive() == 0) { gState = GS_OVER; gOverT = 0; gWon = 1; gPlace = 1; }
+	}
+}
+
 static void initStars(void) {
 	for (int i = 0; i < N_STARS; i++) {
 		unsigned h = hash2(i, 5150);
@@ -2000,7 +3046,7 @@ static C2D_Text txtWp[WP_COUNT], txtWheelT, txtRelease;
 
 static void initMapText(void) {
 	gStatic = C2D_TextBufNew(1024);
-	gDyn    = C2D_TextBufNew(1024);
+	gDyn    = C2D_TextBufNew(4096);
 	for (int k = 0; k < ROADS; k++) {
 		C2D_TextParse(&vLabel[k], gStatic, vNames[k]);
 		C2D_TextOptimize(&vLabel[k]);
@@ -2014,7 +3060,7 @@ static void initMapText(void) {
 
 	// pause menu labels: main 0-4, weather 5-9, graphics toggles 10-15, camera styles 16-18
 	static const char* menuNames[N_MENU_TEXT] = {
-		"RESUME", "WEATHER", "GRAPHICS", "CAMERA", "TITLE",
+		"RESUME", "WEATHER", "GRAPHICS", "CAMERA", "MAIN MENU",
 		"SUNNY", "RAINY", "SUNSET", "NIGHT", "BACK",
 		"FOG: ON", "FOG: OFF", "WINDOWS: ON", "WINDOWS: OFF", "FPS: ON", "FPS: OFF",
 		"DEFAULT", "WATCH DOGS", "FIRST PERSON"
@@ -2111,7 +3157,7 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	}
 
 	// traffic
-	for (int i = 0; i < N_CARS; i++) {
+	for (int i = 0; i < NCARS; i++) {
 		const Car* c = &cars[i];
 		float lane = ROAD_C(c->road) + c->dir * LANE;
 		float wx = (c->axis == 0) ? c->s : lane, wz = (c->axis == 0) ? lane : c->s;
@@ -2120,7 +3166,7 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 			C2D_DrawRectSolid(sx - 1.5f, sy - 1.5f, 0.5f, 3.0f, 3.0f, C2D_Color32f(c->r, c->g, c->b, 1.0f));
 	}
 	// pedestrians
-	for (int i = 0; i < N_PEDS; i++) {
+	for (int i = 0; i < NPEDS; i++) {
 		float wx, wz;
 		pedPos(&peds[i], &wx, &wz);
 		float sx = MAP_CX + (wx - px) * MAP_S, sy = MAP_CY + (wz - pz) * MAP_S;
@@ -2264,11 +3310,14 @@ static void drawTitleBottom(int frame) {
 // ---- weapon wheel (bottom screen, hold X) -----------------------------------
 #define WH_W 76.0f
 #define WH_H 36.0f
+static void txt(const char* s, float x, float y, float sc, u32 clr, int align);
+static int wheelN(void) { return gMode == M_BR ? 6 : 5; } // the 6th tile is the medkit (Battle Royale)
 static void wheelTile(int i, float* x, float* y) {
-	float a = (-90.0f + 72.0f * (float)i) * 0.0174533f;
+	float a = (-90.0f + 360.0f / (float)wheelN() * (float)i) * 0.0174533f;
 	*x = 160.0f + 78.0f * cosf(a);
 	*y = 112.0f + 78.0f * sinf(a);
 }
+static int wheelUsable(int i) { return i < WP_COUNT ? ownedW[i] : plMedkits > 0; }
 
 // ---- pause menu (bottom screen only) ------------------------------------------
 // Menus: 0 main (RESUME, WEATHER, GRAPHICS, TITLE), 1 weather (SUNNY, RAINY, SUNSET, NIGHT, BACK),
@@ -2365,25 +3414,412 @@ static void drawWheel(float amt, int sel, int cur, int frame) {
 		C2D_DrawRectSolid(0.0f, y, 0.5f, 320.0f, 1.0f, neon(0, 229, 255, 0.05f * amt));
 	drawCentered(&txtWheelT, 160.0f, 1.0f, 0.34f, neon(0, 229, 255, amt));
 	float pulse = 0.5f + 0.5f * sinf((float)frame * 0.12f);
-	for (int i = 0; i < WP_COUNT; i++) {
+	for (int i = 0; i < wheelN(); i++) {
 		float x, y;
 		wheelTile(i, &x, &y);
 		float x0 = x - WH_W * 0.5f, y0 = y - WH_H * 0.5f;
-		int on = (i == sel);
+		int on = (i == sel), use = wheelUsable(i);
+		float dm = use ? 1.0f : 0.45f;
 		C2D_DrawRectSolid(x0, y0, 0.5f, WH_W, WH_H, on ? neon(0, 229, 255, (0.22f + 0.08f * pulse) * amt) : neon(8, 24, 40, 0.88f * amt));
-		frameRect(x0, y0, WH_W, WH_H, 1.0f, on ? neon(0, 229, 255, amt) : neon(0, 150, 180, 0.6f * amt));
+		frameRect(x0, y0, WH_W, WH_H, 1.0f, on ? neon(0, 229, 255, amt) : neon(0, 150, 180, 0.6f * amt * dm));
 		if (i == cur) C2D_DrawRectSolid(x0, y0, 0.5f, 4.0f, WH_H, neon(255, 46, 209, amt));
-		C2D_DrawText(&txtWp[i], C2D_WithColor, x0 + 8.0f, y0 + 3.0f, 0.5f, 0.38f, 0.38f,
-		             on ? neon(255, 255, 255, amt) : neon(120, 220, 235, 0.9f * amt));
+		if (i < WP_COUNT) C2D_DrawText(&txtWp[i], C2D_WithColor, x0 + 8.0f, y0 + 3.0f, 0.5f, 0.38f, 0.38f,
+		             on ? neon(255, 255, 255, amt) : neon(120, 220, 235, 0.9f * amt * dm));
+		else txt("MEDKIT", x0 + 8.0f, y0 + 3.0f, 0.38f, on ? neon(255, 255, 255, amt) : neon(110, 255, 150, 0.9f * amt * dm), 0);
 		char ab[16];
-		C2D_Text ta;
-		if (i == WP_FISTS) snprintf(ab, sizeof ab, "-"); else snprintf(ab, sizeof ab, "%d", ammo[i]);
-		C2D_TextParse(&ta, gDyn, ab);
-		C2D_TextOptimize(&ta);
-		C2D_DrawText(&ta, C2D_WithColor, x0 + 8.0f, y0 + 15.0f, 0.5f, 0.52f, 0.52f,
-		             (i != WP_FISTS && ammo[i] == 0) ? neon(255, 80, 80, amt) : neon(255, 255, 255, 0.95f * amt));
+		if (i == WP_FISTS) snprintf(ab, sizeof ab, "-");
+		else if (i == WP_COUNT) snprintf(ab, sizeof ab, "x%d", plMedkits);
+		else if (!ownedW[i]) snprintf(ab, sizeof ab, "NONE");
+		else snprintf(ab, sizeof ab, "%d", ammo[i]);
+		txt(ab, x0 + 8.0f, y0 + 15.0f, 0.52f, (i != WP_FISTS && i < WP_COUNT && ownedW[i] && ammo[i] == 0) || !use ? neon(255, 80, 80, amt * dm + 0.0f) : neon(255, 255, 255, 0.95f * amt), 0);
 	}
 	drawCentered(&txtRelease, 160.0f, 104.0f, 0.30f, neon(255, 46, 209, 0.9f * amt));
+}
+
+// ---- menus, loading screens and HUD for the game modes ------------------------------------------------
+static void txt(const char* s, float x, float y, float sc, u32 clr, int align) { // 0 left, 1 centre, 2 right
+	C2D_Text t;
+	C2D_TextParse(&t, gDyn, s);
+	C2D_TextOptimize(&t);
+	float w, h;
+	C2D_TextGetDimensions(&t, sc, sc, &w, &h);
+	if (align == 1) x -= w * 0.5f; else if (align == 2) x -= w;
+	C2D_DrawText(&t, C2D_WithColor, x, y, 0.5f, sc, sc, clr);
+}
+
+static const char* const kModeName[4] = {"FREE ROAM", "DEATHMATCH", "BATTLE ROYALE", "TARGET PRACTICE"};
+static const char* const kModeTag[4] = {"// OPEN CITY SANDBOX", "// ENDLESS SURVIVAL", "// LAST ONE STANDING", "// DARTS WITH GUNS"};
+static const char* const kModeDesc[4][5] = {
+	{"Explore Chicago at your own pace.", "Traffic, pedestrians and weather are live.", "Hack the lights, cause a blackout,", "grab a weapon from the wheel and roam.", ""},
+	{"Hostile NPCs hunt you across a random", "part of the city. Ten hits will kill you.", "Hide from them to heal back to half health.", "You can never win. Survive, and every", "10/25/30/45/50 kills they get deadlier."},
+	{"Drop in at a random spot with no weapons.", "Find guns, ammo and medkits around the map.", "NPCs loot, heal and fight each other too.", "The storm closes in. Be the last one alive", "to win."},
+	{"Darts, but with guns. Stand still, look", "around and shoot at your own target board.", "5 rounds of 3 shots against 3 NPC rivals.", "First person only. The closer to the", "bullseye the higher the score. Top score wins."}
+};
+
+// generic neon list panel in the pause-menu style (dim: 0..1)
+static void listRect(int n, int i, float y0first, float sp, float* y0, float* h) { (void)n; *y0 = y0first + (float)i * sp; *h = sp - 6.0f; }
+
+static void menuPanel(float dim, const char* title, const char* const* items, int n, int sel, int frame,
+                      const char* sub, const char* footer, float y0first, float sp, int bg) {
+	if (dim < 0.01f) return;
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, 240.0f, bg ? neon(2, 6, 14, 0.96f * dim) : neon(2, 6, 14, 0.80f * dim));
+	for (float y = 2.0f; y < 240.0f; y += 6.0f) C2D_DrawRectSolid(0.0f, y, 0.5f, 320.0f, 1.0f, neon(0, 229, 255, 0.05f * dim));
+	float by = fmodf((float)frame * 1.6f, 270.0f) - 15.0f;
+	C2D_DrawRectSolid(0.0f, by, 0.5f, 320.0f, 3.0f, neon(0, 229, 255, 0.09f * dim));
+	brackets(8.0f, 8.0f, 304.0f, 224.0f, 20.0f, 2.0f, neon(0, 229, 255, 0.95f * dim));
+	brackets(14.0f, 14.0f, 292.0f, 212.0f, 8.0f, 1.0f, neon(255, 46, 209, 0.7f * dim));
+	txt(title, 160.0f, 20.0f, 0.7f, neon(0, 229, 255, dim), 1);
+	C2D_DrawRectSolid(50.0f, 52.0f, 0.5f, 220.0f, 1.0f, neon(0, 229, 255, 0.6f * dim));
+	C2D_DrawRectSolid(50.0f, 51.0f, 0.5f, 44.0f, 3.0f, neon(255, 46, 209, 0.9f * dim));
+	if (sub) txt(sub, 160.0f, 55.0f, 0.30f, neon(255, 46, 209, 0.9f * dim), 1);
+	float pulse = 0.5f + 0.5f * sinf((float)frame * 0.12f);
+	for (int i = 0; i < n; i++) {
+		float y0, h, x0 = 50.0f, w = 220.0f;
+		listRect(n, i, y0first, sp, &y0, &h);
+		int on = (i == sel);
+		C2D_DrawRectSolid(x0, y0, 0.5f, w, h, on ? neon(0, 229, 255, (0.18f + 0.07f * pulse) * dim) : neon(8, 24, 40, 0.80f * dim));
+		frameRect(x0, y0, w, h, 1.0f, on ? neon(0, 229, 255, dim) : neon(0, 150, 180, 0.6f * dim));
+		C2D_DrawRectSolid(x0, y0, 0.5f, on ? 6.0f : 2.0f, h, on ? neon(255, 46, 209, dim) : neon(0, 229, 255, 0.7f * dim));
+		if (on) C2D_DrawRectSolid(x0 + w - 18.0f, y0 + h - 3.0f, 0.5f, 18.0f, 3.0f, neon(255, 46, 209, 0.9f * dim));
+		C2D_Text t;
+		C2D_TextParse(&t, gDyn, items[i]);
+		C2D_TextOptimize(&t);
+		float tw, th;
+		C2D_TextGetDimensions(&t, 0.55f, 0.55f, &tw, &th);
+		C2D_DrawText(&t, C2D_WithColor, x0 + 20.0f, y0 + (h - th) * 0.5f, 0.5f, 0.55f, 0.55f, on ? neon(255, 255, 255, dim) : neon(120, 220, 235, 0.9f * dim));
+	}
+	if (footer) txt(footer, 160.0f, 213.0f, 0.34f, neon(120, 220, 235, 0.85f * dim), 1);
+}
+
+static const char* const feMain[3]   = {"SINGLE PLAYER", "MULTIPLAYER", "BACK"};
+static const char* const feSingle[2] = {"FREE ROAM", "BACK"};
+static const char* const feMulti[4]  = {"DEATHMATCH", "BATTLE ROYALE", "TARGET PRACTICE", "BACK"};
+static int feCount(int st) { return st == 1 ? 3 : (st == 2 ? 2 : 4); }
+static void feRect(int st, int i, float* y0, float* h) { listRect(feCount(st), i, st == 2 ? 96.0f : 60.0f, 36.0f, y0, h); if (st == 2) *y0 = 90.0f + (float)i * 40.0f; }
+
+static void drawFrontEnd(int st, int sel, int frame) {
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, 240.0f, C2D_Color32(0x0b, 0x0d, 0x14, 0xFF));
+	const char* sub = NULL;
+	if (st == 3 && sel < 3) sub = kModeTag[1 + sel];
+	if (st == 2 && sel == 0) sub = kModeTag[0];
+	menuPanel(1.0f, st == 1 ? "M A I N   M E N U" : (st == 2 ? "S I N G L E   P L A Y E R" : "M U L T I P L A Y E R"),
+	          st == 1 ? feMain : (st == 2 ? feSingle : feMulti), feCount(st), sel, frame, sub, "A: SELECT     B: BACK     D-PAD / TOUCH", st == 2 ? 90.0f : 60.0f, st == 2 ? 40.0f : 36.0f, 0);
+}
+
+static const char* const overItems[2] = {"RETRY", "MAIN MENU"};
+static void drawOverPanel(int frame, int sel) {
+	char l1[48], l2[48], l3[48];
+	const char* title = "G A M E   O V E R";
+	l1[0] = l2[0] = l3[0] = 0;
+	if (gMode == M_DM) { snprintf(l1, sizeof l1, "KILLS  %d", gKills); snprintf(l2, sizeof l2, "LEVEL  %d / 5", gLevel); snprintf(l3, sizeof l3, "SURVIVED  %d:%02d", gTime / 3600, (gTime / 60) % 60); }
+	else if (gMode == M_BR) {
+		title = gWon ? "V I C T O R Y" : "E L I M I N A T E D";
+		snprintf(l1, sizeof l1, gWon ? "LAST ONE ALIVE" : "PLACE  #%d / 12", gPlace); snprintf(l2, sizeof l2, "KILLS  %d", gKills); snprintf(l3, sizeof l3, "TIME  %d:%02d", gTime / 3600, (gTime / 60) % 60);
+	} else if (gMode == M_TP) {
+		title = gWon ? "Y O U   W I N" : (gDraw ? "D R A W" : "Y O U   L O S E");
+		snprintf(l1, sizeof l1, "YOUR SCORE  %d", tpScore[TP_PL]); snprintf(l2, sizeof l2, "PLACE  #%d / 4", gPlace);
+	}
+	menuPanel(1.0f, title, overItems, 2, sel, frame, NULL, "A: SELECT     D-PAD / TOUCH", 140.0f, 42.0f, 1);
+	txt(l1, 160.0f, 62.0f, 0.5f, neon(255, 255, 255, 1.0f), 1);
+	txt(l2, 160.0f, 84.0f, 0.45f, neon(120, 220, 235, 1.0f), 1);
+	txt(l3, 160.0f, 104.0f, 0.45f, neon(120, 220, 235, 1.0f), 1);
+}
+static void overRect(int i, float* y0, float* h) { listRect(2, i, 140.0f, 42.0f, y0, h); }
+
+// black, futuristic loading screen with a description of the chosen mode. Returns 0 if the player backed out.
+static int runLoading(C3D_RenderTarget* top, C3D_RenderTarget* bottom, int mode, int* quit) {
+	static const char* const sysMsg[6] = {"BUILDING NAV GRID", "SPAWNING ENTITIES", "COMPILING LOOT TABLES", "CALIBRATING AI", "SYNCING WORLD STATE", "READY"};
+	int f = 0, ready = 0, done = 0, result = 1;
+	float prog = 0.0f;
+	while (aptMainLoop()) {
+		hidScanInput();
+		u32 down = hidKeysDown();
+		updateAudio(0, 0);
+		if (f == 40) { setupMode(mode); ready = 1; }
+		if (!ready) prog += (0.45f - prog) * 0.05f; else prog += (1.0f - prog) * 0.04f;
+		if (prog > 0.995f && ready) prog = 1.0f;
+		done = (prog >= 1.0f && f > 140);
+		if (done && (down & (KEY_A | KEY_TOUCH))) break;
+		if (down & KEY_B) { if (ready) exitMode(); result = 0; break; }
+		int pct = (int)(prog * 100.0f + 0.5f);
+		C2D_TextBufClear(gDyn);
+		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+		C2D_Prepare();
+		C2D_TargetClear(top, C2D_Color32(0, 0, 0, 0xFF));
+		C2D_SceneBegin(top);
+		C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+		// drifting grid
+		float gy = fmodf((float)f * 0.6f, 20.0f);
+		for (float y = gy; y < 240.0f; y += 20.0f) C2D_DrawRectSolid(0.0f, y, 0.5f, 400.0f, 1.0f, neon(0, 229, 255, 0.07f));
+		for (float x = 0.0f; x < 400.0f; x += 40.0f) C2D_DrawRectSolid(x, 0.0f, 0.5f, 1.0f, 240.0f, neon(0, 229, 255, 0.05f));
+		float sw = fmodf((float)f * 3.0f, 300.0f) - 30.0f;
+		C2D_DrawRectSolid(0.0f, sw, 0.5f, 400.0f, 2.0f, neon(0, 229, 255, 0.10f));
+		brackets(8.0f, 8.0f, 384.0f, 224.0f, 22.0f, 2.0f, neon(0, 229, 255, 0.95f));
+		brackets(14.0f, 14.0f, 372.0f, 212.0f, 8.0f, 1.0f, neon(255, 46, 209, 0.7f));
+		txt("// MISSION BRIEFING", 24.0f, 20.0f, 0.38f, neon(255, 46, 209, 0.9f), 0);
+		txt(kModeName[mode], 200.0f, 34.0f, 1.0f, neon(0, 229, 255, 1.0f), 1);
+		C2D_DrawRectSolid(60.0f, 76.0f, 0.5f, 280.0f, 1.0f, neon(0, 229, 255, 0.6f));
+		C2D_DrawRectSolid(60.0f, 75.0f, 0.5f, 60.0f, 3.0f, neon(255, 46, 209, 0.9f));
+		txt(kModeTag[mode], 200.0f, 80.0f, 0.4f, neon(255, 46, 209, 0.9f), 1);
+		for (int i = 0; i < 5; i++) if (kModeDesc[mode][i][0]) txt(kModeDesc[mode][i], 200.0f, 102.0f + 17.0f * (float)i, 0.42f, neon(215, 240, 250, 0.95f), 1);
+		// progress: segmented bar
+		float bx = 50.0f, bw = 300.0f;
+		for (int i = 0; i < 30; i++) {
+			float on = (float)(i + 1) / 30.0f <= prog ? 1.0f : 0.0f;
+			C2D_DrawRectSolid(bx + (float)i * (bw / 30.0f), 200.0f, 0.5f, bw / 30.0f - 2.0f, 8.0f, on > 0.5f ? neon(0, 229, 255, 0.95f) : neon(0, 120, 150, 0.30f));
+		}
+		char buf[64];
+		int mi = ready ? (prog > 0.99f ? 5 : 3 + (int)(prog * 2.0f) % 2) : (f / 14) % 3;
+		snprintf(buf, sizeof buf, "SYS> %s ...", sysMsg[mi]);
+		txt(buf, 50.0f, 214.0f, 0.34f, neon(120, 220, 235, 0.9f), 0);
+		snprintf(buf, sizeof buf, "%d%%", pct);
+		txt(buf, 350.0f, 212.0f, 0.45f, neon(255, 255, 255, 1.0f), 2);
+
+		C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 0xFF));
+		C2D_SceneBegin(bottom);
+		brackets(8.0f, 8.0f, 304.0f, 224.0f, 20.0f, 2.0f, neon(0, 229, 255, 0.8f));
+		for (int i = 0; i < 6; i++) { // spinner
+			float a = (float)f * 0.1f + (float)i * 1.0472f, k = 0.25f + 0.75f * (float)((i + f / 4) % 6) / 5.0f;
+			C2D_DrawRectSolid(160.0f + 26.0f * cosf(a) - 4.0f, 100.0f + 26.0f * sinf(a) - 4.0f, 0.5f, 8.0f, 8.0f, neon(0, 229, 255, k));
+		}
+		txt(done ? "PRESS  A  TO  DEPLOY" : "L O A D I N G", 160.0f, 150.0f, done ? 0.55f : 0.5f, (done && (f / 20) % 2) ? neon(255, 46, 209, 1.0f) : neon(220, 240, 250, 1.0f), 1);
+		txt("B: BACK", 160.0f, 210.0f, 0.34f, neon(90, 110, 130, 1.0f), 1);
+		C2D_Flush();
+		C3D_FrameEnd(0);
+		f++;
+	}
+	if (!aptMainLoop()) { *quit = 1; result = 0; }
+	return result;
+}
+
+// ---- bottom screen for Target Practice ----
+static void drawTpBottom(int frame) {
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, 240.0f, C2D_Color32(0x05, 0x08, 0x10, 0xFF));
+	for (float y = 2.0f; y < 240.0f; y += 6.0f) C2D_DrawRectSolid(0.0f, y, 0.5f, 320.0f, 1.0f, neon(0, 229, 255, 0.04f));
+	brackets(6.0f, 6.0f, 308.0f, 228.0f, 16.0f, 2.0f, neon(0, 229, 255, 0.9f));
+	txt("T A R G E T   P R A C T I C E", 160.0f, 10.0f, 0.42f, neon(0, 229, 255, 1.0f), 1);
+	// your board with this turn's hits
+	const float bx = 82.0f, by = 112.0f, R = 66.0f;
+	static const u32 band[6] = {0, 0, 0, 0, 0, 0};
+	(void)band;
+	C2D_DrawCircleSolid(bx, by, 0.5f, R + 3.0f, neon(0, 80, 100, 1.0f));
+	static const float rr[5] = {1.8f, 1.62f, 1.26f, 0.9f, 0.54f};
+	for (int q = 0; q < 5; q++) C2D_DrawCircleSolid(bx, by, 0.5f, R * rr[q] / TP_BR, (q & 1) ? neon(235, 235, 235, 1.0f) : neon(215, 40, 40, 1.0f));
+	C2D_DrawCircleSolid(bx, by, 0.5f, R * TP_RING / TP_BR, neon(255, 210, 40, 1.0f));
+	for (int m = 0; m < tpMarkN[TP_PL]; m++) {
+		const Mark* mk = &tpMarks[TP_PL][m];
+		C2D_DrawCircleSolid(bx + mk->x * R / TP_BR, by - mk->y * R / TP_BR, 0.5f, 3.2f, neon(0, 0, 0, 1.0f));
+		C2D_DrawCircleSolid(bx + mk->x * R / TP_BR, by - mk->y * R / TP_BR, 0.5f, 2.2f, mk->s ? neon(0, 229, 255, 1.0f) : neon(120, 120, 120, 1.0f));
+	}
+	txt("YOUR BOARD", bx, 190.0f, 0.34f, neon(120, 220, 235, 1.0f), 1);
+	// scoreboard
+	float x0 = 162.0f, y0 = 30.0f;
+	txt("SCOREBOARD", x0 + 2.0f, y0 - 2.0f, 0.34f, neon(255, 46, 209, 1.0f), 0);
+	int order[4] = {0, 1, 2, 3};
+	for (int a = 0; a < 4; a++) for (int b2 = a + 1; b2 < 4; b2++) if (tpScore[order[b2]] > tpScore[order[a]]) { int t = order[a]; order[a] = order[b2]; order[b2] = t; }
+	for (int i = 0; i < 4; i++) {
+		int id = order[i];
+		float yy = y0 + 14.0f + (float)i * 28.0f;
+		int act = (gState == GS_PLAY && tpTurn == id);
+		C2D_DrawRectSolid(x0, yy, 0.5f, 146.0f, 24.0f, id == TP_PL ? neon(0, 229, 255, 0.20f) : neon(8, 24, 40, 0.85f));
+		frameRect(x0, yy, 146.0f, 24.0f, 1.0f, act ? neon(255, 46, 209, 1.0f) : neon(0, 150, 180, 0.6f));
+		char b[32];
+		snprintf(b, sizeof b, "%d. %s", i + 1, tpName[id]);
+		txt(b, x0 + 8.0f, yy + 5.0f, 0.45f, id == TP_PL ? neon(255, 255, 255, 1.0f) : neon(120, 220, 235, 1.0f), 0);
+		snprintf(b, sizeof b, "%d", tpScore[id]);
+		txt(b, x0 + 138.0f, yy + 3.0f, 0.6f, neon(255, 255, 255, 1.0f), 2);
+	}
+	char b[64];
+	snprintf(b, sizeof b, "ROUND %d / %d", tpRound + 1, TP_ROUNDS);
+	txt(b, 235.0f, 150.0f, 0.5f, neon(0, 229, 255, 1.0f), 1);
+	int yourRound = tpRoundScore[TP_PL][tpRound];
+	snprintf(b, sizeof b, "THIS ROUND: %d", yourRound);
+	txt(b, 235.0f, 170.0f, 0.4f, neon(220, 240, 250, 1.0f), 1);
+	if (gState == GS_PLAY && tpTurn == TP_PL && tpPhase == 1) {
+		snprintf(b, sizeof b, "SHOTS LEFT: %d", tpShotsLeft);
+		txt(b, 235.0f, 190.0f, 0.45f, neon(255, 46, 209, 1.0f), 1);
+	}
+	txt("R: FIRE   L: STEADY AIM   PAD: LOOK", 160.0f, 214.0f, 0.3f, neon(90, 130, 150, 1.0f), 1);
+}
+
+// bottom-screen overlays for the modes: enemy radar, loot, storm
+static void drawMapMode(float px, float pz) {
+	if (gMode != M_DM && gMode != M_BR) return;
+	if (gMode == M_BR) {
+		for (int i = 0; i < N_LOOT; i++) {
+			const Loot* l = &loot[i];
+			if (!l->active) continue;
+			float sx = MAP_CX + (l->x - px) * MAP_S, sy = MAP_CY + (l->z - pz) * MAP_S;
+			if (sx < 4.0f || sx > 316.0f || sy < 24.0f || sy > MAP_H - 4.0f) continue;
+			u32 c = l->kind == LK_WEAPON ? C2D_Color32(80, 160, 255, 255) : (l->kind == LK_AMMO ? C2D_Color32(255, 220, 60, 255) : C2D_Color32(70, 255, 120, 255));
+			C2D_DrawRectSolid(sx - 2.0f, sy - 2.0f, 0.5f, 4.0f, 4.0f, c);
+		}
+		for (int pass = 0; pass < 2; pass++) { // storm edge (purple) and next safe circle (white)
+			if (pass == 1 && zPhase >= 5) break;
+			float cx = pass ? zTx : zCx, cz = pass ? zTz : zCz, R = pass ? zTr : zR;
+			u32 c = pass ? C2D_Color32(255, 255, 255, 220) : C2D_Color32(190, 70, 255, 255);
+			float ox = 0, oy = 0;
+			for (int k = 0; k <= 72; k++) {
+				float a = (float)k * 6.2832f / 72.0f;
+				float sx = MAP_CX + (cx + R * sinf(a) - px) * MAP_S, sy = MAP_CY + (cz + R * cosf(a) - pz) * MAP_S;
+				if (k > 0 && sx > -50.0f && sx < 370.0f && sy > -50.0f && sy < 230.0f && ox > -50.0f && ox < 370.0f && oy > -50.0f && oy < 230.0f) {
+					float y0 = oy, y1 = sy;
+					if ((y0 > 22.0f && y0 < MAP_H - 2.0f) && (y1 > 22.0f && y1 < MAP_H - 2.0f)) C2D_DrawLine(ox, oy, c, sx, sy, c, 2.0f, 0.5f);
+				}
+				ox = sx; oy = sy;
+			}
+		}
+	}
+	for (int i = 0; i < MAX_BOTS; i++) {
+		const Bot* b = &bots[i];
+		if (!b->active || b->dead) continue;
+		float dx = b->x - px, dz = b->z - pz;
+		if (gMode == M_BR && dx * dx + dz * dz > 55.0f * 55.0f) continue;
+		float sx = MAP_CX + dx * MAP_S, sy = MAP_CY + dz * MAP_S;
+		if (sx < 4.0f || sx > 316.0f || sy < 24.0f || sy > MAP_H - 4.0f) continue;
+		C2D_DrawCircleSolid(sx, sy, 0.5f, 4.5f, C2D_Color32(255, 255, 255, 255));
+		C2D_DrawCircleSolid(sx, sy, 0.5f, 3.3f, C2D_Color32(235, 40, 50, 255));
+	}
+	if (gMode == M_BR) {
+		char b[32];
+		snprintf(b, sizeof b, "MEDKITS x%d", plMedkits);
+		C2D_DrawRectSolid(206.0f, 54.0f, 0.5f, 110.0f, 14.0f, C2D_Color32(0, 0, 0, 180));
+		txt(b, 212.0f, 55.0f, 0.34f, plMedkits ? C2D_Color32(110, 255, 150, 255) : C2D_Color32(160, 160, 170, 255), 0);
+	}
+}
+
+// ---- top-screen HUD (drawn with citro2d on top of the 3D view) ----
+static void drawTopHud(int frame, float camYaw) {
+	if (gMode == M_FREE && gState != GS_COUNTDOWN && gGo <= 0) return;
+	const float CX = 200.0f, CY = 120.0f;
+	if (gMode == M_DM || gMode == M_BR) {
+		if (plFlash > 0) { // damage flash around the edges
+			float a = (float)plFlash / 14.0f;
+			for (int k = 0; k < 4; k++) {
+				float th = 10.0f + 8.0f * (float)k, al = 0.28f * a * (1.0f - 0.2f * (float)k);
+				C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 400.0f, th, neon(255, 0, 20, al));
+				C2D_DrawRectSolid(0.0f, 240.0f - th, 0.5f, 400.0f, th, neon(255, 0, 20, al));
+				C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, th, 240.0f, neon(255, 0, 20, al));
+				C2D_DrawRectSolid(400.0f - th, 0.0f, 0.5f, th, 240.0f, neon(255, 0, 20, al));
+			}
+		}
+		if (plHp > 0.0f && plHp < 30.0f && gState == GS_PLAY) { // low health pulse
+			float a = 0.10f + 0.10f * sinf((float)frame * 0.2f);
+			C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 400.0f, 14.0f, neon(255, 0, 20, a)); C2D_DrawRectSolid(0.0f, 226.0f, 0.5f, 400.0f, 14.0f, neon(255, 0, 20, a));
+			C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 14.0f, 240.0f, neon(255, 0, 20, a));  C2D_DrawRectSolid(386.0f, 0.0f, 0.5f, 14.0f, 240.0f, neon(255, 0, 20, a));
+		}
+		if (gMode == M_BR && gState == GS_PLAY && outsideStorm(gPlX, gPlZ)) {
+			float a = 0.16f + 0.08f * sinf((float)frame * 0.15f);
+			C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 400.0f, 20.0f, neon(170, 40, 255, a)); C2D_DrawRectSolid(0.0f, 220.0f, 0.5f, 400.0f, 20.0f, neon(170, 40, 255, a));
+			C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 20.0f, 240.0f, neon(170, 40, 255, a)); C2D_DrawRectSolid(380.0f, 0.0f, 0.5f, 20.0f, 240.0f, neon(170, 40, 255, a));
+		}
+		float fx = -sinf(camYaw), fz = -cosf(camYaw), rx = cosf(camYaw), rz = -sinf(camYaw);
+		for (int i = 0; i < 4; i++) { // red wedges pointing at whoever shot you
+			if (plHitLife[i] <= 0) continue;
+			float dx = plHitAng[i] - gPlX, dz = plHitZ[i] - gPlZ;
+			float ang = atan2f(dx * rx + dz * rz, dx * fx + dz * fz), a = (float)plHitLife[i] / 70.0f;
+			float sx = sinf(ang), sy = -cosf(ang), nx = -sy, ny = sx;
+			u32 c = neon(255, 30, 30, a);
+			C2D_DrawTriangle(CX + sx * 96.0f, CY + sy * 96.0f, c, CX + sx * 78.0f + nx * 11.0f, CY + sy * 78.0f + ny * 11.0f, c, CX + sx * 78.0f - nx * 11.0f, CY + sy * 78.0f - ny * 11.0f, c, 0.5f);
+		}
+		// health bar
+		float hx = 14.0f, hy = 212.0f, hw = 150.0f, hh = 10.0f, k = plHp / 100.0f;
+		if (k < 0.0f) k = 0.0f;
+		C2D_DrawRectSolid(hx - 2.0f, hy - 2.0f, 0.5f, hw + 4.0f, hh + 4.0f, neon(0, 0, 0, 0.6f));
+		u32 hc = k > 0.5f ? neon(80, 230, 110, 1.0f) : (k > 0.25f ? neon(255, 200, 40, 1.0f) : neon(255, 50, 50, 1.0f));
+		C2D_DrawRectSolid(hx, hy, 0.5f, hw * k, hh, hc);
+		if (plHeal > 0) C2D_DrawRectSolid(hx, hy, 0.5f, hw * k, 3.0f, neon(255, 255, 255, 0.7f));
+		frameRect(hx - 2.0f, hy - 2.0f, hw + 4.0f, hh + 4.0f, 1.0f, neon(0, 229, 255, 0.8f));
+		if (gMode == M_DM) C2D_DrawRectSolid(hx + hw * 0.5f - 1.0f, hy - 5.0f, 0.5f, 2.0f, hh + 10.0f, neon(255, 255, 255, 0.85f)); // the level you can heal back to
+		char b[64];
+		snprintf(b, sizeof b, "HP %d", (int)(plHp + 0.5f));
+		txt(b, hx, hy - 15.0f, 0.4f, neon(255, 255, 255, 0.95f), 0);
+		if (gMode == M_DM && plHp < 50.0f && gState == GS_PLAY) txt(plUnseen > 120 && plSince > 150 ? "RECOVERING..." : "BREAK LINE OF SIGHT TO RECOVER", hx + 60.0f, hy - 14.0f, 0.3f, neon(255, 210, 90, 0.9f), 0);
+	}
+	if (gMode == M_DM) {
+		char b[64];
+		snprintf(b, sizeof b, "KILLS %d", gKills);
+		C2D_DrawRectSolid(10.0f, 10.0f, 0.5f, 118.0f, 40.0f, neon(0, 0, 0, 0.5f));
+		txt(b, 16.0f, 12.0f, 0.6f, neon(255, 255, 255, 1.0f), 0);
+		snprintf(b, sizeof b, "LEVEL %d / 5", gLevel);
+		txt(b, 16.0f, 32.0f, 0.42f, neon(255, 46, 209, 1.0f), 0);
+		if (gLevel < 5) { snprintf(b, sizeof b, "NEXT AT %d", dmLevelAt[gLevel + 1]); txt(b, 386.0f, 12.0f, 0.34f, neon(160, 210, 225, 0.9f), 2); }
+		else txt("MAX LEVEL", 386.0f, 12.0f, 0.34f, neon(255, 90, 90, 1.0f), 2);
+		if (gBanner > 0) {
+			float a = gBanner > 30 ? 1.0f : (float)gBanner / 30.0f;
+			snprintf(b, sizeof b, "LEVEL %d", gLevel);
+			C2D_DrawRectSolid(0.0f, 52.0f, 0.5f, 400.0f, 46.0f, neon(0, 0, 0, 0.55f * a));
+			C2D_DrawRectSolid(0.0f, 52.0f, 0.5f, 400.0f, 2.0f, neon(255, 46, 209, a));
+			C2D_DrawRectSolid(0.0f, 96.0f, 0.5f, 400.0f, 2.0f, neon(0, 229, 255, a));
+			txt(b, 200.0f, 54.0f, 0.9f, neon(255, 255, 255, a), 1);
+			txt("ENEMIES ARE GETTING DEADLIER", 200.0f, 82.0f, 0.34f, neon(255, 120, 120, a), 1);
+		}
+	}
+	if (gMode == M_BR) {
+		char b[64];
+		C2D_DrawRectSolid(286.0f, 8.0f, 0.5f, 106.0f, 44.0f, neon(0, 0, 0, 0.5f));
+		snprintf(b, sizeof b, "ALIVE %d", botsAlive() + (plHp > 0.0f ? 1 : 0));
+		txt(b, 386.0f, 10.0f, 0.55f, neon(255, 255, 255, 1.0f), 2);
+		snprintf(b, sizeof b, "KILLS %d", gKills);
+		txt(b, 386.0f, 29.0f, 0.4f, neon(255, 46, 209, 1.0f), 2);
+		int secs = zPhase >= 5 ? 0 : ((stormShrinking() ? zShrink[zPhase] - (zT - zWait[zPhase]) : zWait[zPhase] - zT) / 60);
+		if (zPhase >= 5) snprintf(b, sizeof b, "FINAL ZONE");
+		else if (stormShrinking()) snprintf(b, sizeof b, "STORM CLOSING %d:%02d", secs / 60, secs % 60);
+		else snprintf(b, sizeof b, "STORM IN %d:%02d", secs / 60, secs % 60);
+		C2D_DrawRectSolid(10.0f, 10.0f, 0.5f, 160.0f, 16.0f, neon(0, 0, 0, 0.5f));
+		txt(b, 16.0f, 11.0f, 0.36f, stormShrinking() || zPhase >= 5 ? neon(200, 110, 255, 1.0f) : neon(220, 240, 250, 1.0f), 0);
+		for (int i = 0; i < FEED_N; i++) if (feedLife[i] > 0) txt(feedTxt[i], 392.0f, 58.0f + 13.0f * (float)i, 0.32f, neon(255, 255, 255, feedLife[i] > 40 ? 0.95f : feedLife[i] / 40.0f), 2);
+		if (curWeapon == WP_FISTS && gState == GS_PLAY && gTime < 1500) txt("NO WEAPON - FIND ONE!", 200.0f, 190.0f, 0.4f, neon(255, 210, 90, 0.5f + 0.5f * sinf((float)frame * 0.15f)), 1);
+	}
+	if (gMode == M_TP) {
+		char b[64];
+		C2D_DrawRectSolid(120.0f, 6.0f, 0.5f, 160.0f, 44.0f, neon(0, 0, 0, 0.55f));
+		snprintf(b, sizeof b, "ROUND %d / %d", tpRound + 1, TP_ROUNDS);
+		txt(b, 200.0f, 8.0f, 0.5f, neon(0, 229, 255, 1.0f), 1);
+		if (gState == GS_PLAY) {
+			if (tpTurn == TP_PL) snprintf(b, sizeof b, tpPhase == 1 ? "YOUR TURN - %d SHOTS LEFT" : "YOUR TURN", tpShotsLeft);
+			else snprintf(b, sizeof b, "%s'S TURN", tpName[tpTurn]);
+			txt(b, 200.0f, 28.0f, 0.4f, neon(255, 255, 255, 1.0f), 1);
+			if (tpTurn == TP_PL && tpPhase == 1) { snprintf(b, sizeof b, "%d", tpTimer / 60 + 1); txt(b, 200.0f, 40.0f, 0.3f, neon(255, 46, 209, 1.0f), 1); }
+		}
+		for (int i = 0; i < 4; i++) {
+			snprintf(b, sizeof b, "%s  %d", tpName[i], tpScore[i]);
+			txt(b, 392.0f, 10.0f + 14.0f * (float)i, 0.36f, i == TP_PL ? neon(0, 229, 255, 1.0f) : neon(255, 255, 255, 0.9f), 2);
+		}
+		float ch = 120.0f;
+		float gap = 5.0f, a = 0.9f;
+		C2D_DrawRectSolid(CX - gap - 9.0f, ch, 0.5f, 9.0f, 1.0f, neon(255, 255, 255, a)); C2D_DrawRectSolid(CX + gap, ch, 0.5f, 9.0f, 1.0f, neon(255, 255, 255, a));
+		C2D_DrawRectSolid(CX, ch - gap - 9.0f, 0.5f, 1.0f, 9.0f, neon(255, 255, 255, a)); C2D_DrawRectSolid(CX, ch + gap, 0.5f, 1.0f, 9.0f, neon(255, 255, 255, a));
+	}
+	if (gToast > 0 && gState == GS_PLAY) txt(gToastTxt, 200.0f, 172.0f, 0.5f, neon(255, 255, 255, gToast > 30 ? 1.0f : (float)gToast / 30.0f), 1);
+	if (gState == GS_COUNTDOWN) {
+		int n = gCount / 60; // 3, 2, 1
+		char b[8];
+		snprintf(b, sizeof b, "%d", n);
+		float ph = (float)(gCount % 60) / 60.0f, sc = 2.6f + 1.0f * ph;
+		C2D_DrawRectSolid(0.0f, 86.0f, 0.5f, 400.0f, 70.0f, neon(0, 0, 0, 0.35f));
+		txt(n >= 1 ? b : "GO", 200.0f, 98.0f - 20.0f * ph, sc, neon(0, 229, 255, 0.4f + 0.6f * (1.0f - ph)), 1);
+		txt("GET READY", 200.0f, 64.0f, 0.5f, neon(255, 46, 209, 1.0f), 1);
+		txt(kModeName[gMode], 200.0f, 172.0f, 0.5f, neon(255, 255, 255, 0.9f), 1);
+	} else if (gGo > 0) {
+		float a = (float)gGo / 60.0f;
+		txt("GO!", 200.0f, 80.0f, 3.0f, neon(255, 255, 255, a), 1);
+	}
+	if (gState == GS_OVER) { // result banner
+		float a = gOverT > 40 ? 1.0f : (float)gOverT / 40.0f;
+		C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 400.0f, 240.0f, neon(0, 0, 0, 0.55f * a));
+		const char* big = "YOU DIED";
+		u32 col = neon(255, 50, 50, a);
+		if (gMode == M_BR) { big = gWon ? "VICTORY ROYALE" : "ELIMINATED"; col = gWon ? neon(255, 210, 40, a) : neon(255, 50, 50, a); }
+		if (gMode == M_TP) { big = gWon ? "YOU WIN!" : (gDraw ? "DRAW" : "YOU LOSE"); col = gWon ? neon(255, 210, 40, a) : (gDraw ? neon(255, 255, 255, a) : neon(255, 50, 50, a)); }
+		txt(big, 200.0f, 70.0f, 1.3f, col, 1);
+		char b[64];
+		if (gMode == M_DM) snprintf(b, sizeof b, "%d KILLS  -  LEVEL %d", gKills, gLevel);
+		else if (gMode == M_BR) snprintf(b, sizeof b, gWon ? "LAST ONE STANDING" : "PLACE #%d  -  %d KILLS", gPlace, gKills);
+		else snprintf(b, sizeof b, "FINAL SCORE %d", tpScore[TP_PL]);
+		txt(b, 200.0f, 125.0f, 0.5f, neon(255, 255, 255, a), 1);
+		if (gMode == M_TP) for (int i = 0; i < 4; i++) { snprintf(b, sizeof b, "%s  %d", tpName[i], tpScore[i]); txt(b, 200.0f, 148.0f + 14.0f * (float)i, 0.36f, i == TP_PL ? neon(0, 229, 255, a) : neon(200, 210, 220, a), 1); }
+	}
 }
 
 // ---- boot: developer logo sequence ---------------------------------------------
@@ -2539,6 +3975,7 @@ int main(int argc, char** argv) {
 	buildCity();
 	staticCount = vcount;
 	GSPGPU_FlushDataCache(vbo, staticCount * sizeof(Vertex));
+	initNav();
 	initCars();
 	initPeds();
 	initCrates();
@@ -2559,6 +3996,7 @@ int main(int argc, char** argv) {
 	float px = 0.0f, pz = 0.0f, yaw = 0.0f, pitch = 0.3f;
 	int   hackFrames = 0, frame = 0;
 	int   title = 1;
+	int   feState = 0, feSel = 0, overSel = 0, launch = -1; // front-end menus: 0 press start, 1 main, 2 single player, 3 multiplayer
 	float titleFade = 0.0f; // title screen fades in from black
 	float orbit = 0.0f;
 	float face = 0.0f, phase = 0.0f, moveAmt = 0.0f; // character heading, step cycle, 0 idle / 1 walk / 2 run
@@ -2585,17 +4023,68 @@ int main(int argc, char** argv) {
 		hidTouchRead(&tp);
 
 		if (title) {
-			if (down & (KEY_A | KEY_TOUCH)) {
-				title = 0; musicWant = 0; // the music fades out, the city ambience fades in
-				px = 0.0f; pz = 0.0f; yaw = 0.0f; pitch = 0.3f;
-				face = 0.0f; phoneTimer = 0; pending = 0;
-				hackFrames = 0; frame = 0; aimAmt = 0.0f;
+			if (feState == 0) {
+				if (down & (KEY_A | KEY_TOUCH)) { feState = 1; feSel = 0; playSfx(SFX_SWITCH, 0.6f); }
+			} else {
+				int n = feCount(feState), choose = (down & KEY_A) ? 1 : 0;
+				if (down & KEY_DDOWN) { feSel = (feSel + 1) % n; playSfx(SFX_CLICK, 0.4f); }
+				if (down & KEY_DUP)   { feSel = (feSel + n - 1) % n; playSfx(SFX_CLICK, 0.4f); }
+				if (down & KEY_TOUCH) {
+					for (int i = 0; i < n; i++) {
+						float y0, h;
+						feRect(feState, i, &y0, &h);
+						if (tp.px >= 50 && tp.px <= 270 && tp.py >= y0 && tp.py < y0 + h) { feSel = i; choose = 1; }
+					}
+				}
+				if (down & KEY_B) { feState = (feState == 1) ? 0 : 1; feSel = 0; }
+				else if (choose) {
+					if (feState == 1) {
+						if (feSel == 0) { feState = 2; feSel = 0; } else if (feSel == 1) { feState = 3; feSel = 0; } else feState = 0;
+					} else if (feState == 2) {
+						if (feSel == 0) { launch = M_FREE; gLastMenu = 2; } else { feState = 1; feSel = 0; }
+					} else {
+						if (feSel < 3) { launch = M_DM + feSel; gLastMenu = 3; } else { feState = 1; feSel = 1; }
+					}
+				}
 			}
-			held = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; // ignore game input on the title screen
+			held = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; // ignore game input on the menus
 		}
 
+		// a mode was chosen: black loading screen with its description, then 3-2-1
+		if (launch >= 0) {
+			int m = launch, quit = 0;
+			launch = -1;
+			int okk = runLoading(top, bottom, m, &quit);
+			if (quit) break;
+			if (okk) {
+				title = 0; musicWant = 0; paused = 0; menuState = 0; sel = 0; overSel = 0;
+				px = gPlX; pz = gPlZ; yaw = gPlYaw; pitch = (m == M_TP) ? 0.0f : 0.3f;
+				face = yaw; phoneTimer = 0; pending = 0; hackFrames = 0; frame = 0; sim = 0; aimAmt = 0.0f; wheelAmt = 0.0f;
+				wheelSel = curWeapon; wheelWas = 0; lastTouchX = lastTouchY = -1; pauseDim = 0.0f;
+			}
+			continue;
+		}
+
+		// game over / result screen: RETRY or MAIN MENU
+		if (!title && gState == GS_OVER && gOverT > 30) {
+			int choose = (down & KEY_A) ? 1 : 0;
+			if (down & (KEY_DDOWN | KEY_DUP)) overSel = 1 - overSel;
+			if (down & KEY_TOUCH) {
+				for (int i = 0; i < 2; i++) {
+					float y0, h;
+					overRect(i, &y0, &h);
+					if (tp.px >= 50 && tp.px <= 270 && tp.py >= y0 && tp.py < y0 + h) { overSel = i; choose = 1; }
+				}
+			}
+			if (choose) {
+				if (overSel == 0) launch = gMode;
+				else { exitMode(); title = 1; feState = gLastMenu; feSel = 0; musicWant = 1; titleFade = 0.0f; wheelAmt = 0.0f; }
+			}
+		}
+		if (!title && gState == GS_OVER) { held = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; down = 0; }
+
 		// pause menu: SELECT toggles, D-Pad / touch select, A confirm, B resume
-		if (!title && (down & KEY_SELECT)) {
+		if (!title && gState != GS_OVER && (down & KEY_SELECT)) {
 			if (paused) paused = 0;
 			else { paused = 1; menuState = 0; sel = 0; }
 		}
@@ -2617,7 +4106,7 @@ int main(int argc, char** argv) {
 					else if (sel == 1) { menuState = 1; sel = weather; }
 					else if (sel == 2) { menuState = 2; sel = 0; }
 					else if (sel == 3) { menuState = 3; sel = camStyle; }
-					else { title = 1; paused = 0; menuState = 0; musicWant = 1; titleFade = 0.0f; wheelAmt = 0.0f; } // TITLE
+					else { exitMode(); title = 1; feState = gLastMenu; feSel = 0; paused = 0; menuState = 0; musicWant = 1; titleFade = 0.0f; wheelAmt = 0.0f; } // MAIN MENU
 				} else if (menuState == 1) {
 					if (sel < 4) weather = sel;                  // SUNNY / RAINY / SUNSET / NIGHT
 					else         { menuState = 0; sel = 1; }     // BACK
@@ -2627,7 +4116,7 @@ int main(int argc, char** argv) {
 					else if (sel == 2) gFps = !gFps;
 					else               { menuState = 0; sel = 2; } // BACK
 				} else {
-					if (sel < 3) camStyle = sel;                 // DEFAULT / WATCH DOGS / FIRST PERSON
+					if (sel < 3) { if (gMode != M_TP) camStyle = sel; } // DEFAULT / WATCH DOGS / FIRST PERSON (the range is first person only)
 					else         { menuState = 0; sel = 3; }     // BACK
 				}
 			}
@@ -2639,14 +4128,14 @@ int main(int argc, char** argv) {
 		updateAudio(!title, paused);
 		if (title) titleFade += (1.0f - titleFade) * 0.04f;
 
-		if (!title && !paused && (down & KEY_Y)) camStyle = (camStyle + 1) % 3; // quick camera switch
+		if (!title && !paused && gMode != M_TP && (down & KEY_Y)) camStyle = (camStyle + 1) % 3; // quick camera switch
 
 		// weapon wheel: hold X, pick with the Circle Pad or by touch, release to equip
-		int wheelOpen = (!title && !paused && (held & KEY_X)) ? 1 : 0;
+		int wheelOpen = (!title && !paused && gState == GS_PLAY && gMode != M_TP && (held & KEY_X)) ? 1 : 0;
 		if (wheelOpen && !wheelWas) wheelSel = curWeapon;
-		if (!wheelOpen && wheelWas && wheelSel != curWeapon) {
-			curWeapon = wheelSel; fireCool = 12;
-			playSfx(SFX_SWITCH, 0.6f);
+		if (!wheelOpen && wheelWas) {
+			if (wheelSel == WP_COUNT) useMedkit();
+			else if (wheelSel != curWeapon && ownedW[wheelSel]) { curWeapon = wheelSel; fireCool = 12; playSfx(SFX_SWITCH, 0.6f); }
 		}
 		wheelWas = wheelOpen;
 		wheelAmt += ((wheelOpen ? 1.0f : 0.0f) - wheelAmt) * 0.3f;
@@ -2655,23 +4144,24 @@ int main(int argc, char** argv) {
 			float mx = (float)cp.dx, my = -(float)cp.dy; // screen coordinates, y down
 			if (mx * mx + my * my > 55.0f * 55.0f) {
 				float bd = -1e9f;
-				for (int i = 0; i < WP_COUNT; i++) {
-					float a = (-90.0f + 72.0f * (float)i) * 0.0174533f, dd = mx * cosf(a) + my * sinf(a);
+				for (int i = 0; i < wheelN(); i++) {
+					if (!wheelUsable(i) && i != curWeapon) continue;
+					float a = (-90.0f + 360.0f / (float)wheelN() * (float)i) * 0.0174533f, dd = mx * cosf(a) + my * sinf(a);
 					if (dd > bd) { bd = dd; wheelSel = i; }
 				}
 			}
 			if (down & KEY_TOUCH) {
-				for (int i = 0; i < WP_COUNT; i++) {
+				for (int i = 0; i < wheelN(); i++) {
 					float x, y;
 					wheelTile(i, &x, &y);
-					if (fabsf((float)tp.px - x) < WH_W * 0.5f && fabsf((float)tp.py - y) < WH_H * 0.5f) wheelSel = i;
+					if (wheelUsable(i) && fabsf((float)tp.px - x) < WH_W * 0.5f && fabsf((float)tp.py - y) < WH_H * 0.5f) wheelSel = i;
 				}
 			}
 			cp.dx = 0; cp.dy = 0; // the stick picks a weapon instead of moving the character
 		}
 
 		// aiming: hold L / ZL, or just fire - the camera goes over the shoulder and the crosshair appears
-		int armed = (curWeapon != WP_FISTS);
+		int armed = (curWeapon != WP_FISTS) && ownedW[curWeapon];
 		int wantAim = (!title && !paused && !wheelOpen && armed && (held & (KEY_L | KEY_ZL | KEY_R | KEY_ZR))) ? 1 : 0;
 		aimAmt += ((wantAim ? 1.0f : 0.0f) - aimAmt) * 0.22f;
 		if (aimAmt < 0.01f) aimAmt = 0.0f;
@@ -2681,12 +4171,16 @@ int main(int argc, char** argv) {
 		if (held & KEY_DRIGHT) yaw -= 0.04f * lookScale;
 		if (held & KEY_DUP)    pitch -= 0.03f * lookScale;
 		if (held & KEY_DDOWN)  pitch += 0.03f * lookScale;
+		if (gMode == M_TP && !title && !wheelOpen) { // no walking at the range: the Circle Pad looks around too
+			if (abs(cp.dx) > 18) yaw   -= cp.dx / 156.0f * 0.05f * lookScale;
+			if (abs(cp.dy) > 18) pitch -= cp.dy / 156.0f * 0.04f * lookScale;
+		}
 		if (abs(cs.dx) > 15) yaw   -= cs.dx / 156.0f * 0.05f * lookScale;
 		if (abs(cs.dy) > 15) pitch -= cs.dy / 156.0f * 0.04f * lookScale;
 
 		// touch: bottom strip = HACK button, elsewhere = drag to look
 		if ((held & KEY_TOUCH) && !wheelOpen) {
-			if (tp.py >= BTN_Y0) {
+				if (tp.py >= BTN_Y0 && gMode != M_TP) {
 				if (down & KEY_TOUCH) {
 					if (phoneTimer == 0 && tp.py < BTN_Y1) {
 						pending = (tp.px < 160) ? 1 : 2; // 1 = hack lights, 2 = blackout
@@ -2702,6 +4196,7 @@ int main(int argc, char** argv) {
 			lastTouchX = lastTouchY = -1;
 		}
 		float pMin = (camStyle == 2) ? -1.3f : -0.3f, pMax = (camStyle == 2) ? 1.3f : 1.2f;
+		if (gMode == M_TP && !title) { pMin = -0.45f; pMax = 0.45f; if (yaw > 1.0f) yaw = 1.0f; if (yaw < -1.0f) yaw = -1.0f; }
 		if (pitch > pMax) pitch = pMax;
 		if (pitch < pMin) pitch = pMin;
 
@@ -2710,7 +4205,7 @@ int main(int argc, char** argv) {
 		if (fabsf(sx) < 0.1f) sx = 0;
 		float len = sqrtf(fx * fx + sx * sx);
 		if (len > 1.0f) { fx /= len; sx /= len; len = 1.0f; }
-		if (phoneTimer > 0) { fx = 0.0f; sx = 0.0f; len = 0.0f; } // standing still while on the phone
+		if (phoneTimer > 0 || (!title && (gState != GS_PLAY || gMode == M_TP))) { fx = 0.0f; sx = 0.0f; len = 0.0f; } // standing still: on the phone, counting down, game over, or at the range
 		int aimFace = (aimAmt > 0.5f) || (camStyle == 2);        // aiming / first person: body follows the camera
 		int running = (held & KEY_B) && len > 0.5f && aimAmt < 0.3f;
 		float speed = running ? 0.17f : (aimAmt > 0.3f ? 0.045f : 0.07f);
@@ -2761,6 +4256,7 @@ int main(int argc, char** argv) {
 			if (!wheelOpen || (sim & 3) == 0) { // the world slows to a crawl while the wheel is open
 				updateCars(sim, title ? 1e6f : px, title ? 1e6f : pz);
 				updatePeds(sim);
+				if (!title) updateMode(px, pz, len > 0.0f);
 			}
 			sim++;
 		}
@@ -2770,6 +4266,11 @@ int main(int argc, char** argv) {
 		static const float baseSh[3]   = {0.0f, 0.75f, 0.0f}, aimSh[3]   = {0.8f, 0.95f, 0.0f};
 		static const float baseH[3]    = {1.6f, 1.9f, 1.65f},  aimH[3]    = {1.75f, 1.85f, 1.65f};
 		float cyaw = yaw, cpitch = pitch - kick;
+		if (gMode == M_TP && !title) { // a slight hand tremor: steadier while holding L
+			float k = 1.0f - 0.5f * aimAmt;
+			cyaw   += (sinf((float)sim * 0.021f) * 0.0042f + sinf((float)sim * 0.057f) * 0.0020f) * k;
+			cpitch += (sinf((float)sim * 0.027f + 1.0f) * 0.0038f + sinf((float)sim * 0.061f) * 0.0018f) * k;
+		}
 		float cx, cy, cz;
 		{
 			float dist0 = baseDist[camStyle] + (aimDist[camStyle] - baseDist[camStyle]) * aimAmt;
@@ -2801,7 +4302,7 @@ int main(int argc, char** argv) {
 		Mtx_RotateY(&mv, -cyaw, true);
 		Mtx_Translate(&mv, -cx, -cy, -cz, true);
 
-		gCamX = cx; gCamZ = cz;
+		gCamX = cx; gCamZ = cz; gCamYaw = cyaw;
 		gCullR = title ? 400.0f : 140.0f;
 		gFwdX = -sinf(cyaw); gFwdZ = -cosf(cyaw);
 		gCone = !title;
@@ -2824,21 +4325,25 @@ int main(int argc, char** argv) {
 				muz[0] = px + hx * (0.6f + L) + rx * 0.36f; muz[1] = 1.2f; muz[2] = pz + hz * (0.6f + L) + rz * 0.36f;
 			}
 			if (fireCool > 0) fireCool--;
-			if (!wheelOpen && phoneTimer == 0 && armed && (held & (KEY_R | KEY_ZR)) && fireCool == 0) {
+			if (gState == GS_PLAY && !wheelOpen && phoneTimer == 0 && armed && (held & (KEY_R | KEY_ZR)) && fireCool == 0) {
 				const WDef* w = &wdef[curWeapon];
 				int fresh = (down & (KEY_R | KEY_ZR)) ? 1 : 0;
-				if (w->autoFire || fresh) {
+				if (gMode == M_TP) {
+					if (fresh && tpTurn == TP_PL && tpPhase == 1 && tpShotsLeft > 0) { fireCool = 24; tpPlayerShot(cam, fwd, muz); }
+				} else if (w->autoFire || fresh) {
 					if (ammo[curWeapon] > 0) { ammo[curWeapon]--; fireCool = w->cooldown; fireWeapon(cam, fwd, muz); }
 					else if (fresh) { playSfx(SFX_CLICK, 0.6f); fireCool = 10; }
 				}
 			}
 			updateRocket();
-			updateCrates(px, pz);
+			if (gCratesOn) updateCrates(px, pz);
 			updateFx();
 		}
 
 		// ---- build this frame's dynamic geometry ----
 		drawDynamic();
+		if (!title && gMode == M_TP) drawTpRoom(sim);
+		else if (!title && gMode != M_FREE) drawBots();
 		if (!title) {
 			if (camStyle == 2) {
 				drawViewModel(cx, cy, cz, cyaw, cpitch);
@@ -2855,12 +4360,14 @@ int main(int argc, char** argv) {
 		}
 		int litStart = vcount;            // emissive: signal heads, lights, ammo crates, tracers, rocket
 		drawLights(sim, wNight);
-		drawCrates(sim);
+		if (gCratesOn) drawCrates(sim);
+		drawLoot(sim);
 		drawTracers();
 		GSPGPU_FlushDataCache(&vbo[litStart], (vcount - litStart) * sizeof(Vertex));
 		int skyStart = vcount;            // blended: sun / moon / stars, rain, muzzle flashes, smoke, explosions
 		drawSkyBodies(cx, cy, cz, cyaw);
 		drawRain(cx, cz, cyaw);
+		drawStorm();
 		drawFx(cyaw);
 		int dropStart = vcount;           // lens droplets + HUD (pixel coordinates, own pass)
 		drawDroplets();
@@ -2897,10 +4404,12 @@ int main(int argc, char** argv) {
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uFogClr, fogC[0], fogC[1], fogC[2], 1.0f);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, wTint[0] * t, wTint[1] * t, wTint[2] * t, 1.0f);
 		envPlain();
-		drawRange(0, globalEnd);                         // ground + skyline
-		drawCells(cellAStart, cellACount, vis);          // roofs, road markings, crossings, signal poles
-		if (gWin) { envTextured(); C3D_TexBind(0, &texDay); }
-		drawCells(cellWStart, cellWCount, vis);          // textured facades
+		if (title || gMode != M_TP) { // the shooting range is far from the city: skip the city entirely
+			drawRange(0, globalEnd);                         // ground + skyline
+			drawCells(cellAStart, cellACount, vis);          // roofs, road markings, crossings, signal poles
+			if (gWin) { envTextured(); C3D_TexBind(0, &texDay); }
+			drawCells(cellWStart, cellWCount, vis);          // textured facades
+		}
 		envPlain();
 		drawRange(staticCount, litStart - staticCount);  // shadows, cars, pedestrians, player
 
@@ -2909,7 +4418,7 @@ int main(int argc, char** argv) {
 		drawRange(litStart, skyStart - litStart);
 
 		// 3) lit windows: the night texture added on top of the facades
-		if (gWin && glow > 0.03f) {
+		if (gWin && glow > 0.03f && (title || gMode != M_TP)) {
 			C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ONE, GPU_ONE, GPU_ONE);
 			C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_COLOR);
 			C3D_FVUnifSet(GPU_VERTEX_SHADER, uFogClr, 0.0f, 0.0f, 0.0f, 1.0f); // distant windows fade to black
@@ -2937,16 +4446,29 @@ int main(int argc, char** argv) {
 			drawRange(dropStart, vcount - dropStart);
 		}
 
-		// bottom screen: street map (or the title card)
+		// top screen HUD (health, kills, countdown ...) drawn with citro2d over the 3D view
+		C2D_Prepare();
+		C2D_TextBufClear(gDyn);
+		C2D_SceneBegin(top);
+		C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+		if (!title) drawTopHud(frame, cyaw);
+		C2D_Flush();
+
+		// bottom screen: street map (or the menus)
 		C2D_Prepare();
 		C2D_TextBufClear(gDyn);
 		C2D_TargetClear(bottom, C2D_Color32(0x12, 0x15, 0x1d, 0xFF));
 		C2D_SceneBegin(bottom);
-		if (title) drawTitleBottom(frame);
+		if (title) { if (feState == 0) drawTitleBottom(frame); else drawFrontEnd(feState, feSel, frame); }
 		else {
-			drawMap(px, pz, frame, phoneTimer, face);
-			drawWheel(wheelAmt, wheelSel, curWeapon, frame);
+			if (gMode == M_TP) drawTpBottom(frame);
+			else {
+				drawMap(px, pz, frame, phoneTimer, face);
+				drawMapMode(px, pz);
+				drawWheel(wheelAmt, wheelSel, curWeapon, frame);
+			}
 			drawPause(pauseDim, menuState, sel, menuState == 3 ? camStyle : weather, frame);
+			if (gState == GS_OVER) drawOverPanel(frame, overSel);
 		}
 		if (fadeA > 0.01f) C2D_DrawRectSolid(0.0f, 0.0f, 0.9f, 320.0f, 240.0f, C2D_Color32(0, 0, 0, (u8)(fadeA * 255.0f)));
 		C2D_Flush();
