@@ -20,6 +20,13 @@ A pedestrian goes down after 4 hits (a shotgun blast counts as one hit); rocket 
 crates on the sidewalks refill ammo. Camera styles (CAMERA menu): Default, Watch Dogs (close over-the-shoulder), First Person.
 Touch HACK LIGHTS / BLACKOUT on the bottom screen to use the phone.
 
+## Menus and game modes
+Title screen: press A / tap, then **Single Player** (Free Roam) or **Multiplayer** (Deathmatch, Battle Royale, Target Practice). The menus use the same neon style as the pause menu; B goes back. Every mode shows a black loading screen with a description, then a 3-2-1-GO countdown. Pause (SELECT) > **MAIN MENU** leaves a mode.
+
+- **Deathmatch** - random spawn, NPCs hunt you. Every enemy hit costs 10 health (10 hits = dead). Stay out of sight for ~2 s and you heal back up to 50% only. Endless: you cannot win. Levels at 10 / 25 / 30 / 45 / 50 kills (Level 5 max; before 10 kills is a warm-up "Level 0"). Each level adds more enemies, more health, faster fire, longer bursts and better aim. Kills refill some ammo.
+- **Battle Royale** - random spawn, no weapons. Guns, ammo drops and medkits lie around the map (blue = gun, yellow = ammo, green = medkit on the map). Medkits go on the weapon wheel (hold X, 6th tile). 11 NPCs loot, heal and shoot each other. A storm shrinks in 5 stages; last one alive wins.
+- **Target Practice** - first person only, you cannot move. 5 rounds x 3 shots against 3 NPC rivals, ring score 1-10 per shot (bullseye 10). Circle Pad / C-stick / D-pad look, R fires, L steadies the aim. Highest total wins; equal top scores are a draw.
+
 ## City layout
 The city is 8 x 8 blocks with 40 m between road centre lines (wide streets, wide sidewalks). Each block is a glass tower on a plaza, low-rise brick
 houses with gaps between them, a mid-rise with a car park, a park (grass, paths, pond, trees) or a fountain plaza. Downtown (the Loop) is tallest, Grant
