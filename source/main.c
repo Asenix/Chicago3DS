@@ -19,7 +19,7 @@
 	GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | \
 	GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO))
 
-#define GRID      8          // 8 x 8 city blocks
+#define GRID      14         // 14 x 14 city blocks (560 m x 560 m)
 #define ROAD_SP   40.0f      // distance between road centre lines
 #define ROAD_HW   5.5f       // half width of the asphalt
 #define SW_W      2.5f       // sidewalk width
@@ -28,21 +28,22 @@
 #define LANE      2.8f       // car lane offset from the road centre line
 #define BLK_H     (ROAD_SP * 0.5f - ROAD_HW)  // half size of a block (sidewalk included)
 #define LOT_H     (BLK_H - SW_W)              // half size of the buildable lot
-#define CITY_H    (GRID * ROAD_SP * 0.5f)     // half size of the whole city (160)
+#define CITY_H    (GRID * ROAD_SP * 0.5f)     // half size of the whole city (280)
 #define ROAD_END  (CITY_H + 10.0f)            // traffic and pedestrians wrap here
 #define FLOOR_H   3.5f
-#define MAX_VERTS 40000
-#define MAX_BLD   420
-#define MAX_PATCH 520
+#define MAX_VERTS 230000
+#define MAX_BLD   3600
+#define MAX_PATCH 2400
+#define MAX_FEAT  11000
 #define RAIN_N    140
 #define N_DROPS   11
-#define N_CARS    22
-#define N_PEDS    20
+#define N_CARS    36
+#define N_PEDS    30
 static int gTraffic = 1;   // cars and pedestrians exist in Free Roam only
 #define NCARS (gTraffic ? N_CARS : 0)
 #define NPEDS (gTraffic ? N_PEDS : 0)
 #define N_STARS   70
-#define ROADS     7
+#define ROADS     13
 #define PLAYER_R  0.6f
 #define TEX_N     128
 
@@ -57,7 +58,7 @@ static Building bldg[MAX_BLD];
 static int      nBld = 0;
 static Patch    patch[MAX_PATCH];
 static int      nPatch = 0;
-enum { BT_TOWER, BT_LOW, BT_MID, BT_PARK, BT_PLAZA };
+enum { BT_TOWER, BT_LOW, BT_MID, BT_PARK, BT_PLAZA, BT_HOUSES, BT_MIXED, BT_COMM, BT_INDUS, BT_DOCK, BT_LOT, BT_COURT, BT_RAIL, BT_FWY };
 static int      blkType[GRID][GRID];
 
 // quality switches (pause menu > GRAPHICS)
@@ -212,10 +213,11 @@ static int initWindowTex(void) {
 }
 
 // ---- city -------------------------------------------------------------------------
-// Roads run along x = ROAD_C(k) and z = ROAD_C(k), k = 0..6 (40 m apart). Intersections are (a, b).
-// Between the roads lie 8 x 8 city blocks. Every block is one of: glass tower on a plaza, low-rise
-// brick houses with gaps between them, a mid-rise with a car park, a park (grass, paths, trees, pond)
-// or a fountain plaza - so the streets open up instead of forming one wall of buildings.
+// Roads run along x = ROAD_C(k) and z = ROAD_C(k), k = 0..12 (40 m apart). Intersections are (a, b).
+// Between the roads lie 14 x 14 city blocks. Every block is one district type: glass towers downtown,
+// brick houses and two-flats, shops with flats above, strip malls and diners, warehouse yards, docks on the
+// lake, vacant lots, courts and parks. One block row is an elevated railway (an embankment with a tunnel
+// for every cross street) and another is an elevated expressway with a car park underneath.
 #define ROAD_C(k) (-(float)(ROADS - 1) * 0.5f * ROAD_SP + ROAD_SP * (float)(k))
 
 // Textured facade: 4 walls, tile = 16 m wide x 14 m tall, shifted per building so no two look alike.
@@ -241,16 +243,17 @@ static void addWalls(float x0, float z0, float x1, float z1, float h, float r, f
 	wallFace(p100, p101, p111, p110, r * 0.88f, g * 0.88f, b * 0.88f, uo + 0.75f, uo + 0.75f + w, vo, vo + v);
 }
 
-#define CELLS 16 // 4x4 districts of 2x2 blocks; each gets its own vertex ranges so it can be skipped when out of view
-#define CELL_W (CITY_H * 0.5f)
+#define CN       (GRID / 2)  // districts of 2x2 blocks; each gets its own vertex ranges so it can be skipped when out of view
+#define CELLS    (CN * CN)
+#define CELL_W   (ROAD_SP * 2.0f)
 static int cellAStart[CELLS], cellACount[CELLS], cellWStart[CELLS], cellWCount[CELLS];
 static int globalEnd = 0; // ground + skyline, always drawn
 
 static int cellOf(float x, float z) {
 	int ix = (int)floorf((x + CITY_H) / CELL_W), iz = (int)floorf((z + CITY_H) / CELL_W);
-	ix = ix < 0 ? 0 : (ix > 3 ? 3 : ix);
-	iz = iz < 0 ? 0 : (iz > 3 ? 3 : iz);
-	return iz * 4 + ix;
+	ix = ix < 0 ? 0 : (ix > CN - 1 ? CN - 1 : ix);
+	iz = iz < 0 ? 0 : (iz > CN - 1 ? CN - 1 : iz);
+	return iz * CN + ix;
 }
 
 static unsigned lrnd(unsigned* s) { // tiny LCG for layout decisions
@@ -258,19 +261,143 @@ static unsigned lrnd(unsigned* s) { // tiny LCG for layout decisions
 	return *s >> 8;
 }
 
+// ---- world data: ground patches, solid buildings, small features, doors, lamps ----------------
+enum { RM_STORE, RM_DINER, RM_LAUNDRY, RM_APT, RM_WARE, RM_STATION, RM_N };
+static const float roomClr[RM_N][3] = {
+	{0.85f, 0.18f, 0.18f}, {0.95f, 0.35f, 0.65f}, {0.15f, 0.72f, 0.74f}, {0.55f, 0.34f, 0.20f}, {0.95f, 0.60f, 0.12f}, {0.20f, 0.45f, 0.90f}
+};
+static const char* const roomName[RM_N] = {"QUICK STOP", "LAKESIDE DINER", "WASH & FOLD", "APARTMENT", "WAREHOUSE", "L STATION"};
+
+// small features, built into the per-district vertex ranges
+enum { FT_BOX, FT_BOXU, FT_POST, FT_CAR, FT_BUSH, FT_PRISM, FT_WALLQ, FT_SLOPE, FT_SIDEZ, FT_FLAT };
+typedef struct { short type, aux; float x0, z0, x1, z1, y0, y1, r, g, b; } Feat;
+static Feat feat[MAX_FEAT];
+static int  nFeat = 0, gDropped = 0;
+
+typedef struct { float x, z, fx, fz; int room; } Door; // x,z = where the player stands to use it, (fx,fz) = outward direction
+#define MAX_DOOR 64
+static Door doors[MAX_DOOR];
+static int  nDoor = 0;
+
+typedef struct { float x, y, z, w; } Lamp; // emissive light fixtures (street lights, tunnel lights)
+#define MAX_LAMP 700
+static Lamp lamps[MAX_LAMP];
+static int  nLamp = 0;
+
 static void addP(float x0, float z0, float x1, float z1, float y, float r, float g, float b) {
-	if (nPatch >= MAX_PATCH) return;
+	if (nPatch >= MAX_PATCH) { gDropped++; return; }
 	Patch* p = &patch[nPatch++];
 	p->x0 = x0; p->z0 = z0; p->x1 = x1; p->z1 = z1; p->y = y; p->r = r; p->g = g; p->b = b;
 }
 
 static Building* addB(int kind, float x0, float z0, float x1, float z1, float h, float r, float g, float b, unsigned hs) {
-	if (nBld >= MAX_BLD) return NULL;
+	if (nBld >= MAX_BLD) { gDropped++; return NULL; }
 	Building* p = &bldg[nBld++];
 	p->x0 = x0; p->z0 = z0; p->x1 = x1; p->z1 = z1; p->h = h; p->kind = kind; p->deco = 0;
 	p->r = r; p->g = g; p->b = b;
 	p->uo = (float)((hs >> 20) & 3) * 0.25f; p->vo = (float)((hs >> 24) & 3) * 0.25f;
 	return p;
+}
+static void addSolid(float x0, float z0, float x1, float z1, float h) { addB(3, x0, z0, x1, z1, h, 0.5f, 0.5f, 0.5f, 0); } // collision only
+
+static void addF(int type, int aux, float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b) {
+	if (nFeat >= MAX_FEAT) { gDropped++; return; }
+	Feat* f = &feat[nFeat++];
+	f->type = (short)type; f->aux = (short)aux;
+	f->x0 = x0; f->z0 = z0; f->x1 = x1; f->z1 = z1; f->y0 = y0; f->y1 = y1; f->r = r; f->g = g; f->b = b;
+}
+static void fBox(float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b) { addF(FT_BOX, 0, x0, z0, x1, z1, y0, y1, r, g, b); }
+static void fBoxU(float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b) { addF(FT_BOXU, 0, x0, z0, x1, z1, y0, y1, r, g, b); }
+static void fPost(float x, float z, float hw, float y0, float y1, float r, float g, float b) { addF(FT_POST, 0, x - hw, z - hw, x + hw, z + hw, y0, y1, r, g, b); }
+static void fBush(float x, float z, float rad, float h, float r, float g, float b) { addF(FT_BUSH, 0, x - rad, z - rad, x + rad, z + rad, 0.0f, h, r, g, b); }
+static void fFlat(float x0, float z0, float x1, float z1, float y, float r, float g, float b) { addF(FT_FLAT, 0, x0, z0, x1, z1, y, y, r, g, b); }
+static void fSlope(float x0, float x1, float z0, float z1, float ya, float yb, float r, float g, float b) { addF(FT_SLOPE, 0, x0, z0, x1, z1, ya, yb, r, g, b); }
+static void fSideZ(float z, float x0, float x1, float ya, float yb, float r, float g, float b) { addF(FT_SIDEZ, 0, x0, z, x1, z, ya, yb, r, g, b); }
+static void fWall(float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b) { addF(FT_WALLQ, 0, x0, z0, x1, z1, y0, y1, r, g, b); }
+static void fPrism(float x0, float z0, float x1, float z1, float y0, float y1, int ridgeAlongZ, float r, float g, float b) { addF(FT_PRISM, ridgeAlongZ, x0, z0, x1, z1, y0, y1, r, g, b); }
+static void addLamp(float x, float y, float z, float w) { if (nLamp < MAX_LAMP) { lamps[nLamp].x = x; lamps[nLamp].y = y; lamps[nLamp].z = z; lamps[nLamp].w = w; nLamp++; } else gDropped++; }
+
+static const float carPal[8][3] = {
+	{0.80f, 0.14f, 0.14f}, {0.16f, 0.33f, 0.80f}, {0.88f, 0.78f, 0.16f}, {0.82f, 0.82f, 0.86f},
+	{0.12f, 0.12f, 0.14f}, {0.20f, 0.60f, 0.30f}, {0.55f, 0.56f, 0.60f}, {0.50f, 0.24f, 0.16f}
+};
+// parked car: 4.2 x 1.9. axis 0 = nose along x, 1 = along z. solid = also blocks the player.
+static void fCar(float x, float z, int axis, unsigned h, int solid) {
+	const float* c = carPal[h & 7];
+	float hx = axis == 0 ? 2.1f : 0.95f, hz = axis == 0 ? 0.95f : 2.1f;
+	addF(FT_CAR, axis, x - hx, z - hz, x + hx, z + hz, 0.0f, 0.0f, c[0], c[1], c[2]);
+	if (solid) addSolid(x - hx, z - hz, x + hx, z + hz, 1.6f);
+}
+
+static const float flowerPal[5][3] = {{0.92f, 0.25f, 0.30f}, {0.95f, 0.82f, 0.25f}, {0.70f, 0.35f, 0.85f}, {0.95f, 0.95f, 0.92f}, {0.95f, 0.55f, 0.20f}};
+static void flowerBed(float x0, float z0, float x1, float z1, unsigned* st) {
+	addP(x0, z0, x1, z1, 0.09f, 0.28f, 0.20f, 0.13f);
+	int n = 4 + (int)(lrnd(st) % 3);
+	for (int k = 0; k < n; k++) {
+		float x = x0 + 0.3f + (x1 - x0 - 0.6f) * (float)(lrnd(st) % 100) / 100.0f, z = z0 + 0.3f + (z1 - z0 - 0.6f) * (float)(lrnd(st) % 100) / 100.0f;
+		const float* c = flowerPal[lrnd(st) % 5];
+		fPost(x, z, 0.16f, 0.0f, 0.5f, c[0], c[1], c[2]);
+	}
+	fBush((x0 + x1) * 0.5f, (z0 + z1) * 0.5f, 0.5f, 0.7f, 0.18f, 0.40f, 0.20f);
+}
+static void weeds(float x0, float z0, float x1, float z1, int n, unsigned* st) {
+	for (int k = 0; k < n; k++) {
+		float x = x0 + (x1 - x0) * (float)(lrnd(st) % 100) / 100.0f, z = z0 + (z1 - z0) * (float)(lrnd(st) % 100) / 100.0f;
+		float g = 0.34f + (float)(lrnd(st) % 20) / 100.0f;
+		fPost(x, z, 0.22f, 0.0f, 0.5f + (float)(lrnd(st) % 6) * 0.1f, 0.40f, g + 0.12f, 0.20f);
+	}
+}
+static void bench(float x, float z, int alongX) { // 1.8 m park bench
+	if (alongX) { fBox(x - 0.9f, z - 0.25f, x + 0.9f, z + 0.25f, 0.0f, 0.45f, 0.45f, 0.30f, 0.18f); fBox(x - 0.9f, z + 0.18f, x + 0.9f, z + 0.28f, 0.45f, 0.95f, 0.40f, 0.27f, 0.16f); }
+	else         { fBox(x - 0.25f, z - 0.9f, x + 0.25f, z + 0.9f, 0.0f, 0.45f, 0.45f, 0.30f, 0.18f); fBox(x + 0.18f, z - 0.9f, x + 0.28f, z + 0.9f, 0.45f, 0.95f, 0.40f, 0.27f, 0.16f); }
+}
+static void dumpster(float x, float z, int alongX, unsigned h) {
+	float hx = alongX ? 1.0f : 0.65f, hz = alongX ? 0.65f : 1.0f;
+	const float* c = (h & 1) ? roomClr[RM_LAUNDRY] : roomClr[RM_STATION];
+	fBox(x - hx, z - hz, x + hx, z + hz, 0.0f, 1.25f, c[0] * 0.55f, c[1] * 0.55f, c[2] * 0.55f);
+	addSolid(x - hx, z - hz, x + hx, z + hz, 1.25f);
+}
+static void trashCan(float x, float z) { fPost(x, z, 0.28f, 0.0f, 0.9f, 0.16f, 0.30f, 0.20f); }
+static void streetLamp(float x, float z, float dx, float dz) { // pole with an arm reaching (dx,dz) unit direction
+	fPost(x, z, 0.09f, 0.0f, 5.6f, 0.22f, 0.23f, 0.26f);
+	float ex = x + dx * 1.5f, ez = z + dz * 1.5f;
+	fBox(fminf(x, ex) - 0.07f, fminf(z, ez) - 0.07f, fmaxf(x, ex) + 0.07f, fmaxf(z, ez) + 0.07f, 5.5f, 5.65f, 0.22f, 0.23f, 0.26f);
+	addLamp(ex, 5.45f, ez, 0.55f);
+}
+
+// A vertical quad just in front of a building wall. side: 0 = -x face, 1 = +x face, 2 = -z face, 3 = +z face.
+// a0..a1 is the span along the wall.
+static void facade(float x0, float z0, float x1, float z1, int side, float a0, float a1, float y0, float y1, float r, float g, float b) {
+	const float o = 0.05f;
+	switch (side) {
+	case 0:  fWall(x0 - o, a0, x0 - o, a1, y0, y1, r, g, b); break;
+	case 1:  fWall(x1 + o, a0, x1 + o, a1, y0, y1, r, g, b); break;
+	case 2:  fWall(a0, z0 - o, a1, z0 - o, y0, y1, r, g, b); break;
+	default: fWall(a0, z1 + o, a1, z1 + o, y0, y1, r, g, b); break;
+	}
+}
+static void awning(float x0, float z0, float x1, float z1, int side, float a0, float a1, float y, float depth, float r, float g, float b) {
+	switch (side) {
+	case 0:  fBox(x0 - depth, a0, x0, a1, y, y + 0.25f, r, g, b); break;
+	case 1:  fBox(x1, a0, x1 + depth, a1, y, y + 0.25f, r, g, b); break;
+	case 2:  fBox(a0, z0 - depth, a1, z0, y, y + 0.25f, r, g, b); break;
+	default: fBox(a0, z1, a1, z1 + depth, y, y + 0.25f, r, g, b); break;
+	}
+}
+// Enterable door in a facade. Adds the door, a sign band over it and a Door record (the spot outside it).
+static void addDoor(float x0, float z0, float x1, float z1, int side, float a, int room) {
+	const float* c = roomClr[room];
+	facade(x0, z0, x1, z1, side, a - 0.8f, a + 0.8f, 0.0f, 2.4f, c[0] * 0.35f, c[1] * 0.35f, c[2] * 0.35f);
+	facade(x0, z0, x1, z1, side, a - 2.2f, a + 2.2f, 2.7f, 3.5f, c[0], c[1], c[2]);
+	if (nDoor >= MAX_DOOR) { gDropped++; return; }
+	Door* d = &doors[nDoor++];
+	d->room = room;
+	switch (side) {
+	case 0:  d->fx = -1.0f; d->fz = 0.0f; d->x = x0 - 1.3f; d->z = a; break;
+	case 1:  d->fx = 1.0f;  d->fz = 0.0f; d->x = x1 + 1.3f; d->z = a; break;
+	case 2:  d->fx = 0.0f;  d->fz = -1.0f; d->x = a; d->z = z0 - 1.3f; break;
+	default: d->fx = 0.0f;  d->fz = 1.0f; d->x = a; d->z = z1 + 1.3f; break;
+	}
 }
 
 static void addTree(float x, float z, unsigned hs) {
@@ -285,32 +412,361 @@ static void addTree(float x, float z, unsigned hs) {
 	if (t && ((hs >> 16) & 1)) t->deco = 8; // round (diamond) crown instead of a cone
 }
 
+// ---- layout of the city: a rail row, a freeway row and districts ---------------------------------------------
+#define BLK_C(i)  (-CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)(i))
+#define RAIL_J    3
+#define FWY_J     10
+#define RAIL_Z    BLK_C(RAIL_J)           // centre of the rail block row (z)
+#define RAIL_H    5.2f                    // top of the embankment
+#define RAIL_HW   7.0f
+#define TRK_Z     (RAIL_Z - 3.5f)         // track centre line
+#define PLAT_Z0   (RAIL_Z - 1.0f)         // station platform: from here to the south edge of the embankment
+#define FWY_Z     BLK_C(FWY_J)            // centre of the freeway
+#define FWY_HW    10.0f
+#define FWY_Y     7.5f                    // top of the deck
+#define FWY_T     1.3f
+#define TUN_HW    8.0f                    // half width of tunnels / underpasses (road + sidewalks)
+#define RAMP_X    (-CITY_H)               // the west end of the freeway comes down to the ground here...
+#define RAMP_L    60.0f                   // ...over this length
+#define FWY_X0    (RAMP_X - RAMP_L)
+#define FWY_X1    (CITY_H + 160.0f)       // the east end runs out over the lake
+static const int kStationI[2] = {4, 10};
+
 static float dtFactor(float bx, float bz) { // 1 in the Loop, fading to 0 far away: taller buildings downtown
-	float dx = bx - 40.0f, dz = bz - 100.0f, v = 1.0f - sqrtf(dx * dx + dz * dz) / 170.0f;
+	float dx = bx - 30.0f, dz = bz + 10.0f, v = 1.0f - sqrtf(dx * dx + dz * dz) / 230.0f;
 	return v < 0.0f ? 0.0f : v;
 }
 
 static int pickBlock(int i, int j) {
-	float bx = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)i, bz = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)j;
+	float bx = BLK_C(i), bz = BLK_C(j);
 	int r = (int)(hash2(i * 31 + 7, j * 17 + 3) % 100);
-	if (i >= 6 && j >= 5) return r < 72 ? BT_PARK : BT_PLAZA;           // Grant Park by the lake
-	if (i >= 2 && i <= 3 && j >= 2 && j <= 3 && r < 62) return BT_PARK; // Lincoln Park
+	if (j == RAIL_J) return BT_RAIL;
+	if (j == FWY_J)  return BT_FWY;
+	if (i >= GRID - 2 && j < FWY_J) return r < 66 ? BT_PARK : (r < 82 ? BT_PLAZA : BT_COURT); // Grant Park by the lake
+	if (j > FWY_J) {                                                                           // south of the expressway
+		if (i >= GRID - 2) return BT_DOCK;
+		if (i >= 8) return r < 26 ? BT_COMM : (r < 44 ? BT_LOT : BT_INDUS);
+		return r < 14 ? BT_LOT : BT_INDUS;
+	}
+	if (i >= 2 && i <= 3 && j >= 1 && j <= 2) return r < 80 ? BT_PARK : BT_COURT;              // Lincoln Park
 	float dt = dtFactor(bx, bz);
-	if (dt > 0.45f) {                                                    // downtown
-		if (r < 62) return BT_TOWER;
-		if (r < 70) return BT_PLAZA;
-		if (r < 88) return BT_MID;
+	if (dt > 0.45f) {                                                                          // downtown
+		if (r < 60) return BT_TOWER;
+		if (r < 68) return BT_PLAZA;
+		if (r < 86) return BT_MID;
 		return BT_LOW;
 	}
-	if (r < 16) return BT_PARK;
-	if (r < 24) return BT_PLAZA;
-	if (r < 32) return BT_TOWER;
-	if (r < 54) return BT_MID;
-	return BT_LOW;
+	if (j < RAIL_J) {                                                                          // north of the railway
+		if (i <= 4 || i >= 10) return r < 8 ? BT_PARK : (r < 15 ? BT_COURT : (r < 21 ? BT_LOT : BT_HOUSES));
+		return r < 50 ? BT_MIXED : (r < 74 ? BT_COMM : (r < 90 ? BT_MID : BT_LOW));
+	}
+	if (i <= 3) return r < 8 ? BT_COURT : (r < 14 ? BT_PARK : (r < 20 ? BT_LOT : BT_HOUSES)); // west neighbourhoods
+	if (i <= 5) return r < 44 ? BT_HOUSES : (r < 78 ? BT_MIXED : (r < 86 ? BT_PARK : BT_LOT));
+	return r < 40 ? BT_MIXED : (r < 62 ? BT_COMM : (r < 80 ? BT_MID : (r < 90 ? BT_LOW : BT_PARK)));
+}
+
+static const float kBrick[6][3] = {{0.68f, 0.38f, 0.30f}, {0.72f, 0.56f, 0.40f}, {0.60f, 0.54f, 0.50f}, {0.64f, 0.30f, 0.26f}, {0.78f, 0.70f, 0.56f}, {0.52f, 0.40f, 0.34f}};
+static const float kPaint[6][3] = {{0.86f, 0.84f, 0.74f}, {0.60f, 0.72f, 0.80f}, {0.78f, 0.62f, 0.58f}, {0.62f, 0.72f, 0.58f}, {0.88f, 0.80f, 0.60f}, {0.70f, 0.68f, 0.74f}};
+
+// Brick houses, two-flats and bungalows facing the streets either side of a back alley.
+static void layoutHouses(float bx, float bz, unsigned st) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.27f, 0.42f, 0.23f);   // lawns
+	addP(bx - 2.0f, bz - L, bx + 2.0f, bz + L, 0.07f, 0.30f, 0.30f, 0.31f); // the alley
+	for (int side = 0; side < 2; side++) {
+		float sg = side ? 1.0f : -1.0f;
+		int face = side ? 1 : 0; // which wall faces the street
+		for (int k = 0; k < 3; k++) {
+			float cz = bz + ((float)k - 1.0f) * 8.0f;
+			int roll = (int)(lrnd(&st) % 100);
+			float w = 6.6f + (float)(lrnd(&st) % 3) * 0.4f, dep = 6.2f + (float)(lrnd(&st) % 3) * 0.4f;
+			float xf = bx + sg * (L - 2.4f), xb = bx + sg * (L - 2.4f - dep);
+			float xa = xf < xb ? xf : xb, xc = xf < xb ? xb : xf;
+			float yardX = bx + sg * (L - 1.2f);
+			if (roll < 12) { // an empty lot: a tree and shrubs
+				addTree(bx + sg * 7.0f, cz, lrnd(&st));
+				fBush(yardX, cz + 2.6f, 0.8f, 1.0f, 0.20f, 0.42f, 0.20f);
+				unsigned q = st; flowerBed(yardX - 0.6f, cz - 3.0f, yardX + 0.6f, cz - 1.0f, &q);
+				continue;
+			}
+			int type = roll < 45 ? 0 : (roll < 78 ? 1 : 2); // 0 two-flat, 1 greystone, 2 bungalow
+			float h = type == 0 ? 2.0f * FLOOR_H : (type == 1 ? 3.0f * FLOOR_H : 1.2f * FLOOR_H);
+			const float* c = (lrnd(&st) % 3) ? kBrick[lrnd(&st) % 6] : kPaint[lrnd(&st) % 6];
+			Building* b = addB(0, xa, cz - w * 0.5f, xc, cz + w * 0.5f, h, c[0], c[1], c[2], st);
+			if (!b) continue;
+			if (type == 2) { // pitched roof
+				const float* rc = kBrick[(lrnd(&st) % 2) ? 5 : 2];
+				fPrism(xa - 0.2f, cz - w * 0.5f - 0.2f, xc + 0.2f, cz + w * 0.5f + 0.2f, h, h + 1.7f, 0, rc[0] * 0.7f, rc[1] * 0.7f, rc[2] * 0.7f);
+			}
+			float fx0 = xa, fx1 = xc;
+			if (lrnd(&st) % 100 < 60) { // front porch with a canopy
+				float p0 = sg < 0 ? xa - 1.5f : xc, p1 = sg < 0 ? xa : xc + 1.5f;
+				fBox(p0, cz - 1.1f, p1, cz + 1.1f, 0.0f, 0.5f, 0.62f, 0.60f, 0.56f);
+				fBox(p0, cz - 1.1f, p1, cz + 1.1f, 2.4f, 2.6f, 0.82f, 0.80f, 0.74f);
+			}
+			facade(fx0, 0, fx1, 0, face, cz - 0.5f, cz + 0.5f, 0.5f, 2.3f, 0.30f, 0.20f, 0.14f); // front door
+			if (lrnd(&st) % 100 < 35) { // low front fence
+				float fxx = bx + sg * (L - 0.15f);
+				fBox(fxx - 0.05f, cz - w * 0.5f, fxx + 0.05f, cz + w * 0.5f, 0.0f, 0.85f, 0.86f, 0.86f, 0.84f);
+			}
+			if (lrnd(&st) % 100 < 60) fBush(yardX, cz + (lrnd(&st) % 2 ? 2.4f : -2.4f), 0.6f, 0.9f, 0.20f, 0.40f + (float)(lrnd(&st) % 10) * 0.01f, 0.20f);
+			if (type == 1 && (lrnd(&st) % 2)) addTree(yardX, cz + (lrnd(&st) % 2 ? 3.2f : -3.2f), lrnd(&st));
+		}
+	}
+	// alley: dumpsters, bins, a utility pole, maybe a parked car
+	dumpster(bx - 0.6f, bz + (float)((int)(lrnd(&st) % 17) - 8), 0, lrnd(&st));
+	dumpster(bx + 0.8f, bz + (float)((int)(lrnd(&st) % 17) - 8), 0, lrnd(&st));
+	trashCan(bx - 1.5f, bz + (float)((int)(lrnd(&st) % 21) - 10));
+	trashCan(bx + 1.5f, bz + (float)((int)(lrnd(&st) % 21) - 10));
+	{
+		float pz = bz + (float)((int)(lrnd(&st) % 13) - 6);
+		fPost(bx + 1.7f, pz, 0.12f, 0.0f, 7.0f, 0.30f, 0.22f, 0.16f);
+		fBox(bx + 0.9f, pz - 0.08f, bx + 2.5f, pz + 0.08f, 6.4f, 6.6f, 0.30f, 0.22f, 0.16f);
+	}
+	if (lrnd(&st) % 100 < 40) fCar(bx, bz + (float)((int)(lrnd(&st) % 17) - 8) * 0.9f, 1, lrnd(&st), 1);
+	weeds(bx - 2.0f, bz - L, bx + 2.0f, bz + L, 4, &st);
+}
+
+// Shops with apartments above: two rows of 3 units, a courtyard in between.
+static void layoutMixed(float bx, float bz, unsigned st, float dt) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.38f, 0.38f, 0.40f);
+	int ent = (int)(lrnd(&st) % 100);
+	int entRow = (int)(lrnd(&st) & 1), entU = (int)(lrnd(&st) % 3);
+	for (int row = 0; row < 2; row++) {
+		float sg = row ? 1.0f : -1.0f;
+		int side = row ? 3 : 2;
+		float za = bz + sg * L, zb = bz + sg * (L - 8.5f);
+		float z0 = za < zb ? za : zb, z1 = za < zb ? zb : za;
+		for (int u = 0; u < 3; u++) {
+			float x0 = bx - L + (float)u * 8.0f, x1 = x0 + 7.8f;
+			int nf = 3 + (int)(lrnd(&st) % 3) + (int)(dt * 3.0f);
+			const float* c = (lrnd(&st) % 3) ? kBrick[lrnd(&st) % 6] : kPaint[lrnd(&st) % 6];
+			Building* b = addB(0, x0, z0, x1, z1, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
+			if (!b) continue;
+			if (lrnd(&st) % 3 == 0) b->deco = 1;
+			int special = (row == entRow && u == entU);
+			float xm = (x0 + x1) * 0.5f;
+			const float* ac = flowerPal[lrnd(&st) % 5];
+			facade(x0, z0, x1, z1, side, x0 + 0.6f, x1 - 0.6f, 0.35f, 2.6f, 0.15f, 0.22f, 0.28f);          // shop window
+			awning(x0, z0, x1, z1, side, x0 + 0.3f, x1 - 0.3f, 2.7f, 1.1f, ac[0] * 0.8f, ac[1] * 0.8f, ac[2] * 0.8f);
+			if (special && ent < 22)      addDoor(x0, z0, x1, z1, side, xm, RM_STORE);
+			else if (special && ent < 36) addDoor(x0, z0, x1, z1, side, xm, RM_LAUNDRY);
+			else if (special && ent < 52) addDoor(x0, z0, x1, z1, side, xm, RM_APT);
+			else facade(x0, z0, x1, z1, side, xm - 0.5f, xm + 0.5f, 0.0f, 2.2f, 0.25f, 0.20f, 0.18f);
+		}
+	}
+	// courtyard
+	for (int k = 0; k < 3; k++) {
+		float t = bx - 7.0f + (float)k * 7.0f;
+		if (lrnd(&st) % 100 < 50) addTree(t, bz + (float)((int)(lrnd(&st) % 3) - 1) * 0.6f, lrnd(&st));
+		else dumpster(t, bz, 1, lrnd(&st));
+	}
+	if (lrnd(&st) % 100 < 50) fCar(bx + (lrnd(&st) % 2 ? 4.0f : -4.0f), bz + 1.0f, 0, lrnd(&st), 1);
+	trashCan(bx + L - 1.0f, bz - 2.0f);
+}
+
+// Strip mall, diner or big-box store with a car park.
+static void layoutComm(float bx, float bz, unsigned st) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.30f, 0.30f, 0.32f);
+	int variant = (int)(lrnd(&st) % 3);
+	float bz0 = bz - L + 0.5f;
+	// the car park: bays across the south half
+	float pz0 = bz - 2.0f, pz1 = bz + L - 0.8f;
+	addP(bx - L + 0.5f, pz0, bx + L - 0.5f, pz1, 0.08f, 0.16f, 0.16f, 0.18f);
+	for (int k = 0; k <= 8; k++) addP(bx - 10.1f + (float)k * 2.5f, pz0 + 0.3f, bx - 9.9f + (float)k * 2.5f, pz0 + 4.6f, 0.10f, 0.85f, 0.85f, 0.82f);
+	for (int k = 0; k < 8; k++) if (lrnd(&st) % 100 < 45) fCar(bx - 8.75f + (float)k * 2.5f, pz0 + 2.5f, 1, lrnd(&st), 1);
+	streetLamp(bx - L + 1.0f, pz1 - 0.5f, 1.0f, 0.0f);
+	streetLamp(bx + L - 1.0f, pz1 - 0.5f, -1.0f, 0.0f);
+	if (variant == 0) { // strip mall: three shops
+		for (int u = 0; u < 3; u++) {
+			float x0 = bx - 10.5f + (float)u * 7.0f, x1 = x0 + 6.9f, z0 = bz0, z1 = bz0 + 7.0f;
+			const float* c = kPaint[lrnd(&st) % 6];
+			addSolid(x0, z0, x1, z1, 4.4f);
+			fBox(x0, z0, x1, z1, 0.0f, 4.4f, c[0], c[1], c[2]);
+			facade(x0, z0, x1, z1, 3, x0 + 0.6f, x1 - 0.6f, 0.4f, 2.7f, 0.14f, 0.22f, 0.30f);
+			const float* ac = flowerPal[lrnd(&st) % 5];
+			facade(x0, z0, x1, z1, 3, x0 + 0.3f, x1 - 0.3f, 3.2f, 4.1f, ac[0], ac[1], ac[2]);
+			awning(x0, z0, x1, z1, 3, x0 + 0.3f, x1 - 0.3f, 2.9f, 1.2f, ac[0] * 0.7f, ac[1] * 0.7f, ac[2] * 0.7f);
+			if (u == 1 && (lrnd(&st) % 100) < 70) addDoor(x0, z0, x1, z1, 3, (x0 + x1) * 0.5f, RM_STORE);
+		}
+	} else if (variant == 1) { // diner
+		float x0 = bx - 6.5f, x1 = bx + 6.5f, z0 = bz0 + 1.0f, z1 = bz0 + 7.5f;
+		addSolid(x0, z0, x1, z1, 3.8f);
+		fBox(x0, z0, x1, z1, 0.0f, 3.8f, 0.80f, 0.82f, 0.86f);
+		facade(x0, z0, x1, z1, 3, x0 + 0.5f, x1 - 0.5f, 0.9f, 2.7f, 0.18f, 0.28f, 0.36f);
+		facade(x0, z0, x1, z1, 3, x0, x1, 3.0f, 3.5f, 0.85f, 0.15f, 0.25f);
+		facade(x0, z0, x1, z1, 1, z0 + 0.5f, z1 - 0.5f, 0.9f, 2.7f, 0.18f, 0.28f, 0.36f);
+		facade(x0, z0, x1, z1, 0, z0 + 0.5f, z1 - 0.5f, 0.9f, 2.7f, 0.18f, 0.28f, 0.36f);
+		fBox(bx - 0.8f, z1 + 4.6f, bx + 0.8f, z1 + 4.9f, 6.0f, 7.4f, 0.95f, 0.35f, 0.65f); // sign on a pole... (flat plate)
+		fPost(bx, z1 + 4.75f, 0.1f, 0.0f, 6.0f, 0.3f, 0.3f, 0.32f);
+		addDoor(x0, z0, x1, z1, 3, bx, RM_DINER);
+	} else { // big-box store
+		float x0 = bx - L + 1.0f, x1 = bx + L - 1.0f, z0 = bz0, z1 = bz0 + 11.0f;
+		addSolid(x0, z0, x1, z1, 6.5f);
+		fBox(x0, z0, x1, z1, 0.0f, 6.5f, 0.52f, 0.56f, 0.62f);
+		facade(x0, z0, x1, z1, 3, bx - 4.0f, bx + 4.0f, 0.2f, 3.0f, 0.14f, 0.22f, 0.30f);
+		facade(x0, z0, x1, z1, 3, x0 + 1.0f, x1 - 1.0f, 4.2f, 5.8f, 0.18f, 0.35f, 0.80f);
+		awning(x0, z0, x1, z1, 3, bx - 4.0f, bx + 4.0f, 3.3f, 2.0f, 0.18f, 0.35f, 0.80f);
+	}
+	for (int k = 0; k < 3; k++) fBush(bx - 8.0f + (float)k * 8.0f, pz1 + 0.2f, 0.7f, 0.9f, 0.20f, 0.40f, 0.20f);
+}
+
+// Warehouse yard: big sheds, shipping containers, tanks, a chimney, a chain-link fence.
+static void layoutIndus(float bx, float bz, unsigned st) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.36f, 0.35f, 0.33f);
+	static const float shed[4][3] = {{0.42f, 0.50f, 0.60f}, {0.62f, 0.56f, 0.45f}, {0.38f, 0.52f, 0.45f}, {0.55f, 0.58f, 0.62f}};
+	const float* c = shed[lrnd(&st) % 4];
+	float sg = (lrnd(&st) & 1) ? 1.0f : -1.0f;
+	float zf = bz + sg * (L - 0.5f), zbk = bz + sg * (L - 13.5f);
+	float z0 = zf < zbk ? zf : zbk, z1 = zf < zbk ? zbk : zf;
+	float x0 = bx - L + 1.0f, x1 = bx + L - 1.0f;
+	float h = 7.0f + (float)(lrnd(&st) % 3);
+	addSolid(x0, z0, x1, z1, h);
+	fBox(x0, z0, x1, z1, 0.0f, h, c[0], c[1], c[2]);
+	int side = sg > 0 ? 3 : 2; // face towards the street... the yard is on the other side, so doors face the yard
+	int ys = sg > 0 ? 2 : 3;
+	(void)side;
+	facade(x0, z0, x1, z1, ys, x0 + 1.0f, x1 - 1.0f, h - 1.4f, h - 0.7f, c[0] * 0.6f, c[1] * 0.6f, c[2] * 0.6f); // stripe
+	for (int k = 0; k < 3; k++) facade(x0, z0, x1, z1, ys, x0 + 2.0f + (float)k * 6.5f, x0 + 5.5f + (float)k * 6.5f, 0.0f, 4.0f, 0.62f, 0.64f, 0.66f); // roller doors
+	if (lrnd(&st) % 100 < 55) addDoor(x0, z0, x1, z1, ys, x1 - 1.4f, RM_WARE);
+	// the yard: containers and a trailer
+	float yz0 = sg > 0 ? bz - L + 1.0f : zbk + 0.5f, yz1 = sg > 0 ? zbk - 0.5f : bz + L - 1.0f;
+	(void)yz0; (void)yz1;
+	float yardZ = bz - sg * (L - 4.0f);
+	static const float conC[5][3] = {{0.70f, 0.20f, 0.16f}, {0.16f, 0.36f, 0.66f}, {0.85f, 0.62f, 0.14f}, {0.22f, 0.52f, 0.36f}, {0.60f, 0.60f, 0.62f}};
+	for (int k = 0; k < 4; k++) {
+		float cx = bx - 9.0f + (float)k * 6.0f + (float)((int)(lrnd(&st) % 3) - 1) * 0.3f;
+		if (lrnd(&st) % 100 < 25) continue;
+		const float* cc = conC[lrnd(&st) % 5];
+		fBox(cx - 1.2f, yardZ - 3.0f, cx + 1.2f, yardZ + 3.0f, 0.0f, 2.6f, cc[0], cc[1], cc[2]);
+		addSolid(cx - 1.2f, yardZ - 3.0f, cx + 1.2f, yardZ + 3.0f, 2.6f);
+		if (lrnd(&st) % 100 < 40) { const float* c2 = conC[lrnd(&st) % 5]; fBox(cx - 1.2f, yardZ - 3.0f, cx + 1.2f, yardZ + 3.0f, 2.6f, 5.2f, c2[0], c2[1], c2[2]); }
+	}
+	if (lrnd(&st) % 100 < 40) { // storage tank
+		float tx = bx + (lrnd(&st) % 2 ? 7.0f : -7.0f), tz = bz - sg * 1.0f;
+		fBox(tx - 1.8f, tz - 1.8f, tx + 1.8f, tz + 1.8f, 0.0f, 6.0f, 0.82f, 0.82f, 0.80f);
+		addSolid(tx - 1.8f, tz - 1.8f, tx + 1.8f, tz + 1.8f, 6.0f);
+	}
+	if (lrnd(&st) % 100 < 35) { // chimney
+		float tx = bx + (lrnd(&st) % 2 ? 9.0f : -9.0f), tz = (z0 + z1) * 0.5f;
+		fBox(tx - 0.8f, tz - 0.8f, tx + 0.8f, tz + 0.8f, h, h + 12.0f, 0.60f, 0.38f, 0.32f);
+	}
+	weeds(bx - L, bz - L, bx + L, bz + L, 5, &st);
+	// fence along the street side of the yard
+	float fz = bz - sg * (L - 0.2f);
+	fBox(bx - L, fz - 0.05f, bx + L, fz + 0.05f, 1.6f, 1.7f, 0.40f, 0.42f, 0.44f);
+	for (int k = 0; k <= 4; k++) fPost(bx - L + (float)k * 6.0f, fz, 0.07f, 0.0f, 1.7f, 0.40f, 0.42f, 0.44f);
+}
+
+// Docks beside the lake: apron, container stacks, a crane and a wooden pier.
+static void layoutDock(float bx, float bz, unsigned st, int lakeSide) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.40f, 0.39f, 0.37f);
+	static const float conC[5][3] = {{0.70f, 0.20f, 0.16f}, {0.16f, 0.36f, 0.66f}, {0.85f, 0.62f, 0.14f}, {0.22f, 0.52f, 0.36f}, {0.60f, 0.60f, 0.62f}};
+	for (int k = 0; k < 4; k++) for (int m = 0; m < 2; m++) {
+		if (lrnd(&st) % 100 < 22) continue;
+		float cx = bx - 9.0f + (float)k * 6.0f, cz = bz - 6.0f + (float)m * 9.0f;
+		const float* cc = conC[lrnd(&st) % 5];
+		fBox(cx - 1.2f, cz - 3.0f, cx + 1.2f, cz + 3.0f, 0.0f, 2.6f, cc[0], cc[1], cc[2]);
+		addSolid(cx - 1.2f, cz - 3.0f, cx + 1.2f, cz + 3.0f, 2.6f);
+		if (lrnd(&st) % 100 < 50) { const float* c2 = conC[lrnd(&st) % 5]; fBox(cx - 1.2f, cz - 3.0f, cx + 1.2f, cz + 3.0f, 2.6f, 5.2f, c2[0], c2[1], c2[2]); }
+	}
+	if (lakeSide) { // pier, crane
+		float px0 = bx + L, px1 = bx + L + 80.0f;
+		fBox(px0, bz - 3.5f, px1, bz + 3.5f, 0.0f, 0.8f, 0.45f, 0.32f, 0.20f);
+		for (int k = 0; k < 8; k++) { fPost(px0 + 8.0f + (float)k * 10.0f, bz - 3.2f, 0.25f, -0.5f, 1.4f, 0.30f, 0.22f, 0.15f); fPost(px0 + 8.0f + (float)k * 10.0f, bz + 3.2f, 0.25f, -0.5f, 1.4f, 0.30f, 0.22f, 0.15f); }
+		float cx = bx + L - 1.5f;
+		fBox(cx - 0.6f, bz - 6.0f, cx + 0.6f, bz - 4.8f, 0.0f, 17.0f, 0.90f, 0.70f, 0.10f);
+		fBox(cx - 0.6f, bz + 4.8f, cx + 0.6f, bz + 6.0f, 0.0f, 17.0f, 0.90f, 0.70f, 0.10f);
+		fBox(cx - 22.0f, bz - 6.0f, cx + 40.0f, bz + 6.0f, 17.0f, 18.2f, 0.90f, 0.70f, 0.10f);
+		addSolid(cx - 0.6f, bz - 6.0f, cx + 0.6f, bz - 4.8f, 17.0f);
+		addSolid(cx - 0.6f, bz + 4.8f, cx + 0.6f, bz + 6.0f, 17.0f);
+	}
+	weeds(bx - L, bz - L, bx + L, bz + L, 4, &st);
+}
+
+// Vacant lot: weeds, rubble, an old car, a billboard and a chain-link fence with a gap.
+static void layoutLot(float bx, float bz, unsigned st) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.36f, 0.38f, 0.26f);
+	addP(bx - 6.0f, bz - 5.0f, bx + 4.0f, bz + 6.0f, 0.07f, 0.40f, 0.34f, 0.26f);
+	weeds(bx - L, bz - L, bx + L, bz + L, 16, &st);
+	for (int k = 0; k < 4; k++) {
+		float x = bx - 9.0f + (float)(lrnd(&st) % 18), z = bz - 9.0f + (float)(lrnd(&st) % 18);
+		fBox(x - 0.6f, z - 0.5f, x + 0.6f, z + 0.5f, 0.0f, 0.5f + (float)(lrnd(&st) % 5) * 0.1f, 0.50f, 0.46f, 0.42f);
+	}
+	if (lrnd(&st) % 100 < 50) fCar(bx + 5.0f, bz + 3.0f, (int)(lrnd(&st) & 1), 6, 1);
+	for (int k = 0; k < 2; k++) { // fences on two sides
+		float e = (k ? 1.0f : -1.0f) * (L - 0.3f);
+		fBox(bx - L, bz + e - 0.04f, bx + L, bz + e + 0.04f, 1.55f, 1.65f, 0.45f, 0.47f, 0.48f);
+		for (int p = 0; p <= 4; p++) fPost(bx - L + (float)p * 6.0f, bz + e, 0.06f, 0.0f, 1.65f, 0.45f, 0.47f, 0.48f);
+	}
+	// graffiti panel on a low wall + billboard
+	fBox(bx - 6.0f, bz - L + 0.6f, bx + 3.0f, bz - L + 0.9f, 0.0f, 2.6f, 0.62f, 0.60f, 0.56f);
+	const float* g1 = flowerPal[lrnd(&st) % 5]; const float* g2 = flowerPal[lrnd(&st) % 5];
+	fWall(bx - 5.0f, bz - L + 0.95f, bx - 1.0f, bz - L + 0.95f, 0.5f, 2.2f, g1[0], g1[1], g1[2]);
+	fWall(bx - 0.5f, bz - L + 0.95f, bx + 2.5f, bz - L + 0.95f, 0.8f, 2.0f, g2[0], g2[1], g2[2]);
+	fPost(bx - 3.0f, bz + 8.0f, 0.12f, 0.0f, 6.5f, 0.35f, 0.35f, 0.38f); fPost(bx + 3.0f, bz + 8.0f, 0.12f, 0.0f, 6.5f, 0.35f, 0.35f, 0.38f);
+	fBox(bx - 4.5f, bz + 7.85f, bx + 4.5f, bz + 8.15f, 4.5f, 7.5f, 0.85f, 0.85f, 0.82f);
+}
+
+// Basketball court and a playground.
+static void layoutCourt(float bx, float bz, unsigned st) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.24f, 0.44f, 0.24f);
+	float cx0 = bx - 6.5f, cx1 = bx + 6.5f, cz0 = bz - 12.0f, cz1 = bz - 0.5f + 1.0f;
+	cz0 = bz - 11.0f; cz1 = bz + 1.0f;
+	addP(cx0, cz0, cx1, cz1, 0.08f, 0.52f, 0.26f, 0.20f);
+	addP(cx0, cz0, cx1, cz0 + 0.12f, 0.10f, 0.92f, 0.92f, 0.90f); addP(cx0, cz1 - 0.12f, cx1, cz1, 0.10f, 0.92f, 0.92f, 0.90f);
+	addP(cx0, cz0, cx0 + 0.12f, cz1, 0.10f, 0.92f, 0.92f, 0.90f); addP(cx1 - 0.12f, cz0, cx1, cz1, 0.10f, 0.92f, 0.92f, 0.90f);
+	addP(cx0, (cz0 + cz1) * 0.5f - 0.06f, cx1, (cz0 + cz1) * 0.5f + 0.06f, 0.10f, 0.92f, 0.92f, 0.90f);
+	addP(bx - 2.4f, cz0, bx + 2.4f, cz0 + 3.6f, 0.09f, 0.42f, 0.20f, 0.16f); addP(bx - 2.4f, cz1 - 3.6f, bx + 2.4f, cz1, 0.09f, 0.42f, 0.20f, 0.16f);
+	for (int e = 0; e < 2; e++) { // hoops
+		float z = e ? cz1 - 0.3f : cz0 + 0.3f;
+		fPost(bx, z, 0.08f, 0.0f, 3.2f, 0.30f, 0.30f, 0.33f);
+		fBox(bx - 0.9f, z + (e ? -0.4f : 0.4f) - 0.04f, bx + 0.9f, z + (e ? -0.4f : 0.4f) + 0.04f, 2.7f, 3.5f, 0.92f, 0.92f, 0.92f);
+		fBox(bx - 0.25f, z + (e ? -0.8f : 0.8f) - 0.25f, bx + 0.25f, z + (e ? -0.8f : 0.8f) + 0.25f, 2.95f, 3.0f, 0.95f, 0.45f, 0.10f);
+	}
+	// playground: swing frame, slide, sandbox
+	float pz = bz + 7.5f;
+	fPost(bx - 6.0f, pz - 1.4f, 0.1f, 0.0f, 2.6f, 0.80f, 0.30f, 0.20f); fPost(bx - 6.0f, pz + 1.4f, 0.1f, 0.0f, 2.6f, 0.80f, 0.30f, 0.20f);
+	fBox(bx - 6.1f, pz - 1.5f, bx - 5.9f, pz + 1.5f, 2.55f, 2.7f, 0.80f, 0.30f, 0.20f);
+	fBox(bx - 6.1f, pz - 0.9f, bx - 5.9f, pz - 0.3f, 0.7f, 0.8f, 0.15f, 0.15f, 0.15f); fBox(bx - 6.1f, pz + 0.3f, bx - 5.9f, pz + 0.9f, 0.7f, 0.8f, 0.15f, 0.15f, 0.15f);
+	fBox(bx + 1.0f, pz - 1.0f, bx + 3.0f, pz + 1.0f, 0.0f, 1.8f, 0.20f, 0.45f, 0.85f);
+	addF(FT_SLOPE, 0, bx + 3.0f, pz - 0.5f, bx + 6.0f, pz + 0.5f, 1.8f, 0.2f, 0.95f, 0.80f, 0.15f);
+	addP(bx - 3.0f, pz + 2.2f, bx + 0.5f, pz + 4.2f, 0.09f, 0.80f, 0.72f, 0.50f);
+	addSolid(bx + 1.0f, pz - 1.0f, bx + 3.0f, pz + 1.0f, 1.8f);
+	bench(bx - 9.0f, bz - 4.0f, 0); bench(bx + 9.0f, bz - 4.0f, 0);
+	addTree(bx + 9.5f, bz + 9.5f, lrnd(&st)); addTree(bx - 9.5f, bz + 9.5f, lrnd(&st));
+	// perimeter fence
+	fBox(bx - L, bz - L + 0.05f, bx + L, bz - L + 0.15f, 1.5f, 1.6f, 0.30f, 0.32f, 0.34f);
+}
+
+// Under the elevated expressway: a car park between the pillars (the deck itself is built in layoutFreeway).
+static void layoutFwyBlock(float bx, float bz, unsigned st) {
+	const float L = LOT_H;
+	addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.20f, 0.20f, 0.22f);
+	for (int side = 0; side < 2; side++) {
+		float sg = side ? 1.0f : -1.0f;
+		for (int k = 0; k <= 8; k++) {
+			float z = bz - 10.0f + (float)k * 2.5f;
+			float xa = bx + sg * 3.0f, xb = bx + sg * 7.6f;
+			fFlat(fminf(xa, xb), z - 0.06f, fmaxf(xa, xb), z + 0.06f, 0.10f, 0.88f, 0.88f, 0.84f);
+		}
+		for (int k = 0; k < 8; k++) if (lrnd(&st) % 100 < 40) fCar(bx + sg * 5.3f, bz - 8.75f + (float)k * 2.5f, 0, lrnd(&st), 1);
+		addLamp(bx + sg * 6.0f, FWY_Y - FWY_T - 0.25f, bz - 5.0f, 0.5f);
+		addLamp(bx + sg * 6.0f, FWY_Y - FWY_T - 0.25f, bz + 5.0f, 0.5f);
+	}
+	weeds(bx - L, bz - L, bx + L, bz - 10.5f, 4, &st);
+	weeds(bx - L, bz + 10.5f, bx + L, bz + L, 4, &st);
+	dumpster(bx + 9.5f, bz + 10.0f, 1, lrnd(&st));
 }
 
 static void layoutBlock(int i, int j) {
-	const float bx = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)i, bz = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * (float)j;
+	const float bx = BLK_C(i), bz = BLK_C(j);
 	unsigned st = hash2(i * 131 + 5, j * 71 + 9);
 	const float L = LOT_H;
 	float dt = dtFactor(bx, bz);
@@ -330,10 +786,11 @@ static void layoutBlock(int i, int j) {
 			if (lrnd(&st) % 100 < 50)
 				addTree(bx + ((k & 1) ? 10.6f : -10.6f) + (float)((int)(lrnd(&st) % 3) - 1) * 0.4f,
 				        bz + ((k & 2) ? 10.6f : -10.6f) + (float)((int)(lrnd(&st) % 3) - 1) * 0.4f, lrnd(&st));
+		bench(bx - 8.0f, bz + 10.5f, 1); trashCan(bx + 8.0f, bz + 10.5f);
+		if (lrnd(&st) % 100 < 50) flowerBed(bx - 11.0f, bz - 3.0f, bx - 9.0f, bz + 3.0f, &st);
 		break;
 	}
 	case BT_LOW: {
-		static const float brick[5][3] = {{0.68f, 0.38f, 0.30f}, {0.72f, 0.56f, 0.40f}, {0.60f, 0.54f, 0.50f}, {0.64f, 0.30f, 0.26f}, {0.78f, 0.70f, 0.56f}};
 		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.40f, 0.40f, 0.41f);
 		for (int s = 0; s < 4; s++) {
 			float sx = bx + ((s & 1) ? 6.3f : -6.3f), sz = bz + ((s & 2) ? 6.3f : -6.3f);
@@ -341,9 +798,10 @@ static void layoutBlock(int i, int j) {
 				float w = 8.0f + (float)(lrnd(&st) % 3), d = 8.0f + (float)(lrnd(&st) % 3);
 				float jx = ((int)(lrnd(&st) % 3) - 1) * 0.5f, jz = ((int)(lrnd(&st) % 3) - 1) * 0.5f;
 				int nf = 2 + (int)(lrnd(&st) % 4) + (int)(dt * 3.0f);
-				const float* c = brick[lrnd(&st) % 5];
+				const float* c = kBrick[lrnd(&st) % 5];
 				Building* b = addB(0, sx + jx - w * 0.5f, sz + jz - d * 0.5f, sx + jx + w * 0.5f, sz + jz + d * 0.5f, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
 				if (b && lrnd(&st) % 3 == 0) b->deco = 1;
+				if (b && nf >= 3 && lrnd(&st) % 100 < 14) addDoor(b->x0, b->z0, b->x1, b->z1, (s & 1) ? 1 : 0, sz + jz, RM_APT);
 			} else {
 				addTree(sx, sz, lrnd(&st));
 			}
@@ -364,7 +822,7 @@ static void layoutBlock(int i, int j) {
 		if (horiz) b = addB(0, bx - len * 0.5f, bz + lo, bx + len * 0.5f, bz + hi, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
 		else       b = addB(0, bx + lo, bz - len * 0.5f, bx + hi, bz + len * 0.5f, (float)nf * FLOOR_H, c[0], c[1], c[2], st);
 		if (b) b->deco = 1;
-		// the other half of the lot: a car park with a few trees
+		// the other half of the lot: a car park with a few trees and cars
 		float p0 = -sgn * 1.5f, p1 = -sgn * (L - 0.5f);
 		float plo = p0 < p1 ? p0 : p1, phi = p0 < p1 ? p1 : p0;
 		if (horiz) addP(bx - L + 1.0f, bz + plo, bx + L - 1.0f, bz + phi, 0.08f, 0.17f, 0.17f, 0.19f);
@@ -372,6 +830,11 @@ static void layoutBlock(int i, int j) {
 		for (int k = 0; k < 2; k++) {
 			float t = (-6.0f + 12.0f * (float)k), n = -sgn * (L - 1.5f);
 			addTree(horiz ? bx + t : bx + n, horiz ? bz + n : bz + t, lrnd(&st));
+		}
+		{
+			float n = -sgn * 5.5f;
+			if (lrnd(&st) % 100 < 60) fCar(horiz ? bx - 3.0f : bx + n, horiz ? bz + n : bz - 3.0f, horiz ? 0 : 1, lrnd(&st), 1);
+			if (lrnd(&st) % 100 < 50) fCar(horiz ? bx + 4.0f : bx + n, horiz ? bz + n : bz + 4.0f, horiz ? 0 : 1, lrnd(&st), 1);
 		}
 		break;
 	}
@@ -396,6 +859,31 @@ static void layoutBlock(int i, int j) {
 			addTree(x, z, lrnd(&st));
 			placed++;
 		}
+		bench(bx + 2.2f, bz - 6.0f, 0); bench(bx - 2.2f, bz + 6.0f, 0); bench(bx + 6.0f, bz + 2.2f, 1);
+		for (int k = 0; k < 3; k++) fBush(bx + (float)((int)(lrnd(&st) % 21) - 10), bz + (float)((int)(lrnd(&st) % 21) - 10), 0.8f, 1.1f, 0.18f, 0.38f, 0.18f);
+		unsigned q = st;
+		if (!pond) flowerBed(bx + 4.0f, bz - 10.5f, bx + 8.0f, bz - 8.5f, &q);
+		flowerBed(bx - 9.0f, bz + 8.5f, bx - 5.0f, bz + 10.5f, &q);
+		streetLamp(bx - 2.0f, bz - 2.0f, 1.0f, 0.0f);
+		weeds(bx - L, bz - L, bx + L, bz + L, 6, &st);
+		break;
+	}
+	case BT_HOUSES: layoutHouses(bx, bz, st); break;
+	case BT_MIXED:  layoutMixed(bx, bz, st, dt); break;
+	case BT_COMM:   layoutComm(bx, bz, st); break;
+	case BT_INDUS:  layoutIndus(bx, bz, st); break;
+	case BT_DOCK:   layoutDock(bx, bz, st, i == GRID - 1); break;
+	case BT_LOT:    layoutLot(bx, bz, st); break;
+	case BT_COURT:  layoutCourt(bx, bz, st); break;
+	case BT_FWY: layoutFwyBlock(bx, bz, st); break;
+	case BT_RAIL: { // gravel strips either side of the embankment; stations at kStationI
+		addP(bx - L, bz - L, bx + L, bz + L, 0.06f, 0.36f, 0.35f, 0.32f);
+		weeds(bx - L, RAIL_Z - L, bx + L, RAIL_Z - RAIL_HW, 8, &st);
+		weeds(bx - L, RAIL_Z + RAIL_HW, bx + L, RAIL_Z + L, 8, &st);
+		if (i != kStationI[0] && i != kStationI[1]) {
+			dumpster(bx + 4.0f, RAIL_Z + 9.0f, 1, lrnd(&st));
+			if (lrnd(&st) % 100 < 60) fCar(bx - 4.0f, RAIL_Z - 9.6f, 0, 6, 1);
+		}
 		break;
 	}
 	default: { // BT_PLAZA
@@ -407,6 +895,9 @@ static void layoutBlock(int i, int j) {
 			if (k == 0 || k == 3 || (lrnd(&st) & 1))
 				addTree(bx + ((k & 1) ? 10.4f : -10.4f), bz + ((k & 2) ? 10.4f : -10.4f), lrnd(&st));
 		if (lrnd(&st) & 1) addB(0, bx - 2.2f, bz + 8.5f, bx + 2.2f, bz + 11.0f, 3.2f, 0.80f, 0.74f, 0.62f, st); // kiosk
+		bench(bx - 6.0f, bz - 6.0f, 1); bench(bx + 6.0f, bz - 6.0f, 1); bench(bx, bz + 6.0f, 1);
+		fBush(bx - 6.0f, bz + 6.0f, 0.9f, 1.0f, 0.18f, 0.40f, 0.18f); fBush(bx + 6.0f, bz + 6.0f, 0.9f, 1.0f, 0.18f, 0.40f, 0.18f);
+		{ unsigned q = st; flowerBed(bx - 11.5f, bz - 3.0f, bx - 9.5f, bz + 3.0f, &q); }
 		break;
 	}
 	}
@@ -446,14 +937,681 @@ static void addTreeGeom(const Building* t) {
 	}
 }
 
+// ---- feature geometry ------------------------------------------------------------------------------
+static void emitFeat(const Feat* f) {
+	const float cx = (f->x0 + f->x1) * 0.5f, cz = (f->z0 + f->z1) * 0.5f;
+	const float R = f->r, G = f->g, B = f->b;
+	switch (f->type) {
+	case FT_BOX:
+		addBoxG(f->x0, f->z0, f->x1, f->z1, f->y0, f->y1, R, G, B, f->aux ? 0.5f : 0.82f, 1.0f);
+		break;
+	case FT_BOXU: { // box with a visible underside (ceilings, decks)
+		addBoxG(f->x0, f->z0, f->x1, f->z1, f->y0, f->y1, R, G, B, 0.82f, 1.0f);
+		float a[3] = {f->x0, f->y0, f->z0}, b[3] = {f->x1, f->y0, f->z0}, c[3] = {f->x1, f->y0, f->z1}, d[3] = {f->x0, f->y0, f->z1};
+		quad(a, b, c, d, R * 0.42f, G * 0.42f, B * 0.42f);
+		break;
+	}
+	case FT_POST:
+		addPost(cx, cz, (f->x1 - f->x0) * 0.5f, f->y0, f->y1, R, G, B);
+		break;
+	case FT_CAR: { // parked car: body plus a cabin that doubles as glass and roof
+		int ax = f->aux;
+		float hx = (f->x1 - f->x0) * 0.5f, hz = (f->z1 - f->z0) * 0.5f;
+		addBoxG(cx - hx, cz - hz, cx + hx, cz + hz, 0.15f, 1.05f, R, G, B, 0.7f, 1.0f);
+		float gx = ax == 0 ? hx * 0.55f : hx * 0.85f, gz = ax == 0 ? hz * 0.85f : hz * 0.55f;
+		addBoxG(cx - gx, cz - gz, cx + gx, cz + gz, 1.05f, 1.6f, 0.10f + 0.35f * R, 0.12f + 0.35f * G, 0.16f + 0.35f * B, 0.9f, 1.0f);
+		break;
+	}
+	case FT_BUSH: { // squat pyramid
+		float rad = (f->x1 - f->x0) * 0.5f;
+		float p[4][3] = {{cx - rad, f->y0, cz}, {cx, f->y0, cz - rad}, {cx + rad, f->y0, cz}, {cx, f->y0, cz + rad}};
+		float apex[3] = {cx, f->y1, cz};
+		const float sh[4] = {0.62f, 0.60f, 0.95f, 0.80f};
+		for (int k = 0; k < 4; k++) tri(p[k], p[(k + 1) & 3], apex, R * sh[k], G * sh[k], B * sh[k]);
+		break;
+	}
+	case FT_PRISM: { // gable roof; aux 0 = ridge along x, 1 = along z
+		float x0 = f->x0, x1 = f->x1, z0 = f->z0, z1 = f->z1, ya = f->y0, yb = f->y1;
+		if (f->aux == 0) {
+			float zm = cz;
+			float a[3] = {x0, ya, z0}, b[3] = {x1, ya, z0}, c[3] = {x1, yb, zm}, d[3] = {x0, yb, zm};
+			quad(a, b, c, d, R * 0.7f, G * 0.7f, B * 0.7f);
+			float e[3] = {x0, ya, z1}, g[3] = {x1, ya, z1};
+			quad(e, g, c, d, R, G, B);
+			float t0[3] = {x0, yb, zm}, t1[3] = {x1, yb, zm};
+			tri(a, e, t0, R * 0.55f, G * 0.55f, B * 0.55f);
+			tri(b, g, t1, R * 0.8f, G * 0.8f, B * 0.8f);
+		} else {
+			float xm = cx;
+			float a[3] = {x0, ya, z0}, b[3] = {x0, ya, z1}, c[3] = {xm, yb, z1}, d[3] = {xm, yb, z0};
+			quad(a, b, c, d, R * 0.7f, G * 0.7f, B * 0.7f);
+			float e[3] = {x1, ya, z0}, g[3] = {x1, ya, z1};
+			quad(e, g, c, d, R, G, B);
+			float t0[3] = {xm, yb, z0}, t1[3] = {xm, yb, z1};
+			tri(a, e, t0, R * 0.55f, G * 0.55f, B * 0.55f);
+			tri(b, g, t1, R * 0.8f, G * 0.8f, B * 0.8f);
+		}
+		break;
+	}
+	case FT_WALLQ: { // vertical quad along the line (x0,z0) - (x1,z1)
+		float a[3] = {f->x0, f->y0, f->z0}, b[3] = {f->x1, f->y0, f->z1}, c[3] = {f->x1, f->y1, f->z1}, d[3] = {f->x0, f->y1, f->z0};
+		quad(a, b, c, d, R, G, B);
+		break;
+	}
+	case FT_FLAT: {
+		float a[3] = {f->x0, f->y0, f->z0}, b[3] = {f->x1, f->y0, f->z0}, c[3] = {f->x1, f->y0, f->z1}, d[3] = {f->x0, f->y0, f->z1};
+		quad(a, d, c, b, R, G, B);
+		break;
+	}
+	case FT_SLOPE: { // surface from (x0, y0) to (x1, y1) across z0..z1
+		float a[3] = {f->x0, f->y0, f->z0}, b[3] = {f->x1, f->y1, f->z0}, c[3] = {f->x1, f->y1, f->z1}, d[3] = {f->x0, f->y0, f->z1};
+		quad(a, d, c, b, R, G, B);
+		break;
+	}
+	case FT_SIDEZ: { // vertical side at z = z0, x0..x1, from the ground up to y0 (at x0) / y1 (at x1)
+		float a[3] = {f->x0, 0.0f, f->z0}, b[3] = {f->x1, 0.0f, f->z0}, c[3] = {f->x1, f->y1, f->z0}, d[3] = {f->x0, f->y0, f->z0};
+		quad(a, b, c, d, R * 0.85f, G * 0.85f, B * 0.85f);
+		break;
+	}
+	}
+}
+
+// ---- street furniture at every junction -----------------------------------------------------------------------
+static void layoutIntersections(void) {
+	for (int a = 0; a < ROADS; a++) {
+		for (int b = 0; b < ROADS; b++) {
+			float xc = ROAD_C(a), zc = ROAD_C(b);
+			unsigned h = hash2(a * 53 + 1, b * 29 + 7);
+			float sx = xc - SW_OFF - 0.7f, sz = zc - SW_OFF - 0.7f; // street name sign, north-west corner
+			fPost(sx, sz, 0.06f, 0.0f, 2.9f, 0.25f, 0.25f, 0.28f);
+			fWall(sx - 0.65f, sz + 0.08f, sx + 0.65f, sz + 0.08f, 2.55f, 2.95f, 0.08f, 0.42f, 0.26f);
+			fWall(sx + 0.08f, sz - 0.65f, sx + 0.08f, sz + 0.65f, 2.15f, 2.5f, 0.08f, 0.42f, 0.26f);
+			fPost(xc + SW_OFF + 0.7f, zc - SW_OFF - 0.7f, 0.17f, 0.0f, 0.75f, 0.80f, 0.10f, 0.10f); // hydrant, north-east
+			streetLamp(xc - SW_OFF - 0.7f, zc + SW_OFF + 0.7f, 0.0f, -1.0f);                         // street light, south-west
+			if ((h >> 4) % 100 < 45) trashCan(xc + SW_OFF + 0.7f, zc - SW_OFF + 0.4f);
+		}
+	}
+}
+
+// ---- railway: an embankment with tunnels for the cross streets, an elevated track and two stations ----------
+static void layoutRail(void) {
+	const float xs = -CITY_H - 90.0f, xe = CITY_H + 90.0f;
+	float a = xs;
+	for (int k = 0; k <= ROADS; k++) {
+		float b = (k < ROADS) ? ROAD_C(k) - TUN_HW : xe;
+		if (b > a + 0.5f) { // solid embankment between two tunnels
+			addSolid(a, RAIL_Z - RAIL_HW, b, RAIL_Z + RAIL_HW, RAIL_H);
+			for (float x = a; x < b - 0.01f; x += 20.0f) {
+				float x1 = fminf(x + 20.0f, b);
+				fBox(x, RAIL_Z - RAIL_HW, x1, RAIL_Z + RAIL_HW, 0.0f, RAIL_H, 0.56f, 0.55f, 0.52f);
+				fSideZ(RAIL_Z - RAIL_HW - 0.02f, x, x1, 0.55f, 0.55f, 0.18f, 0.18f, 0.20f); // dark base band
+			}
+		}
+		a = (k < ROADS) ? ROAD_C(k) + TUN_HW : xe;
+	}
+	// ballast, rails and sleepers along the whole line
+	for (float x = xs; x < xe - 0.01f; x += 20.0f) {
+		fFlat(x, RAIL_Z - RAIL_HW + 0.3f, x + 20.0f, RAIL_Z + RAIL_HW - 0.3f, RAIL_H + 0.03f, 0.29f, 0.28f, 0.27f);
+		fFlat(x, TRK_Z - 0.78f, x + 20.0f, TRK_Z - 0.64f, RAIL_H + 0.09f, 0.62f, 0.62f, 0.66f);
+		fFlat(x, TRK_Z + 0.64f, x + 20.0f, TRK_Z + 0.78f, RAIL_H + 0.09f, 0.62f, 0.62f, 0.66f);
+		for (int k = 0; k < 8; k++) fFlat(x + 1.0f + (float)k * 2.5f, TRK_Z - 1.3f, x + 1.5f + (float)k * 2.5f, TRK_Z + 1.3f, RAIL_H + 0.06f, 0.30f, 0.22f, 0.15f);
+	}
+	// tunnels under the line: roof slab, pipes, wall stripes, lights
+	for (int k = 0; k < ROADS; k++) {
+		float rc = ROAD_C(k);
+		fBoxU(rc - TUN_HW, RAIL_Z - RAIL_HW, rc + TUN_HW, RAIL_Z + RAIL_HW, 4.4f, RAIL_H, 0.52f, 0.52f, 0.50f);
+		fBox(rc - 6.4f, RAIL_Z - RAIL_HW, rc - 6.0f, RAIL_Z + RAIL_HW, 3.9f, 4.3f, 0.36f, 0.40f, 0.46f);
+		fBox(rc + 6.0f, RAIL_Z - RAIL_HW, rc + 6.4f, RAIL_Z + RAIL_HW, 3.9f, 4.3f, 0.58f, 0.30f, 0.22f);
+		for (int s = -1; s <= 1; s += 2) {
+			float wx = rc + (float)s * (TUN_HW - 0.04f);
+			fWall(wx, RAIL_Z - RAIL_HW, wx, RAIL_Z + RAIL_HW, 0.0f, 0.55f, 0.16f, 0.16f, 0.18f);
+			fWall(wx, RAIL_Z - RAIL_HW, wx, RAIL_Z + RAIL_HW, 1.1f, 1.35f, 0.90f, 0.75f, 0.14f);
+			addLamp(rc + (float)s * 4.2f, 4.3f, RAIL_Z - 3.8f, 0.5f);
+			addLamp(rc + (float)s * 4.2f, 4.3f, RAIL_Z + 3.8f, 0.5f);
+			unsigned h = hash2(k * 7 + s, 4242);
+			if (h % 100 < 35) { const float* g = flowerPal[(h >> 8) % 5]; fWall(wx, RAIL_Z - 3.0f + (float)((h >> 12) % 3), wx, RAIL_Z + 1.5f + (float)((h >> 12) % 3), 0.7f, 2.5f, g[0], g[1], g[2]); }
+		}
+	}
+	// stations: a platform with a canopy on top of the embankment and a ticket hall at street level
+	for (int s = 0; s < 2; s++) {
+		float bx = BLK_C(kStationI[s]);
+		float px0 = bx - 30.0f, px1 = bx + 30.0f, pz0 = PLAT_Z0, pz1 = RAIL_Z + RAIL_HW - 0.2f;
+		fBox(px0, pz0, px1, pz1, RAIL_H, RAIL_H + 0.5f, 0.72f, 0.72f, 0.70f);
+		fFlat(px0, pz0 + 0.2f, px1, pz0 + 0.55f, RAIL_H + 0.53f, 0.95f, 0.80f, 0.10f);          // yellow safety line
+		fBox(px0 + 2.0f, pz0 + 0.8f, px1 - 2.0f, pz1 - 0.3f, 8.9f, 9.2f, 0.30f, 0.34f, 0.40f);  // canopy
+		for (int k = 0; k < 6; k++) fPost(px0 + 6.0f + (float)k * 9.6f, pz1 - 0.6f, 0.15f, RAIL_H + 0.5f, 8.9f, 0.30f, 0.32f, 0.36f);
+		fBox(px0 + 6.0f, pz1 - 1.0f, px0 + 9.0f, pz1 - 0.2f, RAIL_H + 0.5f, RAIL_H + 1.6f, 0.20f, 0.45f, 0.90f); // information board
+		for (int k = 0; k < 3; k++) addLamp(bx - 18.0f + (float)k * 18.0f, 8.8f, (pz0 + pz1) * 0.5f, 0.6f);
+		float z0 = RAIL_Z + RAIL_HW + 0.3f, z1 = z0 + 4.5f;
+		float x0 = bx - 9.0f, x1 = bx + 9.0f;
+		addSolid(x0, z0, x1, z1, 4.4f);
+		fBox(x0, z0, x1, z1, 0.0f, 4.4f, 0.62f, 0.62f, 0.60f);
+		facade(x0, z0, x1, z1, 3, x0 + 1.0f, x1 - 1.0f, 0.4f, 2.8f, 0.14f, 0.24f, 0.34f);
+		facade(x0, z0, x1, z1, 3, x0, x1, 3.4f, 4.1f, 0.20f, 0.45f, 0.90f);
+		addDoor(x0, z0, x1, z1, 3, bx, RM_STATION);
+	}
+}
+
+// ---- elevated expressway: ramp at the west end, deck over the city, a bridge over the lake ------------------------
+static void layoutFreeway(void) {
+	const float Z = FWY_Z, HW = FWY_HW;
+	const float top = FWY_Y, under = FWY_Y - FWY_T;
+	int n = 0;
+	for (float x = RAMP_X; x < FWY_X1 - 0.01f; x += 20.0f, n++) {
+		float x1 = x + 20.0f;
+		fBoxU(x, Z - HW, x1, Z + HW, under, top, 0.58f, 0.58f, 0.56f);
+		fFlat(x, Z - HW + 1.0f, x1, Z + HW - 1.0f, top + 0.03f, 0.14f, 0.14f, 0.16f);
+		fFlat(x, Z - HW + 1.3f, x1, Z - HW + 1.46f, top + 0.05f, 0.92f, 0.92f, 0.88f);
+		fFlat(x, Z + HW - 1.46f, x1, Z + HW - 1.3f, top + 0.05f, 0.92f, 0.92f, 0.88f);
+		for (int k = 0; k < 3; k++) {
+			fFlat(x + 1.0f + (float)k * 6.0f, Z - 4.7f, x + 4.0f + (float)k * 6.0f, Z - 4.5f, top + 0.05f, 0.92f, 0.92f, 0.88f);
+			fFlat(x + 1.0f + (float)k * 6.0f, Z + 4.5f, x + 4.0f + (float)k * 6.0f, Z + 4.7f, top + 0.05f, 0.92f, 0.92f, 0.88f);
+		}
+		fBox(x, Z - 0.4f, x1, Z + 0.4f, top, top + 0.9f, 0.64f, 0.64f, 0.62f);                // median barrier
+		fBox(x, Z - HW, x1, Z - HW + 0.5f, top, top + 1.0f, 0.68f, 0.68f, 0.66f);              // edge barriers
+		fBox(x, Z + HW - 0.5f, x1, Z + HW, top, top + 1.0f, 0.68f, 0.68f, 0.66f);
+		if ((n & 1) == 0) { // street light on the edge, every 40 m, alternating sides
+			float sg = ((n >> 1) & 1) ? 1.0f : -1.0f, lx = x + 10.0f, lz = Z + sg * (HW - 0.25f);
+			fPost(lx, lz, 0.1f, top, top + 7.0f, 0.28f, 0.29f, 0.32f);
+			fBox(lx - 0.06f, lz - sg * 2.2f, lx + 0.06f, lz, top + 6.9f, top + 7.05f, 0.28f, 0.29f, 0.32f);
+			addLamp(lx, top + 6.8f, lz - sg * 2.2f, 0.7f);
+		}
+	}
+	// pillars under the deck (and out in the water): a pair of columns and a cap
+	for (float xp = BLK_C(0) - 40.0f * 2.0f; xp < FWY_X1 - 5.0f; xp += 40.0f) {
+		if (xp < RAMP_X + 4.0f) continue;
+		for (int s = -1; s <= 1; s += 2) {
+			fBox(xp - 0.8f, Z + (float)s * 5.5f - 0.8f, xp + 0.8f, Z + (float)s * 5.5f + 0.8f, 0.0f, under, 0.60f, 0.60f, 0.58f);
+			addSolid(xp - 0.8f, Z + (float)s * 5.5f - 0.8f, xp + 0.8f, Z + (float)s * 5.5f + 0.8f, top);
+		}
+		fBox(xp - 1.2f, Z - 8.0f, xp + 1.2f, Z + 8.0f, under - 1.0f, under, 0.56f, 0.56f, 0.54f);
+	}
+	// the west end: the road comes down to the ground
+	const int nr = 4;
+	for (int m = 0; m < nr; m++) {
+		float xa = FWY_X0 + RAMP_L / (float)nr * (float)m, xb = xa + RAMP_L / (float)nr;
+		float ya = 0.1f + (top - 0.1f) * (float)m / (float)nr, yb = 0.1f + (top - 0.1f) * (float)(m + 1) / (float)nr;
+		fSlope(xa, xb, Z - HW + 0.5f, Z + HW - 0.5f, ya, yb, 0.14f, 0.14f, 0.16f);
+		fSlope(xa, xb, Z - 0.1f, Z + 0.1f, ya + 0.03f, yb + 0.03f, 0.88f, 0.72f, 0.14f);
+		fSideZ(Z - HW, xa, xb, ya + 1.0f, yb + 1.0f, 0.62f, 0.62f, 0.60f);
+		fSideZ(Z + HW, xa, xb, ya + 1.0f, yb + 1.0f, 0.62f, 0.62f, 0.60f);
+	}
+	addSolid(FWY_X0, Z - HW, RAMP_X + 2.0f, Z + HW, top);
+	// overhead gantry signs
+	static const float gx[2] = {-190.0f, 110.0f};
+	for (int g = 0; g < 2; g++) {
+		float x = gx[g];
+		fBox(x - 0.3f, Z - HW, x + 0.3f, Z - HW + 0.6f, top, top + 8.2f, 0.34f, 0.35f, 0.38f);
+		fBox(x - 0.3f, Z + HW - 0.6f, x + 0.3f, Z + HW, top, top + 8.2f, 0.34f, 0.35f, 0.38f);
+		fBox(x - 0.25f, Z - HW + 0.6f, x + 0.25f, Z + HW - 0.6f, top + 5.8f, top + 8.2f, 0.05f, 0.40f, 0.20f);
+		for (int k = 0; k < 3; k++) for (int s = -1; s <= 1; s += 2)
+			fWall(x + (float)s * 0.3f, Z - 7.0f + (float)k * 5.0f, x + (float)s * 0.3f, Z - 3.6f + (float)k * 5.0f, top + 6.5f + (float)(k & 1) * 0.4f, top + 7.0f + (float)(k & 1) * 0.4f, 0.95f, 0.95f, 0.92f);
+	}
+}
+
+// ---- collision acceleration: a coarse grid of building lists -------------------------------------------------------
+#define BK_C 16.0f
+#define BK_O (-CITY_H - 100.0f)
+#define BK_N 48
+#define MAX_BKL 40000
+static unsigned short bkStart[BK_N * BK_N + 1];
+static unsigned short bkList[MAX_BKL];
+static int bkOverflow = 0;
+static unsigned short bkStamp[MAX_BLD];
+static unsigned short bkGen = 0;
+
+static int bkIdx(float v) { int i = (int)floorf((v - BK_O) / BK_C); return i < 0 ? 0 : (i >= BK_N ? BK_N - 1 : i); }
+
+static void buildBuckets(void) {
+	static unsigned short cnt[BK_N * BK_N + 1];
+	memset(cnt, 0, sizeof cnt);
+	for (int pass = 0; pass < 2; pass++) {
+		if (pass == 1) {
+			unsigned s = 0;
+			for (int k = 0; k < BK_N * BK_N; k++) { bkStart[k] = (unsigned short)s; s += cnt[k]; cnt[k] = 0; }
+			bkStart[BK_N * BK_N] = (unsigned short)s;
+		}
+		int total = 0;
+		for (int i = 0; i < nBld; i++) {
+			const Building* b = &bldg[i];
+			int x0 = bkIdx(b->x0 - 2.0f), x1 = bkIdx(b->x1 + 2.0f), z0 = bkIdx(b->z0 - 2.0f), z1 = bkIdx(b->z1 + 2.0f);
+			for (int z = z0; z <= z1; z++) for (int x = x0; x <= x1; x++) {
+				int k = z * BK_N + x;
+				if (pass == 0) cnt[k]++;
+				else if (bkStart[k] + cnt[k] < MAX_BKL) { bkList[bkStart[k] + cnt[k]] = (unsigned short)i; cnt[k]++; }
+				total++;
+			}
+		}
+		if (pass == 0 && total >= MAX_BKL) { bkOverflow = 1; }
+	}
+}
+
+// Gathers the indices of every building near the box (x0,z0)-(x1,z1), each once.
+static int bkGather(float x0, float z0, float x1, float z1, unsigned short* out, int maxN) {
+	int n = 0;
+	if (++bkGen == 0) { memset(bkStamp, 0, sizeof bkStamp); bkGen = 1; }
+	int ix0 = bkIdx(x0), ix1 = bkIdx(x1), iz0 = bkIdx(z0), iz1 = bkIdx(z1);
+	for (int z = iz0; z <= iz1; z++) for (int x = ix0; x <= ix1; x++) {
+		int k = z * BK_N + x;
+		for (int q = bkStart[k]; q < bkStart[k + 1]; q++) {
+			int id = bkList[q];
+			if (bkStamp[id] == bkGen) continue;
+			bkStamp[id] = bkGen;
+			if (n < maxN) out[n++] = (unsigned short)id;
+		}
+	}
+	return n;
+}
+
+// Height of whatever roof (freeway deck, tunnel slab) is above this spot; the camera stays below it.
+static float ceilingAt(float x, float z) {
+	float c = 99.0f;
+	if (fabsf(z - FWY_Z) < FWY_HW && x >= RAMP_X && x <= FWY_X1) c = FWY_Y - FWY_T - 1.0f;
+	if (fabsf(z - RAIL_Z) < RAIL_HW) {
+		int k = (int)floorf((x - ROAD_C(0)) / ROAD_SP + 0.5f);
+		if (k < 0) k = 0;
+		if (k > ROADS - 1) k = ROADS - 1;
+		if (fabsf(x - ROAD_C(k)) < TUN_HW) c = 4.3f;
+	}
+	return c;
+}
+
+static int gRoom = -1;                       // >= 0 while the player is inside a building
+static const float kJacketClr[4][3] = {{0.10f, 0.10f, 0.12f}, {0.80f, 0.15f, 0.15f}, {0.15f, 0.35f, 0.85f}, {0.20f, 0.62f, 0.32f}};
+static int gShades = 0, gCap = 0, gJacketIx = 0;      // what the player bought (sunglasses, cap, jacket colour)
+// ---- interiors ---------------------------------------------------------------------------------------------------
+// Six rooms, each built once into the vertex buffer far away from the city (room k is centred on x = 2000 + 100 k).
+// A Room records where the player may walk, the furniture collision boxes, the shopkeeper and the service spot.
+#define RM_X(k)  (2000.0f + 100.0f * (float)(k))
+#define MAX_RSOL 56
+typedef struct {
+	float x0, z0, x1, z1, h;       // walkable bounds and ceiling height
+	float spX, spZ;                // where the player appears (just inside the door)
+	float exX, exZ;                // stand within 2 m of this spot to leave
+	int   kHas;                    // shopkeeper?
+	float kX, kZ, kFace;
+	float aX, aZ;                  // service spot: counter, bed, ticket machine
+	int   nSol;
+	float sol[MAX_RSOL][4];
+	int   nCrate;                  // loose crates to carry for cash (warehouse)
+	float crate[6][2];
+	int   start, count;
+} Room;
+static Room  rooms[RM_N];
+static Room* rb;                   // the room being built
+
+static void rSolid(float x0, float z0, float x1, float z1) {
+	if (rb->nSol < MAX_RSOL) { float* s = rb->sol[rb->nSol++]; s[0] = x0; s[1] = z0; s[2] = x1; s[3] = z1; } else gDropped++;
+}
+static void rBox(float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b, int solid) {
+	addBoxG(x0, z0, x1, z1, y0, y1, r, g, b, 0.80f, 1.0f);
+	if (solid) rSolid(x0, z0, x1, z1);
+}
+static void rWallQ(float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b) { // vertical quad
+	float a[3] = {x0, y0, z0}, c[3] = {x1, y0, z1}, d[3] = {x1, y1, z1}, e[3] = {x0, y1, z0};
+	quad(a, c, d, e, r, g, b);
+}
+static void rFlat(float x0, float z0, float x1, float z1, float y, float r, float g, float b) {
+	float a[3] = {x0, y, z0}, c[3] = {x1, y, z0}, d[3] = {x1, y, z1}, e[3] = {x0, y, z1};
+	quad(a, e, d, c, r, g, b);
+}
+static void rLight(float x, float z, float hw, float hd, float h) { rFlat(x - hw, z - hd, x + hw, z + hd, h - 0.03f, 1.0f, 1.0f, 0.93f); }
+
+// floor (optionally a 2 m chequer), ceiling, four walls with a skirting board and an accent stripe
+static void rShell(float x0, float z0, float x1, float z1, float h, const float wl[3], const float f1[3], const float f2[3], int tile, const float ac[3]) {
+	if (tile) {
+		int ni = 0;
+		for (float x = x0; x < x1 - 0.01f; x += 2.0f, ni++) {
+			int nj = 0;
+			for (float z = z0; z < z1 - 0.01f; z += 2.0f, nj++) {
+				const float* c = ((ni + nj) & 1) ? f2 : f1;
+				rFlat(x, z, fminf(x + 2.0f, x1), fminf(z + 2.0f, z1), 0.02f, c[0], c[1], c[2]);
+			}
+		}
+	} else rFlat(x0, z0, x1, z1, 0.02f, f1[0], f1[1], f1[2]);
+	rFlat(x0, z0, x1, z1, h, fminf(1.0f, wl[0] * 1.05f), fminf(1.0f, wl[1] * 1.05f), fminf(1.0f, wl[2] * 1.05f));
+	const float k[4] = {0.92f, 0.80f, 0.86f, 0.88f};
+	rWallQ(x0, z0, x1, z0, 0.0f, h, wl[0] * k[0], wl[1] * k[0], wl[2] * k[0]);
+	rWallQ(x0, z1, x1, z1, 0.0f, h, wl[0] * k[1], wl[1] * k[1], wl[2] * k[1]);
+	rWallQ(x0, z0, x0, z1, 0.0f, h, wl[0] * k[2], wl[1] * k[2], wl[2] * k[2]);
+	rWallQ(x1, z0, x1, z1, 0.0f, h, wl[0] * k[3], wl[1] * k[3], wl[2] * k[3]);
+	const float o = 0.02f;
+	for (int w = 0; w < 4; w++) { // skirting (dark) and stripe (accent colour) just in front of each wall
+		float ax = w == 2 ? x0 + o : (w == 3 ? x1 - o : x0), bx = w == 2 ? x0 + o : (w == 3 ? x1 - o : x1);
+		float az = w == 0 ? z0 + o : (w == 1 ? z1 - o : z0), bz = w == 0 ? z0 + o : (w == 1 ? z1 - o : z1);
+		rWallQ(ax, az, bx, bz, 0.0f, 0.22f, wl[0] * 0.45f, wl[1] * 0.45f, wl[2] * 0.45f);
+		rWallQ(ax, az, bx, bz, 1.15f, 1.35f, ac[0], ac[1], ac[2]);
+	}
+}
+// door in the south wall (z = zw): frame, glass, an EXIT sign and a mat
+static void rDoor(float x, float zw) {
+	rWallQ(x - 1.0f, zw - 0.03f, x + 1.0f, zw - 0.03f, 0.0f, 2.5f, 0.20f, 0.20f, 0.23f);
+	rWallQ(x - 0.8f, zw - 0.04f, x + 0.8f, zw - 0.04f, 0.0f, 2.3f, 0.52f, 0.74f, 0.88f);
+	rWallQ(x - 0.04f, zw - 0.05f, x + 0.04f, zw - 0.05f, 0.0f, 2.3f, 0.20f, 0.20f, 0.23f);
+	rBox(x - 0.5f, zw - 0.9f, x + 0.5f, zw - 0.8f, 2.65f, 2.95f, 0.10f, 0.85f, 0.30f, 0);
+	rFlat(x - 1.2f, zw - 1.6f, x + 1.2f, zw - 0.4f, 0.03f, 0.22f, 0.22f, 0.25f);
+}
+// window with a white frame in a wall along x (z = zw, glass faces +dz) or along z (x = xw)
+static void rWinX(float x0, float x1, float zw, float dz, float y0, float y1) {
+	rWallQ(x0 - 0.08f, zw + dz * 0.02f, x1 + 0.08f, zw + dz * 0.02f, y0 - 0.08f, y1 + 0.08f, 0.92f, 0.92f, 0.90f);
+	rWallQ(x0, zw + dz * 0.03f, x1, zw + dz * 0.03f, y0, y1, 0.55f, 0.76f, 0.94f);
+	rWallQ((x0 + x1) * 0.5f - 0.03f, zw + dz * 0.04f, (x0 + x1) * 0.5f + 0.03f, zw + dz * 0.04f, y0, y1, 0.92f, 0.92f, 0.90f);
+}
+static void rWinZ(float z0, float z1, float xw, float dx, float y0, float y1) {
+	rWallQ(xw + dx * 0.02f, z0 - 0.08f, xw + dx * 0.02f, z1 + 0.08f, y0 - 0.08f, y1 + 0.08f, 0.92f, 0.92f, 0.90f);
+	rWallQ(xw + dx * 0.03f, z0, xw + dx * 0.03f, z1, y0, y1, 0.55f, 0.76f, 0.94f);
+	rWallQ(xw + dx * 0.04f, (z0 + z1) * 0.5f - 0.03f, xw + dx * 0.04f, (z0 + z1) * 0.5f + 0.03f, y0, y1, 0.92f, 0.92f, 0.90f);
+}
+static void rSetup(Room* r, float x0, float z0, float x1, float z1, float h, float doorX) {
+	rb = r;
+	memset(r, 0, sizeof *r);
+	r->x0 = x0 + 0.45f; r->x1 = x1 - 0.45f; r->z0 = z0 + 0.45f; r->z1 = z1 - 0.45f; r->h = h;
+	r->spX = doorX; r->spZ = z1 - 1.6f; r->exX = doorX; r->exZ = z1 - 1.2f;
+	r->start = vcount;
+}
+
+static void buildStore(void) {
+	const float cx = RM_X(RM_STORE);
+	const float wl[3] = {0.93f, 0.93f, 0.89f}, f1[3] = {0.88f, 0.88f, 0.85f}, f2[3] = {0.66f, 0.70f, 0.76f}, ac[3] = {0.85f, 0.16f, 0.16f};
+	rSetup(&rooms[RM_STORE], cx - 6.0f, -5.0f, cx + 6.0f, 5.0f, 3.4f, cx + 1.0f);
+	rShell(cx - 6.0f, -5.0f, cx + 6.0f, 5.0f, 3.4f, wl, f1, f2, 1, ac);
+	rDoor(cx + 1.0f, 5.0f);
+	for (int i = 0; i < 3; i++) rLight(cx - 3.5f + 3.5f * (float)i, -1.0f, 0.8f, 0.3f, 3.4f), rLight(cx - 3.5f + 3.5f * (float)i, 2.5f, 0.8f, 0.3f, 3.4f);
+	rWinX(cx - 5.0f, cx - 2.0f, 5.0f, -1.0f, 1.0f, 2.6f);
+	// drinks fridges along the back wall
+	for (int i = 0; i < 4; i++) {
+		float x = cx - 5.6f + 1.35f * (float)i;
+		rBox(x, -5.0f, x + 1.3f, -4.15f, 0.0f, 2.2f, 0.78f, 0.86f, 0.92f, 0);
+		rWallQ(x + 0.1f, -4.14f, x + 1.2f, -4.14f, 0.25f, 2.0f, 0.10f, 0.22f, 0.30f);
+		rWallQ(x + 0.1f, -4.13f, x + 1.2f, -4.13f, 0.45f, 0.75f, 0.90f, 0.30f, 0.20f);
+		rWallQ(x + 0.1f, -4.13f, x + 1.2f, -4.13f, 0.95f, 1.25f, 0.20f, 0.60f, 0.90f);
+		rWallQ(x + 0.1f, -4.13f, x + 1.2f, -4.13f, 1.45f, 1.75f, 0.95f, 0.80f, 0.20f);
+	}
+	rSolid(cx - 5.6f, -5.0f, cx - 0.2f, -4.1f);
+	// two aisles of shelves
+	for (int row = 0; row < 2; row++) {
+		float z = -1.7f + 2.2f * (float)row;
+		for (int u = 0; u < 3; u++) {
+			float x = cx - 5.3f + 1.45f * (float)u;
+			rBox(x, z, x + 1.3f, z + 0.8f, 0.0f, 1.55f, 0.74f, 0.74f, 0.78f, 1);
+			static const float pc[3][3] = {{0.95f, 0.78f, 0.20f}, {0.85f, 0.25f, 0.25f}, {0.25f, 0.60f, 0.85f}};
+			for (int s = 0; s < 3; s++) {
+				const float* c = pc[(u + s + row) % 3];
+				rBox(x + 0.05f, z - 0.04f, x + 1.25f, z, 0.25f + 0.45f * (float)s, 0.55f + 0.45f * (float)s, c[0], c[1], c[2], 0);
+				rBox(x + 0.05f, z + 0.8f, x + 1.25f, z + 0.84f, 0.25f + 0.45f * (float)s, 0.55f + 0.45f * (float)s, c[2], c[0], c[1], 0);
+			}
+		}
+	}
+	// counter with a till, and the staff-only end of it
+	rBox(cx, -3.9f, cx + 5.8f, -2.8f, 0.0f, 1.05f, 0.85f, 0.20f, 0.20f, 1);
+	rBox(cx - 0.05f, -3.95f, cx + 5.85f, -2.75f, 1.05f, 1.12f, 0.93f, 0.93f, 0.90f, 0);
+	rBox(cx + 2.8f, -3.5f, cx + 3.5f, -3.0f, 1.12f, 1.45f, 0.14f, 0.14f, 0.17f, 0);
+	rBox(cx + 4.4f, -3.6f, cx + 5.4f, -3.0f, 1.12f, 1.50f, 0.95f, 0.75f, 0.25f, 0);
+	rBox(cx + 1.0f, -4.95f, cx + 5.5f, -4.9f, 2.3f, 2.9f, 0.90f, 0.18f, 0.18f, 0); // sign over the counter
+	rBox(cx + 1.2f, -4.93f, cx + 5.3f, -4.88f, 2.45f, 2.75f, 0.98f, 0.98f, 0.95f, 0);
+	// ice-cream freezer and a snack rack on the east wall
+	rBox(cx + 4.4f, 1.2f, cx + 5.6f, 3.4f, 0.0f, 0.95f, 0.80f, 0.88f, 0.95f, 1);
+	rBox(cx + 4.45f, 1.25f, cx + 5.55f, 3.35f, 0.95f, 1.0f, 0.30f, 0.50f, 0.85f, 0);
+	rBox(cx + 5.0f, -1.8f, cx + 5.6f, 0.6f, 0.0f, 1.7f, 0.95f, 0.55f, 0.15f, 1);
+	rb->kHas = 1; rb->kX = cx + 3.4f; rb->kZ = -4.5f; rb->kFace = 3.14159f;
+	rb->aX = cx + 3.2f; rb->aZ = -2.0f;
+	rb->count = vcount - rb->start;
+}
+
+static void buildDiner(void) {
+	const float cx = RM_X(RM_DINER);
+	const float wl[3] = {0.95f, 0.86f, 0.88f}, f1[3] = {0.90f, 0.90f, 0.90f}, f2[3] = {0.14f, 0.14f, 0.16f}, ac[3] = {0.92f, 0.28f, 0.60f};
+	rSetup(&rooms[RM_DINER], cx - 7.0f, -5.0f, cx + 7.0f, 5.0f, 3.4f, cx + 3.5f);
+	rShell(cx - 7.0f, -5.0f, cx + 7.0f, 5.0f, 3.4f, wl, f1, f2, 1, ac);
+	rDoor(cx + 3.5f, 5.0f);
+	for (int i = 0; i < 4; i++) rLight(cx - 5.0f + 3.4f * (float)i, 0.5f, 0.8f, 0.3f, 3.4f);
+	rWinX(cx - 6.0f, cx - 3.0f, 5.0f, -1.0f, 0.9f, 2.5f);
+	rWinX(cx + 0.0f, cx + 2.2f, 5.0f, -1.0f, 0.9f, 2.5f);
+	rWinZ(-3.0f, 0.0f, cx - 7.0f, 1.0f, 0.9f, 2.5f);
+	// neon strip over the kitchen pass
+	rBox(cx - 4.0f, -4.95f, cx + 4.0f, -4.9f, 2.5f, 2.75f, 1.0f, 0.35f, 0.70f, 0);
+	rBox(cx - 4.0f, -4.95f, cx + 4.0f, -4.9f, 2.0f, 2.2f, 0.30f, 0.85f, 0.95f, 0);
+	// counter with stools, grill and fridge behind it
+	rBox(cx - 5.0f, -2.9f, cx + 5.0f, -1.9f, 0.0f, 1.05f, 0.72f, 0.74f, 0.78f, 1);
+	rBox(cx - 5.05f, -2.95f, cx + 5.05f, -1.85f, 1.05f, 1.12f, 0.20f, 0.20f, 0.23f, 0);
+	for (int i = 0; i < 6; i++) {
+		float x = cx - 4.2f + 1.65f * (float)i;
+		rBox(x - 0.04f, -1.34f, x + 0.04f, -1.26f, 0.0f, 0.62f, 0.60f, 0.60f, 0.64f, 0);
+		rBox(x - 0.28f, -1.58f, x + 0.28f, -1.02f, 0.62f, 0.76f, 0.85f, 0.15f, 0.20f, 0);
+	}
+	rBox(cx - 5.0f, -4.6f, cx - 2.6f, -3.8f, 0.0f, 1.0f, 0.30f, 0.30f, 0.34f, 0);   // grill
+	rBox(cx + 3.2f, -4.7f, cx + 5.0f, -3.9f, 0.0f, 2.0f, 0.82f, 0.84f, 0.88f, 0);   // fridge
+	rSolid(cx - 5.0f, -4.6f, cx + 5.0f, -1.9f);
+	// booths along the west wall and tables in the middle
+	for (int k = 0; k < 3; k++) {
+		float z = 0.2f + 1.5f * (float)k * 1.0f + (k > 0 ? 0.3f : 0.0f);
+		float x = cx - 6.3f;
+		rBox(x - 0.1f, z - 0.55f, x + 0.55f, z + 0.55f, 0.0f, 0.5f, 0.82f, 0.15f, 0.22f, 1);
+		rBox(x - 0.1f, z - 0.55f, x + 0.12f, z + 0.55f, 0.5f, 1.2f, 0.82f, 0.15f, 0.22f, 0);
+		rBox(x + 1.0f, z - 0.5f, x + 1.9f, z + 0.5f, 0.72f, 0.80f, 0.92f, 0.92f, 0.88f, 1);
+		rBox(x + 1.4f, z - 0.08f, x + 1.5f, z + 0.08f, 0.0f, 0.72f, 0.50f, 0.50f, 0.54f, 0);
+		rBox(x + 2.35f, z - 0.55f, x + 3.0f, z + 0.55f, 0.0f, 0.5f, 0.82f, 0.15f, 0.22f, 1);
+		rBox(x + 2.8f, z - 0.55f, x + 3.02f, z + 0.55f, 0.5f, 1.2f, 0.82f, 0.15f, 0.22f, 0);
+	}
+	for (int k = 0; k < 2; k++) {
+		float x = cx - 1.0f + 2.6f * (float)k, z = 1.6f;   // the lane in front of the door (x = cx + 3.5) stays clear
+		rBox(x - 0.55f, z - 0.55f, x + 0.55f, z + 0.55f, 0.72f, 0.80f, 0.92f, 0.92f, 0.88f, 1);
+		rBox(x - 0.06f, z - 0.06f, x + 0.06f, z + 0.06f, 0.0f, 0.72f, 0.50f, 0.50f, 0.54f, 0);
+		rBox(x - 0.45f, z - 1.25f, x + 0.45f, z - 0.75f, 0.0f, 0.5f, 0.15f, 0.40f, 0.80f, 0);
+		rBox(x - 0.45f, z + 0.75f, x + 0.45f, z + 1.25f, 0.0f, 0.5f, 0.15f, 0.40f, 0.80f, 0);
+		rSolid(x - 0.55f, z - 1.25f, x + 0.55f, z + 1.25f);
+	}
+	rBox(cx + 6.1f, -1.2f, cx + 6.55f, 0.2f, 0.0f, 1.7f, 0.95f, 0.30f, 0.65f, 1); // jukebox
+	rBox(cx + 6.12f, -1.0f, cx + 6.5f, 0.0f, 1.1f, 1.5f, 0.98f, 0.85f, 0.30f, 0);
+	rb->kHas = 1; rb->kX = cx + 0.8f; rb->kZ = -3.9f; rb->kFace = 3.14159f;
+	rb->aX = cx + 0.8f; rb->aZ = -0.7f;
+	rb->count = vcount - rb->start;
+}
+
+static void buildLaundry(void) {
+	const float cx = RM_X(RM_LAUNDRY);
+	const float wl[3] = {0.80f, 0.92f, 0.94f}, f1[3] = {0.92f, 0.95f, 0.96f}, f2[3] = {0.62f, 0.84f, 0.88f}, ac[3] = {0.12f, 0.62f, 0.66f};
+	rSetup(&rooms[RM_LAUNDRY], cx - 6.0f, -4.5f, cx + 6.0f, 4.5f, 3.2f, cx - 1.5f);
+	rShell(cx - 6.0f, -4.5f, cx + 6.0f, 4.5f, 3.2f, wl, f1, f2, 1, ac);
+	rDoor(cx - 1.5f, 4.5f);
+	for (int i = 0; i < 3; i++) rLight(cx - 3.5f + 3.5f * (float)i, 0.0f, 0.8f, 0.3f, 3.2f);
+	rWinX(cx + 1.5f, cx + 4.5f, 4.5f, -1.0f, 0.9f, 2.4f);
+	// washers on both side walls: white drum with a dark glass door
+	for (int side = 0; side < 2; side++) {
+		for (int k = 0; k < 5; k++) {
+			float z = -3.4f + 1.05f * (float)k;
+			float x0 = side ? cx + 4.95f : cx - 5.55f, x1 = side ? cx + 5.55f : cx - 4.95f;
+			rBox(x0, z, x1, z + 0.95f, 0.0f, 1.05f, 0.92f, 0.93f, 0.95f, 1);
+			float fx = side ? x0 - 0.03f : x1 + 0.03f;
+			rWallQ(fx, z + 0.22f, fx, z + 0.72f, 0.28f, 0.78f, 0.20f, 0.30f, 0.42f);
+			rWallQ(fx, z + 0.30f, fx, z + 0.64f, 0.36f, 0.70f, 0.40f, 0.60f, 0.78f);
+			rBox(x0 + 0.05f, z + 0.05f, x1 - 0.05f, z + 0.9f, 1.05f, 1.12f, 0.70f, 0.72f, 0.76f, 0);
+		}
+	}
+	// stacked dryers on the back wall, a folding table, a bench
+	for (int k = 0; k < 4; k++) {
+		float x = cx - 4.3f + 1.05f * (float)k;
+		rBox(x, -4.5f, x + 0.95f, -3.6f, 0.0f, 2.1f, 0.88f, 0.89f, 0.92f, 0);
+		rWallQ(x + 0.15f, -3.59f, x + 0.8f, -3.59f, 0.3f, 0.95f, 0.22f, 0.32f, 0.44f);
+		rWallQ(x + 0.15f, -3.59f, x + 0.8f, -3.59f, 1.2f, 1.85f, 0.22f, 0.32f, 0.44f);
+	}
+	rSolid(cx - 4.3f, -4.5f, cx - 0.1f, -3.6f);
+	rBox(cx - 1.6f, -0.9f, cx + 1.6f, 0.4f, 0.0f, 0.95f, 0.75f, 0.60f, 0.40f, 1);
+	rBox(cx - 1.5f, -0.2f, cx - 0.7f, 0.2f, 0.95f, 1.15f, 0.95f, 0.55f, 0.65f, 0);
+	rBox(cx + 0.2f, -0.7f, cx + 1.2f, -0.1f, 0.95f, 1.1f, 0.35f, 0.65f, 0.90f, 0);
+	rBox(cx - 4.2f, 1.2f, cx - 2.6f, 1.8f, 0.0f, 0.5f, 0.30f, 0.34f, 0.40f, 1);   // bench: not in the lane in front of the door (x = cx - 1.5)
+	// service counter with soap vending machine, attendant behind it
+	rBox(cx + 1.0f, -3.9f, cx + 4.6f, -3.0f, 0.0f, 1.05f, 0.12f, 0.62f, 0.66f, 1);
+	rBox(cx + 0.95f, -3.95f, cx + 4.65f, -2.95f, 1.05f, 1.12f, 0.93f, 0.93f, 0.90f, 0);
+	rBox(cx + 4.7f, -4.2f, cx + 5.5f, -3.5f, 0.0f, 1.9f, 0.85f, 0.25f, 0.30f, 1); // soap machine
+	rBox(cx + 4.8f, -3.5f, cx + 5.4f, -3.47f, 1.2f, 1.6f, 0.95f, 0.95f, 0.80f, 0);
+	rSolid(cx + 1.0f, -4.2f, cx + 4.6f, -3.0f);
+	rb->kHas = 1; rb->kX = cx + 2.8f; rb->kZ = -4.1f; rb->kFace = 3.14159f;
+	rb->aX = cx + 2.8f; rb->aZ = -2.2f;
+	rb->count = vcount - rb->start;
+}
+
+static void buildApt(void) {
+	const float cx = RM_X(RM_APT);
+	const float wl[3] = {0.86f, 0.80f, 0.70f}, f1[3] = {0.52f, 0.36f, 0.22f}, f2[3] = {0.48f, 0.32f, 0.20f}, ac[3] = {0.40f, 0.52f, 0.60f};
+	rSetup(&rooms[RM_APT], cx - 5.0f, -4.0f, cx + 5.0f, 4.0f, 3.0f, cx);
+	rShell(cx - 5.0f, -4.0f, cx + 5.0f, 4.0f, 3.0f, wl, f1, f2, 1, ac);
+	rDoor(cx, 4.0f);
+	rLight(cx - 1.5f, 0.0f, 0.7f, 0.3f, 3.0f); rLight(cx + 1.8f, 0.0f, 0.7f, 0.3f, 3.0f);
+	rWinZ(-2.5f, 0.8f, cx - 5.0f, 1.0f, 0.8f, 2.4f);
+	rWinX(cx + 0.5f, cx + 3.5f, -4.0f, 1.0f, 0.9f, 2.4f);
+	rFlat(cx - 2.2f, -1.0f, cx + 2.2f, 2.4f, 0.04f, 0.60f, 0.22f, 0.22f); // rug
+	// bed
+	rBox(cx - 4.7f, -3.8f, cx - 2.3f, -1.4f, 0.0f, 0.5f, 0.45f, 0.30f, 0.20f, 1);
+	rBox(cx - 4.65f, -3.75f, cx - 2.35f, -1.45f, 0.5f, 0.7f, 0.85f, 0.88f, 0.95f, 0);
+	rBox(cx - 4.6f, -3.7f, cx - 3.4f, -3.0f, 0.7f, 0.85f, 0.95f, 0.95f, 0.98f, 0);
+	rBox(cx - 4.6f, -2.4f, cx - 2.4f, -1.5f, 0.7f, 0.78f, 0.25f, 0.40f, 0.65f, 0);
+	// sofa and TV
+	rBox(cx + 0.8f, 1.2f, cx + 3.8f, 2.2f, 0.0f, 0.5f, 0.28f, 0.34f, 0.48f, 1);
+	rBox(cx + 0.8f, 2.0f, cx + 3.8f, 2.3f, 0.5f, 1.1f, 0.24f, 0.30f, 0.44f, 0);
+	rBox(cx + 1.4f, -3.9f, cx + 3.2f, -3.5f, 0.0f, 0.55f, 0.30f, 0.22f, 0.16f, 1);
+	rBox(cx + 1.5f, -3.95f, cx + 3.1f, -3.88f, 0.9f, 1.8f, 0.05f, 0.05f, 0.07f, 0);
+	rBox(cx + 1.6f, -3.88f, cx + 3.0f, -3.85f, 1.0f, 1.7f, 0.30f, 0.60f, 0.95f, 0);
+	rBox(cx + 1.4f, 0.0f, cx + 3.2f, 0.7f, 0.0f, 0.42f, 0.55f, 0.42f, 0.30f, 1);
+	// kitchenette on the east wall
+	rBox(cx + 4.1f, -3.5f, cx + 4.9f, 0.0f, 0.0f, 0.95f, 0.90f, 0.90f, 0.88f, 1);
+	rBox(cx + 4.1f, -3.5f, cx + 4.9f, 0.0f, 0.95f, 1.02f, 0.25f, 0.25f, 0.28f, 0);
+	rBox(cx + 4.1f, -3.9f, cx + 4.9f, -3.5f, 0.0f, 1.9f, 0.84f, 0.86f, 0.90f, 1);
+	rBox(cx + 4.1f, 0.6f, cx + 4.9f, 1.6f, 0.0f, 0.5f, 0.55f, 0.36f, 0.20f, 1);
+	rb->aX = cx - 3.4f; rb->aZ = -0.9f; // the bed
+	rb->count = vcount - rb->start;
+}
+
+static void buildWare(void) {
+	const float cx = RM_X(RM_WARE);
+	const float wl[3] = {0.60f, 0.62f, 0.64f}, f1[3] = {0.50f, 0.50f, 0.49f}, f2[3] = {0.46f, 0.46f, 0.45f}, ac[3] = {0.95f, 0.60f, 0.12f};
+	rSetup(&rooms[RM_WARE], cx - 12.0f, -8.0f, cx + 12.0f, 8.0f, 7.5f, cx - 8.0f);
+	rShell(cx - 12.0f, -8.0f, cx + 12.0f, 8.0f, 7.5f, wl, f1, f2, 0, ac);
+	rDoor(cx - 8.0f, 8.0f);
+	for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) rLight(cx - 9.0f + 6.0f * (float)i, -4.0f + 8.0f * (float)j, 1.0f, 0.4f, 7.5f);
+	for (int k = 0; k < 4; k++) rFlat(cx - 10.0f + 6.0f * (float)k, -7.5f, cx - 9.8f + 6.0f * (float)k, 7.5f, 0.03f, 0.95f, 0.80f, 0.10f); // aisle lines
+	// roll-up door on the east wall
+	rWallQ(cx + 11.98f, -4.0f, cx + 11.98f, 0.5f, 0.0f, 4.2f, 0.70f, 0.72f, 0.76f);
+	for (int k = 0; k < 8; k++) rWallQ(cx + 11.97f, -4.0f, cx + 11.97f, 0.5f, 0.5f + 0.5f * (float)k, 0.56f + 0.5f * (float)k, 0.55f, 0.57f, 0.62f);
+	// pallet racking: two long rows with crates on them
+	for (int row = 0; row < 2; row++) {
+		float z = -6.9f + 3.4f * (float)row;
+		rBox(cx - 10.8f, z, cx - 1.2f, z + 1.2f, 0.0f, 0.15f, 0.20f, 0.35f, 0.62f, 1);
+		for (int u = 0; u < 5; u++) rBox(cx - 10.8f + 2.4f * (float)u, z, cx - 10.6f + 2.4f * (float)u, z + 1.2f, 0.0f, 5.0f, 0.20f, 0.35f, 0.62f, 0);
+		for (int lv = 0; lv < 3; lv++) {
+			rBox(cx - 10.8f, z, cx - 1.2f, z + 1.2f, 1.0f + 1.6f * (float)lv, 1.12f + 1.6f * (float)lv, 0.95f, 0.55f, 0.15f, 0);
+			for (int u = 0; u < 4; u++) {
+				float x = cx - 10.2f + 2.4f * (float)u;
+				static const float cc[3][3] = {{0.72f, 0.54f, 0.34f}, {0.62f, 0.46f, 0.28f}, {0.78f, 0.62f, 0.40f}};
+				const float* c = cc[(u + lv + row) % 3];
+				rBox(x, z + 0.1f, x + 1.6f, z + 1.1f, 1.12f + 1.6f * (float)lv, 2.0f + 1.6f * (float)lv, c[0], c[1], c[2], 0);
+			}
+		}
+		rSolid(cx - 10.8f, z, cx - 1.2f, z + 1.2f);
+	}
+	// pallets of cartons, a forklift
+	rBox(cx + 1.0f, 3.5f, cx + 3.2f, 5.2f, 0.0f, 1.6f, 0.72f, 0.54f, 0.34f, 1);
+	rBox(cx + 1.0f, 3.5f, cx + 3.2f, 5.2f, 0.0f, 0.18f, 0.55f, 0.42f, 0.26f, 0);
+	rBox(cx - 3.0f, 3.0f, cx - 1.6f, 4.4f, 0.0f, 1.2f, 0.62f, 0.46f, 0.28f, 1);
+	rBox(cx + 5.0f, 3.0f, cx + 7.0f, 5.5f, 0.2f, 1.2f, 0.95f, 0.78f, 0.10f, 1);
+	rBox(cx + 5.1f, 3.2f, cx + 6.9f, 4.4f, 1.2f, 2.0f, 0.20f, 0.20f, 0.23f, 0);
+	rBox(cx + 4.95f, 5.5f, cx + 5.1f, 6.9f, 0.05f, 0.15f, 0.55f, 0.56f, 0.60f, 0);
+	rBox(cx + 6.9f, 5.5f, cx + 7.05f, 6.9f, 0.05f, 0.15f, 0.55f, 0.56f, 0.60f, 0);
+	rBox(cx + 5.0f, 5.4f, cx + 7.0f, 5.6f, 0.0f, 3.0f, 0.30f, 0.30f, 0.33f, 0);
+	// the dealer's cage in the north-east corner: counter, locker wall, gun rack
+	rBox(cx + 6.0f, -2.7f, cx + 11.4f, -1.6f, 0.0f, 1.1f, 0.30f, 0.30f, 0.34f, 1);
+	rBox(cx + 5.95f, -2.75f, cx + 11.45f, -1.55f, 1.1f, 1.18f, 0.70f, 0.72f, 0.76f, 0);
+	rBox(cx + 6.0f, -7.5f, cx + 6.2f, -2.7f, 0.0f, 3.2f, 0.45f, 0.46f, 0.50f, 0);
+	for (int k = 0; k < 4; k++) rBox(cx + 7.0f + 1.1f * (float)k, -7.45f, cx + 7.9f + 1.1f * (float)k, -7.0f, 0.0f, 2.2f, 0.22f, 0.30f, 0.26f, 0);
+	rBox(cx + 7.2f, -7.4f, cx + 11.2f, -7.35f, 1.7f, 2.7f, 0.18f, 0.18f, 0.20f, 0);
+	rSolid(cx + 6.0f, -7.5f, cx + 11.5f, -1.6f);
+	rb->kHas = 1; rb->kX = cx + 8.6f; rb->kZ = -3.4f; rb->kFace = 3.14159f;
+	rb->aX = cx + 8.6f; rb->aZ = -0.6f;
+	// loose crates to carry out for cash
+	rb->nCrate = 5;
+	static const float cp[5][2] = {{-6.0f, 5.5f}, {-4.0f, 0.2f}, {1.5f, -3.0f}, {2.5f, 0.8f}, {-9.5f, 2.0f}};
+	for (int i = 0; i < 5; i++) { rb->crate[i][0] = cx + cp[i][0]; rb->crate[i][1] = cp[i][1]; }
+	rb->count = vcount - rb->start;
+}
+
+static void buildStation(void) {
+	const float cx = RM_X(RM_STATION);
+	const float wl[3] = {0.80f, 0.82f, 0.86f}, f1[3] = {0.74f, 0.74f, 0.72f}, f2[3] = {0.62f, 0.62f, 0.62f}, ac[3] = {0.16f, 0.36f, 0.78f};
+	rSetup(&rooms[RM_STATION], cx - 9.0f, -11.0f, cx + 9.0f, 6.0f, 4.2f, cx);
+	rooms[RM_STATION].z0 = -3.0f; // walkable: the ticket hall only
+	rShell(cx - 9.0f, -11.0f, cx + 9.0f, 6.0f, 4.2f, wl, f1, f2, 1, ac);
+	rDoor(cx, 6.0f);
+	for (int i = 0; i < 3; i++) { rLight(cx - 5.0f + 5.0f * (float)i, 2.0f, 1.0f, 0.4f, 4.2f); rLight(cx - 5.0f + 5.0f * (float)i, -6.0f, 1.0f, 0.4f, 4.2f); }
+	// the track bed behind the hall (floor lowered), platform edge, rails and sleepers
+	rFlat(cx - 9.0f, -10.9f, cx + 9.0f, -6.3f, -0.80f, 0.26f, 0.25f, 0.24f);
+	rFlat(cx - 9.0f, -3.7f, cx + 9.0f, -6.3f, 0.025f, 0.70f, 0.70f, 0.68f);
+	rFlat(cx - 9.0f, -6.25f, cx + 9.0f, -5.95f, 0.04f, 0.95f, 0.80f, 0.10f);
+	rWallQ(cx - 9.0f, -6.3f, cx + 9.0f, -6.3f, -0.8f, 0.0f, 0.45f, 0.45f, 0.46f);
+	rFlat(cx - 9.0f, -9.2f, cx + 9.0f, -9.05f, -0.70f, 0.62f, 0.62f, 0.66f);
+	rFlat(cx - 9.0f, -7.75f, cx + 9.0f, -7.6f, -0.70f, 0.62f, 0.62f, 0.66f);
+	for (int k = 0; k < 14; k++) rFlat(cx - 8.5f + 1.3f * (float)k, -9.6f, cx - 8.2f + 1.3f * (float)k, -7.2f, -0.74f, 0.30f, 0.22f, 0.15f);
+	// dark tunnel mouths in both side walls, where the train comes through
+	rWallQ(cx - 8.98f, -9.9f, cx - 8.98f, -6.7f, -0.8f, 3.6f, 0.04f, 0.04f, 0.06f);
+	rWallQ(cx + 8.98f, -9.9f, cx + 8.98f, -6.7f, -0.8f, 3.6f, 0.04f, 0.04f, 0.06f);
+	// glass-style barrier between hall and platform: low wall, posts, yellow rail
+	rBox(cx - 8.55f, -3.6f, cx + 8.55f, -3.4f, 0.0f, 0.9f, 0.55f, 0.58f, 0.64f, 1);
+	for (int k = 0; k < 9; k++) rBox(cx - 8.4f + 2.1f * (float)k, -3.6f, cx - 8.25f + 2.1f * (float)k, -3.4f, 0.9f, 2.4f, 0.30f, 0.32f, 0.36f, 0);
+	rBox(cx - 8.55f, -3.6f, cx + 8.55f, -3.4f, 2.3f, 2.45f, 0.95f, 0.80f, 0.10f, 0);
+	// ticket machines, bench, information board
+	for (int k = 0; k < 3; k++) {
+		float x = cx + 2.4f + 1.5f * (float)k;
+		rBox(x, -3.3f, x + 1.0f, -2.5f, 0.0f, 1.75f, 0.16f, 0.38f, 0.82f, 1);
+		rBox(x + 0.12f, -2.52f, x + 0.88f, -2.49f, 1.1f, 1.6f, 0.50f, 0.92f, 0.70f, 0);
+		rBox(x + 0.12f, -2.52f, x + 0.88f, -2.49f, 0.8f, 0.95f, 0.95f, 0.85f, 0.20f, 0);
+	}
+	rBox(cx - 7.5f, -0.6f, cx - 4.5f, 0.1f, 0.0f, 0.45f, 0.40f, 0.28f, 0.18f, 1);
+	rBox(cx - 7.5f, 0.1f, cx - 4.5f, 0.2f, 0.45f, 1.0f, 0.38f, 0.26f, 0.16f, 0);
+	rBox(cx - 7.0f, 1.8f, cx - 6.4f, 2.4f, 0.0f, 0.9f, 0.16f, 0.30f, 0.20f, 1); // bin
+	rBox(cx - 3.0f, -3.35f, cx + 0.5f, -3.3f, 1.4f, 2.2f, 0.12f, 0.28f, 0.62f, 0); // route board
+	rBox(cx - 2.8f, -3.34f, cx + 0.3f, -3.3f, 1.6f, 1.75f, 0.95f, 0.95f, 0.95f, 0);
+	rBox(cx - 2.8f, -3.34f, cx + 0.3f, -3.3f, 1.9f, 2.0f, 0.95f, 0.30f, 0.25f, 0);
+	rb->aX = cx + 3.9f; rb->aZ = -1.7f; // ticket machines
+	rb->count = vcount - rb->start;
+}
+
+static void buildRooms(void) {
+	buildStore(); buildDiner(); buildLaundry(); buildApt(); buildWare(); buildStation();
+}
+
+static int roomBlocked(float x, float z, float r) {
+	const Room* m = &rooms[gRoom];
+	if (x < m->x0 + r - 0.3f || x > m->x1 - r + 0.3f || z < m->z0 + r - 0.3f || z > m->z1 - r + 0.3f) return 1;
+	for (int i = 0; i < m->nSol; i++) {
+		const float* s = m->sol[i];
+		if (x > s[0] - r && x < s[2] + r && z > s[1] - r && z < s[3] + r) return 1;
+	}
+	return 0;
+}
+
+// ---- build everything ---------------------------------------------------------------------------------------------
 static void buildCity(void) {
-	nBld = 0; nPatch = 0;
+	nBld = 0; nPatch = 0; nFeat = 0; nDoor = 0; nLamp = 0; gDropped = 0;
 	for (int i = 0; i < GRID; i++) for (int j = 0; j < GRID; j++) blkType[i][j] = pickBlock(i, j);
 	for (int i = 0; i < GRID; i++) for (int j = 0; j < GRID; j++) layoutBlock(i, j);
+	layoutIntersections();
+	layoutRail();
+	layoutFreeway();
+	// distant skyline ring: tall boxes, never reachable, heavily fogged; none over the lake
+	for (int i = 0; i < 72; i++) {
+		unsigned h = hash2(i, 31337);
+		float ang = (float)i * 6.2832f / 72.0f + (float)(h & 15) * 0.004f;
+		float rad = 380.0f + (float)((h >> 4) % 90);
+		float w   = 9.0f + (float)((h >> 10) % 11);
+		float hh  = 30.0f + (float)((h >> 14) % 100);
+		float cx = sinf(ang) * rad, cz = cosf(ang) * rad;
+		if (cx > CITY_H - 20.0f) continue;
+		float tone = 0.42f + (float)((h >> 20) % 20) / 100.0f;
+		addF(FT_BOX, 1, cx - w, cz - w, cx + w, cz + w, 0.0f, hh, tone * 0.95f, tone, tone * 1.08f);
+	}
 
 	// ground outside the city, in 40 m tiles (fog is computed per vertex, so big quads would look washed out).
 	// East of the city is Lake Michigan.
-	const float T = 40.0f, GE = 320.0f, GF = 1200.0f;
+	const float T = 40.0f, GE = 480.0f, GF = 1800.0f;
 	for (float x = -GE; x < GE - 0.1f; x += T) {
 		for (float z = -GE; z < GE - 0.1f; z += T) {
 			float cx = x + T * 0.5f, cz = z + T * 0.5f;
@@ -474,47 +1632,44 @@ static void buildCity(void) {
 		float e0[3] = {GE, 0, -GE}, e1[3] = {GF, 0, -GE}, e2[3] = {GF, 0, GE}, e3[3] = {GE, 0, GE};
 		quad(e0, e3, e2, e1, 0.12f, 0.30f, 0.50f);
 	}
-	// asphalt, in 20 m pieces for the same reason
-	for (int k = 0; k < ROADS; k++) {
-		float c0 = ROAD_C(k);
-		for (float s = -ROAD_END; s < ROAD_END - 0.1f; s += 20.0f) {
-			float v0[3] = {c0 - ROAD_HW, 0.02f, s}, v1[3] = {c0 + ROAD_HW, 0.02f, s};
-			float v2[3] = {c0 + ROAD_HW, 0.02f, s + 20.0f}, v3[3] = {c0 - ROAD_HW, 0.02f, s + 20.0f};
-			quad(v0, v3, v2, v1, 0.17f, 0.18f, 0.20f);
-			float h0[3] = {s, 0.02f, c0 - ROAD_HW}, h1[3] = {s, 0.02f, c0 + ROAD_HW};
-			float h2[3] = {s + 20.0f, 0.02f, c0 + ROAD_HW}, h3[3] = {s + 20.0f, 0.02f, c0 - ROAD_HW};
-			quad(h0, h3, h2, h1, 0.17f, 0.18f, 0.20f);
-		}
-	}
-
-	// distant skyline ring (never reachable, heavily fogged); none over the lake
-	for (int i = 0; i < 56; i++) {
-		unsigned h = hash2(i, 31337);
-		float ang = (float)i * 6.2832f / 56.0f + (float)(h & 15) * 0.004f;
-		float rad = 235.0f + (float)((h >> 4) % 60);
-		float w   = 9.0f + (float)((h >> 10) % 11);
-		float hh  = 25.0f + (float)((h >> 14) % 85);
-		float cx = sinf(ang) * rad, cz = cosf(ang) * rad;
-		if (cx > 150.0f) continue;
-		float tone = 0.42f + (float)((h >> 20) % 20) / 100.0f;
-		addBoxG(cx - w, cz - w, cx + w, cz + w, 0.0f, hh, tone * 0.95f, tone, tone * 1.08f, 0.5f, 1.0f);
-	}
 	globalEnd = vcount;
 
-	// per district: sidewalks and lots, roofs, trees, road markings, crossings, signal poles
+	// which district every item belongs to
+	static unsigned char pCell[MAX_PATCH], bCell[MAX_BLD], fCell[MAX_FEAT];
+	for (int n = 0; n < nPatch; n++) pCell[n] = (unsigned char)cellOf((patch[n].x0 + patch[n].x1) * 0.5f, (patch[n].z0 + patch[n].z1) * 0.5f);
+	for (int n = 0; n < nBld; n++)   bCell[n] = (unsigned char)cellOf((bldg[n].x0 + bldg[n].x1) * 0.5f, (bldg[n].z0 + bldg[n].z1) * 0.5f);
+	for (int n = 0; n < nFeat; n++)  fCell[n] = (unsigned char)cellOf((feat[n].x0 + feat[n].x1) * 0.5f, (feat[n].z0 + feat[n].z1) * 0.5f);
+
+	// per district: asphalt, sidewalks and lots, roofs, trees, small features, road markings, crossings, signal poles
 	for (int c = 0; c < CELLS; c++) {
 		cellAStart[c] = vcount;
+		for (int k = 0; k < ROADS; k++) { // asphalt, in 20 m pieces for the same reason
+			float c0 = ROAD_C(k);
+			for (float s = -ROAD_END; s < ROAD_END - 0.1f; s += 20.0f) {
+				if (cellOf(c0, s + 10.0f) == c) {
+					float v0[3] = {c0 - ROAD_HW, 0.02f, s}, v1[3] = {c0 + ROAD_HW, 0.02f, s};
+					float v2[3] = {c0 + ROAD_HW, 0.02f, s + 20.0f}, v3[3] = {c0 - ROAD_HW, 0.02f, s + 20.0f};
+					quad(v0, v3, v2, v1, 0.17f, 0.18f, 0.20f);
+				}
+				if (cellOf(s + 10.0f, c0) == c) {
+					float h0[3] = {s, 0.02f, c0 - ROAD_HW}, h1[3] = {s, 0.02f, c0 + ROAD_HW};
+					float h2[3] = {s + 20.0f, 0.02f, c0 + ROAD_HW}, h3[3] = {s + 20.0f, 0.02f, c0 - ROAD_HW};
+					quad(h0, h3, h2, h1, 0.17f, 0.18f, 0.20f);
+				}
+			}
+		}
 		for (int n = 0; n < nPatch; n++) {
+			if (pCell[n] != c) continue;
 			const Patch* p = &patch[n];
-			if (cellOf((p->x0 + p->x1) * 0.5f, (p->z0 + p->z1) * 0.5f) != c) continue;
 			float s0[3] = {p->x0, p->y, p->z0}, s1[3] = {p->x1, p->y, p->z0};
 			float s2[3] = {p->x1, p->y, p->z1}, s3[3] = {p->x0, p->y, p->z1};
 			quad(s0, s3, s2, s1, p->r, p->g, p->b);
 		}
 		for (int n = 0; n < nBld; n++) {
+			if (bCell[n] != c) continue;
 			const Building* b = &bldg[n];
 			float cx = (b->x0 + b->x1) * 0.5f, cz = (b->z0 + b->z1) * 0.5f;
-			if (cellOf(cx, cz) != c) continue;
+			if (b->kind == 3) continue; // collision only
 			if (b->kind == 1) { addTreeGeom(b); continue; }
 			if (b->kind == 2) { // fountain: basin with a spout
 				addBoxY(b->x0, b->z0, b->x1, b->z1, 0.0f, b->h, b->r, b->g, b->b);
@@ -538,9 +1693,10 @@ static void buildCity(void) {
 				addBoxG(cx - 0.18f, cz - 0.18f, cx + 0.18f, cz + 0.18f, b->h + 1.0f, b->h + 1.0f + ah, 0.30f, 0.30f, 0.33f, 0.9f, 1.0f);
 			}
 		}
+		for (int n = 0; n < nFeat; n++) if (fCell[n] == c) emitFeat(&feat[n]);
 		for (int k = 0; k < ROADS; k++) {
 			float c0 = ROAD_C(k);
-			for (float s = -CITY_H; s < CITY_H; s += 7.0f) {
+			for (float s = -CITY_H; s < CITY_H; s += 8.0f) {
 				float m = s + 1.5f;
 				int skip = 0;
 				for (int q = 0; q < ROADS; q++) if (fabsf(m - ROAD_C(q)) < XW + 2.2f) skip = 1;
@@ -595,13 +1751,14 @@ static void buildCity(void) {
 		cellWStart[c] = vcount;
 		for (int n = 0; n < nBld; n++) {
 			const Building* b = &bldg[n];
-			if (b->kind != 0) continue;
-			if (cellOf((b->x0 + b->x1) * 0.5f, (b->z0 + b->z1) * 0.5f) != c) continue;
+			if (b->kind != 0 || bCell[n] != c) continue;
 			addWalls(b->x0, b->z0, b->x1, b->z1, b->h, b->r, b->g, b->b, b->uo, b->vo);
 		}
 		cellWCount[c] = vcount - cellWStart[c];
 	}
 	wallEnd = vcount;
+	buildRooms();
+	buildBuckets();
 }
 
 // ---- audio ------------------------------------------------------------------
@@ -615,11 +1772,15 @@ static void buildCity(void) {
 enum { SFX_PISTOL, SFX_SMG, SFX_SHOTGUN, SFX_ROCKET, SFX_EXPLODE, SFX_HIT, SFX_CLICK, SFX_SWITCH,
        SFX_PICKUP, SFX_HORN, SFX_STEP, SFX_SIREN, SFX_BEEP, SFX_GO, SFX_HURT, SFX_LEVEL, SFX_HEAL, SFX_COUNT };
 typedef struct { s16* data; int n; } Snd;
-static Snd sfx[SFX_COUNT], ambSnd[4]; // ambience: 0 city, 1 rain, 2 night crickets, 3 daytime birds
+// ambience loops: 0 city traffic, 1 rain, 2 night crickets, 3 daytime birds, 4 industrial hum, 5 tunnel drone,
+// 6 expressway roar, 7 train rumble, 8 room tone. Channels: 1..4 for the first four, 14..18 for the rest.
+#define AMB_COUNT 9
+#define AMB_CH(i) ((i) < 4 ? 1 + (i) : 10 + (i))
+static Snd sfx[SFX_COUNT], ambSnd[AMB_COUNT];
 static int sndOK = 0;
-static ndspWaveBuf sfxWB[8], ambWB[4];
+static ndspWaveBuf sfxWB[8], ambWB[AMB_COUNT];
 static int sfxNext = 0;
-static float ambSet[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
+static float ambSet[AMB_COUNT] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
 
 static float nrand(unsigned* st) {
 	*st = *st * 1664525u + 1013904223u;
@@ -754,6 +1915,32 @@ static Snd synthLoop(int kind, int seconds) {
 				v += 0.10f * e * sinf(2.0f * PI_F * (4300.0f + 380.0f * (float)k) * t);
 			}
 			v += 0.03f * lp2;
+		} else if (kind == 4) { // industrial hum: mains hum, a distant machine pulse, the odd clank
+			float am = 0.7f + 0.3f * sinf(2.0f * PI_F * 0.5f * t);
+			float pulse = powf(fmaxf(0.0f, sinf(2.0f * PI_F * 2.0f * t)), 6.0f);
+			float cl1 = expf(-fmodf(t + 0.0f, 4.0f) * 0.0f), clank = 0.0f;
+			(void)cl1;
+			float tc = t - 0.9f, td = t - 2.7f;
+			if (tc > 0.0f) clank += expf(-tc * 9.0f) * (sinf(2.0f * PI_F * 520.0f * tc) + 0.6f * sinf(2.0f * PI_F * 1130.0f * tc));
+			if (td > 0.0f) clank += 0.7f * expf(-td * 12.0f) * (sinf(2.0f * PI_F * 410.0f * td) + 0.5f * sinf(2.0f * PI_F * 980.0f * td));
+			v = am * (0.07f * sinf(2.0f * PI_F * 60.0f * t) + 0.05f * sinf(2.0f * PI_F * 120.0f * t) + 0.03f * sinf(2.0f * PI_F * 180.0f * t))
+			    + 0.5f * lp2 + 0.10f * pulse * sinf(2.0f * PI_F * 70.0f * t) + 0.07f * clank;
+		} else if (kind == 5) { // tunnel / underpass: low rumble, slow beating, water drips
+			float beat = 0.6f + 0.4f * sinf(2.0f * PI_F * 0.37f * t);
+			float drip = 0.0f, t1 = t - 1.2f, t2 = t - 3.1f;
+			if (t1 > 0.0f) drip += expf(-t1 * 22.0f) * sinf(2.0f * PI_F * 1750.0f * t1);
+			if (t2 > 0.0f) drip += 0.8f * expf(-t2 * 22.0f) * sinf(2.0f * PI_F * 1450.0f * t2);
+			v = beat * (0.09f * sinf(2.0f * PI_F * 38.0f * t) + 0.06f * sinf(2.0f * PI_F * 57.0f * t)) + 1.4f * b * 0.6f + 0.06f * drip;
+		} else if (kind == 6) { // expressway: wide-band roar with cars passing over the joints
+			float pass = expf(-powf((t - 0.7f) / 0.30f, 2.0f)) + 0.8f * expf(-powf((t - 1.9f) / 0.35f, 2.0f)) + 0.9f * expf(-powf((t - 3.0f) / 0.28f, 2.0f));
+			float thump = powf(fmaxf(0.0f, sinf(2.0f * PI_F * 3.0f * t)), 12.0f);
+			v = b * 1.5f + 0.35f * pass * (lp * 0.7f + lp2 * 2.5f) + 0.12f * thump * sinf(2.0f * PI_F * 48.0f * t);
+		} else if (kind == 7) { // train: rail clatter over a low rumble
+			float tau = fmodf(t, 0.25f), tau2 = fmodf(t + 0.0625f, 0.25f);
+			float clack = expf(-tau * 38.0f) * sinf(2.0f * PI_F * 900.0f * tau) + 0.7f * expf(-tau2 * 45.0f) * sinf(2.0f * PI_F * 1250.0f * tau2);
+			v = 0.16f * clack + 0.10f * sinf(2.0f * PI_F * 45.0f * t) + 0.6f * lp2 + 0.25f * b;
+		} else if (kind == 8) { // room tone: fridge hum and air
+			v = 0.05f * sinf(2.0f * PI_F * 50.0f * t) + 0.03f * sinf(2.0f * PI_F * 100.0f * t) + 0.25f * lp2;
 		} else { // birdsong over a little wind
 			for (int k = 0; k < 7; k++) {
 				float tau = t - birdT[k];
@@ -799,7 +1986,7 @@ static void ambSetVol(int i, float v) {
 	float mix[12];
 	memset(mix, 0, sizeof mix);
 	mix[0] = v; mix[1] = v;
-	ndspChnSetMix(1 + i, mix);
+	ndspChnSetMix(AMB_CH(i), mix);
 }
 
 // ---- title music streaming thread ----
@@ -985,18 +2172,18 @@ static void initAudio(void) {
 	if (R_FAILED(ndspInit())) { gMusicMode = 3; return; } // dspfirm.cdc missing: the whole game stays silent
 	sndOK = 1;
 	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
-	for (int ch = 0; ch < 14; ch++) {
+	for (int ch = 0; ch < 19; ch++) {
 		ndspChnReset(ch);
 		ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
 	}
 	ndspChnSetRate(0, (float)MUS_RATE);
 	ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
-	for (int ch = 1; ch < 14; ch++) {
+	for (int ch = 1; ch < 19; ch++) {
 		ndspChnSetRate(ch, (float)SFX_RATE);
 		ndspChnSetFormat(ch, NDSP_FORMAT_MONO_PCM16);
 	}
 	for (int i = 0; i < SFX_COUNT; i++) sfx[i] = synthSfx(i);
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < AMB_COUNT; i++) {
 		ambSnd[i] = synthLoop(i, 4);
 		if (!ambSnd[i].data) continue;
 		memset(&ambWB[i], 0, sizeof ambWB[i]);
@@ -1004,7 +2191,7 @@ static void initAudio(void) {
 		ambWB[i].nsamples = (u32)ambSnd[i].n;
 		ambWB[i].looping = true;
 		ambSetVol(i, 0.0f);
-		ndspChnWaveBufAdd(1 + i, &ambWB[i]);
+		ndspChnWaveBufAdd(AMB_CH(i), &ambWB[i]);
 	}
 	// the real title music if title.pcm can be found, otherwise the built-in theme
 	FILE* probe = openMusicFile();
@@ -1095,9 +2282,12 @@ static void updateCars(int frame, float px, float pz) {
 	}
 }
 
+static int roomBlocked(float x, float z, float r);
 static int blockedR(float x, float z, float r) {
-	for (int i = 0; i < nBld; i++) {
-		const Building* b = &bldg[i];
+	if (gRoom >= 0) return roomBlocked(x, z, r);
+	int k = bkIdx(z) * BK_N + bkIdx(x);       // every building within 2 m of this cell is listed in it
+	for (int q = bkStart[k]; q < bkStart[k + 1]; q++) {
+		const Building* b = &bldg[bkList[q]];
 		if (x > b->x0 - r && x < b->x1 + r && z > b->z0 - r && z < b->z1 + r) return 1;
 	}
 	float lim = CITY_H + 20.0f;
@@ -1471,8 +2661,8 @@ static int   gPlRun = 0;
 static int   gKills = 0, gLevel = 0, gTime = 0, gBanner = 0;
 
 // ---- navigation grid (A* for the computer-controlled fighters) -------------------------------
-#define NAV_C 2.0f
-#define NAV_N 168
+#define NAV_C 2.25f
+#define NAV_N 256
 #define NAV_H (NAV_N * NAV_C * 0.5f)
 static u8  navOpen[NAV_N * NAV_N];
 static u16 navG[NAV_N * NAV_N], navStamp[NAV_N * NAV_N];
@@ -1673,10 +2863,14 @@ static void drawPlayer(float px, float pz, float face, float phase, float moveAm
 	// legs
 	addPart(-0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f,  s, 0.13f, 0.15f, 0.28f);
 	addPart( 0.15f, 0.90f, 0.0f, 0.0f, -0.45f, 0.0f, 0.09f, 0.45f, 0.10f, -s, 0.13f, 0.15f, 0.28f);
-	// torso (dark jacket), head, cap
-	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, 0.10f, 0.10f, 0.12f);
+	// torso (jacket), head, cap
+	const float* jk = kJacketClr[gJacketIx];
+	const float cap0 = gCap ? 0.12f : 0.08f, cap1 = gCap ? 0.28f : 0.08f, cap2 = gCap ? 0.70f : 0.09f;
+	addPart(0.0f, 0.90f, 0.0f, 0.0f, 0.36f, 0.0f, 0.27f, 0.36f, 0.14f, 0.0f, jk[0], jk[1], jk[2]);
 	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.00f, 0.0f, 0.13f, 0.14f, 0.13f, 0.0f, 0.85f, 0.66f, 0.52f);
-	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.14f, -0.02f, 0.15f, 0.05f, 0.16f, 0.0f, 0.08f, 0.08f, 0.09f);
+	addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.14f, -0.02f, 0.15f, 0.05f, 0.16f, 0.0f, cap0, cap1, cap2);
+	if (gCap) addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.11f, -0.18f, 0.11f, 0.015f, 0.06f, 0.0f, 0.85f, 0.15f, 0.15f);
+	if (gShades) addPart(0.0f, 1.62f, 0.0f, 0.0f, 0.03f, -0.13f, 0.115f, 0.028f, 0.012f, 0.0f, 0.03f, 0.03f, 0.04f);
 
 	int armed = (curWeapon != WP_FISTS) && phoneE < 0.05f;
 	float lSwing = -s * 0.9f;
@@ -1685,8 +2879,8 @@ static void drawPlayer(float px, float pz, float face, float phase, float moveAm
 		rSwing = 0.35f + (1.55f - 0.35f) * aim + recoilAnim * 0.25f;
 		lSwing = 0.25f + 1.20f * aim;
 	}
-	addPart(-0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, lSwing, 0.10f, 0.10f, 0.12f);
-	addPart( 0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, rSwing, 0.10f, 0.10f, 0.12f);
+	addPart(-0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, lSwing, jk[0], jk[1], jk[2]);
+	addPart( 0.36f, 1.50f, 0.0f, 0.0f, -0.30f, 0.0f, 0.07f, 0.30f, 0.07f, rSwing, jk[0], jk[1], jk[2]);
 	if (armed) {
 		const WDef* w = &wdef[curWeapon];
 		addPart(0.36f, 1.50f, 0.0f, 0.0f, -0.58f - w->len * 0.35f, 0.0f, w->thick * 0.5f, w->len * 0.5f, w->thick * 0.9f,
@@ -1791,10 +2985,15 @@ static float castRay(const float o[3], const float d[3], float maxT, int* ped) {
 		float t = -o[1] / d[1];
 		if (t > 0.0f && t < best) best = t;
 	}
-	for (int i = 0; i < nBld; i++) {
-		const Building* b = &bldg[i];
-		float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
-		if (t >= 0.0f && t < best) best = t;
+	if (gRoom < 0) {
+		static unsigned short ids[MAX_BLD];
+		float ex = o[0] + d[0] * best, ez = o[2] + d[2] * best;
+		int nIds = bkGather(fminf(o[0], ex), fminf(o[2], ez), fmaxf(o[0], ex), fmaxf(o[2], ez), ids, MAX_BLD);
+		for (int q = 0; q < nIds; q++) {
+			const Building* b = &bldg[ids[q]];
+			float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
+			if (t >= 0.0f && t < best) best = t;
+		}
 	}
 	for (int i = 0; i < NCARS; i++) {
 		const Car* c = &cars[i];
@@ -2092,8 +3291,10 @@ static int losClear(float ax, float az, float bx, float bz) {
 	if (L < 0.5f) return 1;
 	float o[3] = {ax, 1.3f, az}, d[3] = {dx / L, 0.0f, dz / L};
 	float x0 = fminf(ax, bx) - 1.0f, x1 = fmaxf(ax, bx) + 1.0f, z0 = fminf(az, bz) - 1.0f, z1 = fmaxf(az, bz) + 1.0f;
-	for (int i = 0; i < nBld; i++) {
-		const Building* b = &bldg[i];
+	static unsigned short ids[MAX_BLD];
+	int nIds = bkGather(x0, z0, x1, z1, ids, MAX_BLD);
+	for (int q = 0; q < nIds; q++) {
+		const Building* b = &bldg[ids[q]];
 		if (b->x1 < x0 || b->x0 > x1 || b->z1 < z0 || b->z0 > z1) continue;
 		float t = rayBox(o, d, b->x0, 0.0f, b->z0, b->x1, b->h, b->z1);
 		if (t >= 0.0f && t < L) return 0;
@@ -2104,7 +3305,8 @@ static int losClear(float ax, float az, float bx, float bz) {
 // A random open spot on the street grid, optionally far from / hidden from a point.
 static int pickSpot(float* ox, float* oz, float fx, float fz, float minD, float maxD, int hidden) {
 	for (int k = 0; k < 120; k++) {
-		float x = rnd() * (CITY_H - 6.0f), z = rnd() * (CITY_H - 6.0f);
+		float spotR = gMode == M_FREE ? CITY_H - 6.0f : 215.0f; // the modes are played in the middle of the city
+		float x = rnd() * spotR, z = rnd() * spotR;
 		if (!navIsOpen(x, z) || !navIsOpen(x + 2.0f, z) || !navIsOpen(x - 2.0f, z) || !navIsOpen(x, z + 2.0f) || !navIsOpen(x, z - 2.0f)) continue;
 		float d = sqrtf((x - fx) * (x - fx) + (z - fz) * (z - fz));
 		if (d < minD || d > maxD) continue;
@@ -2112,7 +3314,7 @@ static int pickSpot(float* ox, float* oz, float fx, float fz, float minD, float 
 		*ox = x; *oz = z;
 		return 1;
 	}
-	*ox = ROAD_C((int)(rnd01() * 6.99f)); *oz = ROAD_C((int)(rnd01() * 6.99f)); // any junction
+	*ox = ROAD_C(4 + (int)(rnd01() * 4.99f)); *oz = ROAD_C(4 + (int)(rnd01() * 4.99f)); // any central junction
 	return 0;
 }
 
@@ -2735,7 +3937,9 @@ static void restoreUserSettings(void) {
 	if (gHasSaved) { weather = gSavedWeather; camStyle = gSavedCam; gHasSaved = 0; }
 }
 
+static void worldReset(void);
 static void setupMode(int mode) {
+	worldReset();
 	restoreUserSettings();
 	gRng ^= (unsigned)osGetTime() * 2654435761u;
 	gMode = mode; gState = GS_COUNTDOWN; gCount = 239; gGo = 0; gOverT = 0; gWon = 0; gDraw = 0; gPlace = 0;
@@ -2801,6 +4005,7 @@ static void setupMode(int mode) {
 }
 
 static void exitMode(void) { // back to the menus: everything returns to Free Roam defaults
+	worldReset();
 	restoreUserSettings();
 	gMode = M_FREE; gState = GS_PLAY; gTraffic = 1; gCratesOn = 1;
 	memset(bots, 0, sizeof bots);
@@ -2862,6 +4067,588 @@ static void updateMode(float px, float pz, int moving) {
 		}
 		if (gState == GS_PLAY && botsAlive() == 0) { gState = GS_OVER; gOverT = 0; gWon = 1; gPlace = 1; }
 	}
+}
+
+// ============================================================================================================
+// WORLD SYSTEMS (Free Roam): districts, cash, doors and interiors, shops, the L train, wildlife
+// ============================================================================================================
+
+// ---- districts -------------------------------------------------------------------------------------------
+enum { Z_DOWNTOWN, Z_RES, Z_MIXED, Z_COMM, Z_IND, Z_DOCK, Z_PARK, Z_LOT, Z_RAIL, Z_FWY, Z_N };
+static int blockOfV(float v) { int i = (int)floorf((v + CITY_H) / ROAD_SP); return i < 0 ? 0 : (i > GRID - 1 ? GRID - 1 : i); }
+static int zoneAt(float x, float z) {
+	int i = blockOfV(x), j = blockOfV(z);
+	int t = blkType[i][j];
+	float dt = dtFactor(BLK_C(i), BLK_C(j));
+	switch (t) {
+	case BT_TOWER: return Z_DOWNTOWN;
+	case BT_MID: case BT_PLAZA: return dt > 0.45f ? Z_DOWNTOWN : (t == BT_PLAZA ? Z_PARK : Z_COMM);
+	case BT_LOW: return dt > 0.45f ? Z_DOWNTOWN : Z_RES;
+	case BT_HOUSES: return Z_RES;
+	case BT_MIXED: return Z_MIXED;
+	case BT_COMM: return Z_COMM;
+	case BT_INDUS: return Z_IND;
+	case BT_DOCK: return Z_DOCK;
+	case BT_PARK: case BT_COURT: return Z_PARK;
+	case BT_LOT: return Z_LOT;
+	case BT_RAIL: return Z_RAIL;
+	default: return Z_FWY;
+	}
+}
+// 7 x 7 neighbourhood names, north to south and west to east (each is a 2 x 2 block district)
+static const char* const kHood[CN][CN] = {
+	{"Albany Park",     "Ravenswood",        "Lincoln Square",   "Andersonville", "Uptown",       "Lakeview",      "Wrigleyville"},
+	{"Irving Park",     "Roscoe Village",    "North Center",     "Lincoln Park",  "Old Town",     "Gold Coast",    "Lakefront Trail"},
+	{"Logan Square",    "Bucktown",          "Wicker Park",      "River West",    "River North",  "Streeterville", "Navy Pier"},
+	{"Humboldt Park",   "Ukrainian Village", "West Town",        "West Loop",     "The Loop",     "Millennium Park", "Grant Park"},
+	{"Garfield Park",   "Little Italy",      "Pilsen",           "South Loop",    "Chinatown",    "Museum Campus", "Lakefront Trail"},
+	{"Back of the Yards", "Bridgeport",      "McKinley Park",    "Stockyards",    "Canal Basin",  "Calumet Docks", "South Harbor"},
+	{"Brighton Park",   "Archer Heights",    "Pullman Yards",    "Fulton Yards",  "Rail Yards",   "Steel Docks",   "Harbor Piers"}
+};
+static const char* hoodAt(float x, float z) {
+	int ix = (int)floorf((x + CITY_H) / CELL_W), iz = (int)floorf((z + CITY_H) / CELL_W);
+	ix = ix < 0 ? 0 : (ix > CN - 1 ? CN - 1 : ix);
+	iz = iz < 0 ? 0 : (iz > CN - 1 ? CN - 1 : iz);
+	return kHood[iz][ix];
+}
+static const char* const kZoneName[Z_N] = {"DOWNTOWN", "RESIDENTIAL", "MIXED USE", "COMMERCIAL", "INDUSTRIAL", "DOCKS", "PARK", "VACANT LOTS", "RAIL LINE", "EXPRESSWAY"};
+
+// ---- the L train: runs along the elevated line, stops at both stations -------------------------------------
+#define TRAIN_CARS 6
+#define TCAR_L     9.0f
+static float trX = -300.0f, trV = 0.0f;
+static int   trDir = 1, trDwell = 0, trAt = -1;
+static void updateTrain(void) {
+	if (trDwell > 0) { trDwell--; trV = 0.0f; return; }
+	float want = 0.55f;
+	for (int s = 0; s < 2; s++) {
+		float sx = BLK_C(kStationI[s]), d = (sx - trX) * (float)trDir;
+		if (trAt == s) { if (d < -30.0f) trAt = -1; continue; }
+		if (d >= 0.0f && d < 130.0f) {
+			float lim = sqrtf(2.0f * 0.0042f * d) + 0.05f;
+			if (lim < want) want = lim;
+			if (d < 0.4f) { trDwell = 420; trV = 0.0f; trAt = s; trX = sx; return; }
+		}
+	}
+	trV += (want - trV) * 0.03f;
+	trX += trV * (float)trDir;
+	if (trX > 430.0f) { trDir = -1; trAt = -1; }
+	if (trX < -430.0f) { trDir = 1; trAt = -1; }
+}
+// one car: body, window band, stripe, roof and bogies. (xc, zc) = centre, y0 = top of the rails
+static void drawTrainCar(float xc, float zc, float y0, int front, int rear, int dir) {
+	const float hl = TCAR_L * 0.5f - 0.2f, hw = 1.35f;
+	addBoxG(xc - hl, zc - hw, xc + hl, zc + hw, y0 + 0.55f, y0 + 3.1f, 0.74f, 0.76f, 0.80f, 0.80f, 1.0f);
+	addBoxY(xc - hl + 0.5f, zc - hw - 0.03f, xc + hl - 0.5f, zc + hw + 0.03f, y0 + 1.55f, y0 + 2.45f, 0.10f, 0.14f, 0.20f);
+	addBoxY(xc - hl, zc - hw - 0.04f, xc + hl, zc + hw + 0.04f, y0 + 0.95f, y0 + 1.25f, 0.10f, 0.32f, 0.70f);
+	addBoxY(xc - hl + 0.2f, zc - hw + 0.3f, xc + hl - 0.2f, zc + hw - 0.3f, y0 + 3.1f, y0 + 3.3f, 0.52f, 0.54f, 0.58f);
+	addBoxY(xc - 3.0f, zc - 0.9f, xc - 1.8f, zc + 0.9f, y0 + 0.1f, y0 + 0.55f, 0.12f, 0.12f, 0.14f);
+	addBoxY(xc + 1.8f, zc - 0.9f, xc + 3.0f, zc + 0.9f, y0 + 0.1f, y0 + 0.55f, 0.12f, 0.12f, 0.14f);
+	(void)front; (void)rear; (void)dir;
+}
+static void drawTrain(void) {
+	for (int i = 0; i < TRAIN_CARS; i++) {
+		float xc = trX + ((float)i - ((float)TRAIN_CARS - 1.0f) * 0.5f) * (TCAR_L + 0.5f);
+		if (!inView(xc, TRK_Z)) continue;
+		drawTrainCar(xc, TRK_Z, RAIL_H + 0.09f, 0, 0, trDir);
+	}
+}
+static void drawTrainLit(float night) {
+	float xf = trX + (float)trDir * (((float)TRAIN_CARS) * 0.5f * (TCAR_L + 0.5f) - 0.2f), xr = trX - (float)trDir * (((float)TRAIN_CARS) * 0.5f * (TCAR_L + 0.5f) - 0.2f);
+	float y = RAIL_H + 0.09f;
+	if (inView(xf, TRK_Z)) for (int s = -1; s <= 1; s += 2) addBoxY(xf - 0.1f, TRK_Z + (float)s * 0.8f - 0.2f, xf + 0.1f, TRK_Z + (float)s * 0.8f + 0.2f, y + 0.9f, y + 1.3f, 1.0f, 0.95f, 0.75f);
+	if (inView(xr, TRK_Z)) for (int s = -1; s <= 1; s += 2) addBoxY(xr - 0.1f, TRK_Z + (float)s * 0.8f - 0.2f, xr + 0.1f, TRK_Z + (float)s * 0.8f + 0.2f, y + 0.9f, y + 1.3f, 0.9f, 0.1f, 0.08f);
+	if (night > 0.25f) // lit windows
+		for (int i = 0; i < TRAIN_CARS; i++) {
+			float xc = trX + ((float)i - ((float)TRAIN_CARS - 1.0f) * 0.5f) * (TCAR_L + 0.5f);
+			if (!inView(xc, TRK_Z)) continue;
+			addBoxY(xc - 3.9f, TRK_Z - 1.40f, xc + 3.9f, TRK_Z + 1.40f, y + 1.65f, y + 2.35f, 1.0f, 0.92f, 0.62f);
+		}
+}
+
+// ---- the train in the station hall: arrives, waits at the platform, leaves ------------------------------------
+static int stT = 0;
+static float stTrainOff(void) { // x offset of the train centre relative to the hall centre
+	int t = stT % 1700;
+	if (t < 380) { float u = 1.0f - (float)t / 380.0f; return 80.0f * u * u; }
+	if (t < 1000) return 0.0f;
+	if (t < 1380) { float u = (float)(t - 1000) / 380.0f; return -80.0f * u * u; }
+	return 400.0f;
+}
+static void drawStationTrain(void) {
+	const float cx = RM_X(RM_STATION), off = stTrainOff();
+	for (int i = 0; i < TRAIN_CARS; i++) {
+		float xc = cx + off + ((float)i - ((float)TRAIN_CARS - 1.0f) * 0.5f) * (TCAR_L + 0.5f);
+		if (xc < cx - 16.0f || xc > cx + 16.0f) continue;
+		drawTrainCar(xc, -8.45f, -0.75f, 0, 0, 1);
+	}
+}
+
+// ---- cash on the street ---------------------------------------------------------------------------------------
+#define N_CASH 44
+typedef struct { float x, z; int val, active, respawn; } CashP;
+static CashP cashP[N_CASH];
+static int   wareGot[6];
+static float gTeleX = 0.0f, gTeleZ = 0.0f, gTeleYaw = 0.0f;
+static int   gTele = 0;
+
+static void initCash(void) {
+	memset(cashP, 0, sizeof cashP);
+	for (int i = 0; i < N_CASH; i++) {
+		unsigned h = hash2(i, 6161);
+		int road = (int)((h >> 3) % ROADS), axis = (int)((h >> 7) & 1);
+		float side = ((h >> 8) & 1) ? 1.0f : -1.0f;
+		float s = -CITY_H + 30.0f + (float)((h >> 12) % (unsigned)(2.0f * CITY_H - 60.0f));
+		float lat = ROAD_C(road) + side * (SW_OFF + 0.2f);
+		for (int tries = 0; tries < 10; tries++) {
+			float x = axis ? lat : s, z = axis ? s : lat;
+			if (!blockedR(x, z, 0.5f) && fabsf(x) < CITY_H - 4.0f && fabsf(z) < CITY_H - 4.0f) { cashP[i].x = x; cashP[i].z = z; cashP[i].active = 1; break; }
+			s += 1.7f;
+		}
+		cashP[i].val = ((h >> 20) % 5 == 0) ? 20 : (((h >> 20) % 5 < 3) ? 5 : 10);
+	}
+}
+
+// ---- appearance bought in shops --------------------------------------------------------------------------------
+
+// ---- shops ---------------------------------------------------------------------------------------------------------
+enum { IK_BOOST, IK_AMMO, IK_SHADES, IK_CAP, IK_JACKET, IK_REST, IK_TICKET };
+typedef struct { const char* name; int price, kind, a, b; } ShopItem;
+static const ShopItem shopStore[]   = {{"ENERGY DRINK", 4, IK_BOOST, 90, 0}, {"CHIPS", 2, IK_BOOST, 30, 0}, {"CHICAGO CAP", 12, IK_CAP, 0, 0}, {"SUNGLASSES", 15, IK_SHADES, 0, 0}};
+static const ShopItem shopDiner[]   = {{"COFFEE", 3, IK_BOOST, 60, 0}, {"MILKSHAKE", 5, IK_BOOST, 100, 0}, {"DEEP DISH SLICE", 7, IK_BOOST, 130, 0}, {"CHEESEBURGER", 8, IK_BOOST, 160, 0}};
+static const ShopItem shopLaundry[] = {{"RED JACKET", 6, IK_JACKET, 1, 0}, {"BLUE JACKET", 6, IK_JACKET, 2, 0}, {"GREEN JACKET", 6, IK_JACKET, 3, 0}, {"BLACK JACKET", 6, IK_JACKET, 0, 0}};
+static const ShopItem shopApt[]     = {{"SLEEP UNTIL MORNING", 0, IK_REST, W_SUNNY, 0}, {"SLEEP UNTIL SUNSET", 0, IK_REST, W_SUNSET, 0}, {"SLEEP UNTIL NIGHT", 0, IK_REST, W_NIGHT, 0}};
+static const ShopItem shopWare[]    = {{"PISTOL AMMO x24", 8, IK_AMMO, WP_PISTOL, 24}, {"SMG AMMO x60", 15, IK_AMMO, WP_SMG, 60}, {"SHOTGUN SHELLS x8", 12, IK_AMMO, WP_SHOTGUN, 8}, {"ROCKETS x2", 25, IK_AMMO, WP_ROCKET, 2}};
+static const ShopItem shopStation[] = {{"TICKET TO OTHER STATION", 5, IK_TICKET, 0, 0}};
+static const ShopItem* shopItems(int room, int* n) {
+	switch (room) {
+	case RM_STORE:   *n = 4; return shopStore;
+	case RM_DINER:   *n = 4; return shopDiner;
+	case RM_LAUNDRY: *n = 4; return shopLaundry;
+	case RM_APT:     *n = 3; return shopApt;
+	case RM_WARE:    *n = 4; return shopWare;
+	default:         *n = 1; return shopStation;
+	}
+}
+static const char* const kServiceTxt[RM_N] = {"TALK TO THE CLERK", "ORDER FOOD", "WASH & FOLD", "USE THE BED", "VISIT THE DEALER", "TICKET MACHINE"};
+
+static int   gCash = 40;
+static int   gBoost = 0;                       // frames of speed boost left
+static int   gShop = -1, gShopSel = 0, gShopMsgT = 0;
+static char  gShopMsg[48];
+static int   gTrans = 0, gTransAct = 0, gTransArg = 0;   // screen fade: at the midpoint the queued action runs
+enum { ACT_ENTER, ACT_EXIT, ACT_RIDE, ACT_REST };
+static int   gRetDoor = -1;                    // the door the player went in through
+static int   gPrompt = 0;                      // 0 none, 1 enter, 2 exit, 3 service
+static int   gPromptDoor = -1;
+static char  gPromptTxt[48];
+static const char* gZoneBanner = NULL;         // neighbourhood name shown for a moment when it changes
+static int   gZoneBannerT = 0;
+static Ped   keeperPed[RM_N];
+static const char* const kKeeperName[RM_N] = {"CLERK", "COOK", "ATTENDANT", "", "DEALER", ""};
+
+static void shopSay(const char* s) { snprintf(gShopMsg, sizeof gShopMsg, "%s", s); gShopMsgT = 150; }
+
+static void startTrans(int act, int arg) { if (gTrans > 0) return; gTrans = 26; gTransAct = act; gTransArg = arg; }
+
+static void shopBuy(int room, int idx) {
+	int n;
+	const ShopItem* it = &shopItems(room, &n)[idx];
+	char b[48];
+	if (gCash < it->price) { shopSay("NOT ENOUGH CASH"); playSfx(SFX_CLICK, 0.6f); return; }
+	switch (it->kind) {
+	case IK_BOOST:
+		gBoost += it->a * 60; if (gBoost > 400 * 60) gBoost = 400 * 60;
+		snprintf(b, sizeof b, "SPEED BOOST +%ds", it->a); break;
+	case IK_AMMO:
+		if (ammo[it->a] >= 999) { shopSay("AMMO ALREADY FULL"); return; }
+		ammo[it->a] += it->b; if (ammo[it->a] > 999) ammo[it->a] = 999;
+		snprintf(b, sizeof b, "+%d %s AMMO", it->b, wdef[it->a].name); break;
+	case IK_SHADES:
+		if (gShades) { shopSay("YOU ALREADY OWN THESE"); return; }
+		gShades = 1; snprintf(b, sizeof b, "NICE SHADES!"); break;
+	case IK_CAP:
+		if (gCap) { shopSay("YOU ALREADY OWN THIS"); return; }
+		gCap = 1; snprintf(b, sizeof b, "CHICAGO CAP ON"); break;
+	case IK_JACKET:
+		if (gJacketIx == it->a) { shopSay("ALREADY WEARING THAT"); return; }
+		gJacketIx = it->a; snprintf(b, sizeof b, "FRESH JACKET"); break;
+	case IK_REST:
+		weather = it->a; gShop = -1; startTrans(ACT_REST, it->a);
+		snprintf(b, sizeof b, "%s", it->a == W_SUNNY ? "GOOD MORNING" : (it->a == W_SUNSET ? "SUNSET" : "NIGHT FALLS"));
+		toast(b); return;
+	default: // ticket
+		gShop = -1; gCash -= it->price; startTrans(ACT_RIDE, 0);
+		snprintf(b, sizeof b, "TICKET  -$%d", it->price); toast(b); playSfx(SFX_PICKUP, 0.7f); return;
+	}
+	gCash -= it->price;
+	if (it->price > 0) { char c[48]; snprintf(c, sizeof c, "%s  -$%d", b, it->price); shopSay(c); } else shopSay(b);
+	playSfx(SFX_PICKUP, 0.7f);
+}
+
+// shop input: D-pad moves, A buys / leaves, B closes, touch picks a row
+static void shopListRect(int n, int i, float* y0, float* h) { (void)n; *y0 = 66.0f + 29.0f * (float)i; *h = 23.0f; }
+static void updateShop(u32 down, const touchPosition* tp) {
+	int n;
+	shopItems(gShop, &n);
+	int rows = n + 1, choose = (down & KEY_A) ? 1 : 0;
+	if (down & KEY_DDOWN) { gShopSel = (gShopSel + 1) % rows; playSfx(SFX_CLICK, 0.4f); }
+	if (down & KEY_DUP)   { gShopSel = (gShopSel + rows - 1) % rows; playSfx(SFX_CLICK, 0.4f); }
+	if (down & KEY_TOUCH) {
+		for (int i = 0; i < rows; i++) {
+			float y0, h;
+			shopListRect(rows, i, &y0, &h);
+			if (tp->px >= 50 && tp->px <= 270 && tp->py >= y0 && tp->py < y0 + h) { gShopSel = i; choose = 1; }
+		}
+	}
+	if (down & KEY_B) { gShop = -1; return; }
+	if (choose) { if (gShopSel >= n) { gShop = -1; playSfx(SFX_CLICK, 0.4f); } else shopBuy(gShop, gShopSel); }
+}
+
+static void roomEnterInit(int room) {
+	stT = 0;
+	if (room == RM_WARE) memset(wareGot, 0, sizeof wareGot);
+}
+
+// a free spot just outside a door (some doors have a bench, hydrant or planter right beside the exact spot)
+static void doorExitSpot(const Door* d, float* ox, float* oz) {
+	static const float ts[5] = {0.6f, 0.2f, 1.0f, 1.5f, 0.0f}, ls[5] = {0.0f, 0.6f, -0.6f, 1.2f, -1.2f};
+	for (int a = 0; a < 5; a++)
+		for (int b = 0; b < 5; b++) {
+			float x = d->x + d->fx * ts[a] - d->fz * ls[b], z = d->z + d->fz * ts[a] + d->fx * ls[b];
+			if (!blockedR(x, z, PLAYER_R)) { *ox = x; *oz = z; return; }
+		}
+	*ox = d->x; *oz = d->z;
+}
+
+// the world action that runs at the midpoint of a fade
+static void runTransAct(void) {
+	switch (gTransAct) {
+	case ACT_ENTER: {
+		const Door* d = &doors[gTransArg];
+		gRetDoor = gTransArg; gRoom = d->room; roomEnterInit(gRoom);
+		gTeleX = rooms[gRoom].spX; gTeleZ = rooms[gRoom].spZ; gTeleYaw = 0.0f; gTele = 1;
+		playSfx(SFX_SWITCH, 0.5f);
+		break;
+	}
+	case ACT_EXIT: {
+		const Door* d = &doors[gRetDoor >= 0 ? gRetDoor : 0];
+		gRoom = -1;
+		doorExitSpot(d, &gTeleX, &gTeleZ); gTeleYaw = atan2f(-d->fx, -d->fz); gTele = 1;
+		playSfx(SFX_SWITCH, 0.5f);
+		break;
+	}
+	case ACT_RIDE: { // the other station's front door
+		int other = -1;
+		for (int i = 0; i < nDoor; i++) if (doors[i].room == RM_STATION && i != gRetDoor) other = i;
+		if (other < 0) other = gRetDoor;
+		const Door* d = &doors[other >= 0 ? other : 0];
+		gRoom = -1; gRetDoor = -1;
+		doorExitSpot(d, &gTeleX, &gTeleZ); gTeleYaw = atan2f(-d->fx, -d->fz); gTele = 1;
+		playSfx(SFX_HORN, 0.3f);
+		break;
+	}
+	default: break; // ACT_REST: the weather was already set, the fade covers the change
+	}
+}
+
+static void worldReset(void) {
+	gRoom = -1; gShop = -1; gTrans = 0; gPrompt = 0; gRetDoor = -1; gTele = 0;
+}
+
+// the door / service prompt for the current position
+static void updatePrompt(float px, float pz) {
+	gPrompt = 0; gPromptDoor = -1;
+	if (gRoom < 0) {
+		float best = 2.1f * 2.1f;
+		for (int i = 0; i < nDoor; i++) {
+			float dx = doors[i].x - px, dz = doors[i].z - pz, d2 = dx * dx + dz * dz;
+			if (d2 < best) { best = d2; gPromptDoor = i; }
+		}
+		if (gPromptDoor >= 0) { gPrompt = 1; snprintf(gPromptTxt, sizeof gPromptTxt, "ENTER %s", roomName[doors[gPromptDoor].room]); }
+	} else {
+		const Room* m = &rooms[gRoom];
+		float ex = m->exX - px, ez = m->exZ - pz, ax = m->aX - px, az = m->aZ - pz;
+		if (ax * ax + az * az < 2.3f * 2.3f) { gPrompt = 3; snprintf(gPromptTxt, sizeof gPromptTxt, "%s", kServiceTxt[gRoom]); }
+		else if (ex * ex + ez * ez < 2.0f * 2.0f) { gPrompt = 2; snprintf(gPromptTxt, sizeof gPromptTxt, "LEAVE"); }
+	}
+}
+
+static void updateWorld(float px, float pz, u32 down, int canAct, int frame) {
+	(void)frame;
+	if (gBoost > 0) gBoost--;
+	if (gShopMsgT > 0) gShopMsgT--;
+	if (gZoneBannerT > 0) gZoneBannerT--;
+	// the fade between outside and inside
+	if (gTrans > 0) {
+		gTrans--;
+		if (gTrans == 13) runTransAct();
+		gPrompt = 0;
+		return;
+	}
+	if (gMode != M_FREE) { gPrompt = 0; return; }
+	if (gRoom < 0) {
+		static const char* lastHood = NULL;
+		const char* hd = hoodAt(px, pz);
+		if (hd != lastHood) { lastHood = hd; gZoneBanner = hd; gZoneBannerT = 170; }
+		for (int i = 0; i < N_CASH; i++) { // cash lying around
+			CashP* c = &cashP[i];
+			if (!c->active) { if (c->respawn > 0 && --c->respawn == 0) c->active = 1; continue; }
+			float dx = c->x - px, dz = c->z - pz;
+			if (dx * dx + dz * dz < 1.5f * 1.5f) {
+				c->active = 0; c->respawn = 5400; gCash += c->val;
+				char b[24]; snprintf(b, sizeof b, "+$%d", c->val); toast(b); playSfx(SFX_PICKUP, 0.6f);
+			}
+		}
+	} else {
+		const Room* m = &rooms[gRoom];
+		for (int i = 0; i < m->nCrate; i++) { // warehouse job: pick up the loose crates
+			if (wareGot[i]) continue;
+			float dx = m->crate[i][0] - px, dz = m->crate[i][1] - pz;
+			if (dx * dx + dz * dz < 1.4f * 1.4f) { wareGot[i] = 1; gCash += 15; toast("CRATE DELIVERED  +$15"); playSfx(SFX_PICKUP, 0.6f); }
+		}
+		stT++;
+	}
+	if (!canAct) { gPrompt = 0; return; }
+	updatePrompt(px, pz);
+	if (down & KEY_A) {
+		if (gPrompt == 1) startTrans(ACT_ENTER, gPromptDoor);
+		else if (gPrompt == 2) startTrans(ACT_EXIT, 0);
+		else if (gPrompt == 3) { gShop = gRoom; gShopSel = 0; gShopMsgT = 0; playSfx(SFX_SWITCH, 0.5f); }
+	}
+}
+
+// ---- wildlife: pigeons in plazas, parks and courts; squirrels near the park trees ---------------------------------
+#define N_PIGEON 14
+#define N_SQUIRREL 10
+#define N_ANIM (N_PIGEON + N_SQUIRREL)
+typedef struct {
+	int kind, state, t;            // kind 0 pigeon, 1 squirrel
+	float x, z, y, face, ph, tx, tz, hx, hz, hr, treeX, treeZ, fromX, fromZ;
+	int hasTree;
+	float clr[3];
+} Animal;
+static Animal anim[N_ANIM];
+enum { AS_IDLE, AS_WALK, AS_FLY, AS_RUN, AS_CLIMB };
+
+static void initWildlife(void) {
+	memset(anim, 0, sizeof anim);
+	int homesP[GRID * GRID][2], nP = 0, homesS[GRID * GRID][2], nS = 0;
+	for (int i = 0; i < GRID; i++) for (int j = 0; j < GRID; j++) {
+		int t = blkType[i][j];
+		if (t == BT_PARK || t == BT_PLAZA || t == BT_COURT || t == BT_COMM || t == BT_LOT || t == BT_MIXED) { homesP[nP][0] = i; homesP[nP][1] = j; nP++; }
+		if (t == BT_PARK || t == BT_HOUSES) { homesS[nS][0] = i; homesS[nS][1] = j; nS++; }
+	}
+	for (int a = 0; a < N_ANIM; a++) {
+		Animal* an = &anim[a];
+		unsigned h = hash2(a, 8821);
+		an->kind = a >= N_PIGEON;
+		int nn = an->kind ? nS : nP;
+		if (nn == 0) continue;
+		int pick = (int)((h >> 4) % (unsigned)nn);
+		int bi = (an->kind ? homesS : homesP)[pick][0], bj = (an->kind ? homesS : homesP)[pick][1];
+		float bx = BLK_C(bi), bz = BLK_C(bj);
+		an->hx = bx; an->hz = bz; an->hr = an->kind ? 7.0f : 9.5f;
+		if (an->kind) { // find a tree of this block
+			int cnt = 0;
+			for (int n = 0; n < nBld; n++) {
+				const Building* b = &bldg[n];
+				if (b->kind != 1) continue;
+				float tx = (b->x0 + b->x1) * 0.5f, tz = (b->z0 + b->z1) * 0.5f;
+				if (fabsf(tx - bx) < LOT_H && fabsf(tz - bz) < LOT_H && (hash2(n, a) % 3 == 0 || cnt == 0)) { an->treeX = tx; an->treeZ = tz; an->hasTree = 1; cnt++; }
+			}
+			if (an->hasTree) { an->hx = an->treeX; an->hz = an->treeZ; an->hr = 5.0f; }
+		}
+		for (int tries = 0; tries < 20; tries++) {
+			float x = an->hx + ((float)((h >> (tries % 8)) % 19) - 9.0f) * an->hr / 9.5f * 0.7f, z = an->hz + ((float)((h >> (tries % 8 + 3)) % 19) - 9.0f) * an->hr / 9.5f * 0.7f;
+			h = hash2((int)h, tries + a);
+			if (!blockedR(x, z, 0.35f) && fabsf(x - bx) < LOT_H && fabsf(z - bz) < LOT_H) { an->x = x; an->z = z; break; }
+			an->x = an->hx; an->z = an->hz;
+		}
+		an->face = (float)(h % 628) * 0.01f; an->ph = (float)(h % 100) * 0.1f; an->t = 30 + (int)(h % 120);
+		unsigned c = hash2(a, 313);
+		if (an->kind == 0) { // pigeon colours: mostly blue-grey, a few white / brown
+			int v = (int)(c % 10);
+			if (v < 7) { an->clr[0] = 0.50f; an->clr[1] = 0.52f; an->clr[2] = 0.58f; }
+			else if (v < 9) { an->clr[0] = 0.40f; an->clr[1] = 0.34f; an->clr[2] = 0.30f; }
+			else { an->clr[0] = 0.90f; an->clr[1] = 0.90f; an->clr[2] = 0.88f; }
+		} else {
+			if (c % 3) { an->clr[0] = 0.52f; an->clr[1] = 0.50f; an->clr[2] = 0.48f; } else { an->clr[0] = 0.60f; an->clr[1] = 0.34f; an->clr[2] = 0.16f; }
+		}
+	}
+}
+
+static int animMove(Animal* a, float dx, float dz) { // slides along obstacles; returns 1 if it moved
+	int moved = 0;
+	if (!blockedR(a->x + dx, a->z, 0.3f)) { a->x += dx; moved = 1; }
+	if (!blockedR(a->x, a->z + dz, 0.3f)) { a->z += dz; moved = 1; }
+	return moved;
+}
+
+static void updateWildlife(float px, float pz) {
+	for (int i = 0; i < N_ANIM; i++) {
+		Animal* a = &anim[i];
+		float dx = a->x - px, dz = a->z - pz, d2 = dx * dx + dz * dz;
+		if (d2 > 110.0f * 110.0f) continue; // far away: frozen
+		float d = sqrtf(d2) + 0.001f;
+		a->ph += 0.2f;
+		if (a->kind == 0) { // pigeon
+			if (a->state != AS_FLY && d < 4.8f) { // scared: fly off to another spot of its zone
+				a->state = AS_FLY; a->t = 0; a->fromX = a->x; a->fromZ = a->z;
+				float ang = atan2f(dz, dx), best = -1.0f;
+				for (int k = 0; k < 5; k++) {
+					float aa = ang + ((float)k - 2.0f) * 0.5f, r = 8.0f + (float)((i * 7 + k * 3) % 6);
+					float tx = a->x + cosf(aa) * r, tz = a->z + sinf(aa) * r;
+					float hx = tx - a->hx, hz = tz - a->hz;
+					if (hx * hx + hz * hz > (a->hr + 4.0f) * (a->hr + 4.0f) || blockedR(tx, tz, 0.35f)) continue;
+					float sc = hypotf(tx - px, tz - pz);
+					if (sc > best) { best = sc; a->tx = tx; a->tz = tz; }
+				}
+				if (best < 0.0f) { a->tx = a->hx; a->tz = a->hz; if (blockedR(a->tx, a->tz, 0.35f)) { a->tx = a->x; a->tz = a->z; } }
+				a->face = atan2f(-(a->tx - a->x), -(a->tz - a->z));
+			}
+			if (a->state == AS_FLY) {
+				a->t++;
+				float u = (float)a->t / 100.0f;
+				if (u >= 1.0f) { a->state = AS_IDLE; a->y = 0.0f; a->x = a->tx; a->z = a->tz; a->t = 60 + (i * 13) % 120; }
+				else { a->x = a->fromX + (a->tx - a->fromX) * u; a->z = a->fromZ + (a->tz - a->fromZ) * u; a->y = 3.2f * sinf(3.14159f * u); }
+			} else if (a->state == AS_WALK) {
+				float wx = a->tx - a->x, wz = a->tz - a->z, wd = sqrtf(wx * wx + wz * wz);
+				if (wd < 0.2f || !animMove(a, wx / wd * 0.03f, wz / wd * 0.03f)) { a->state = AS_IDLE; a->t = 40 + (i * 17) % 160; }
+				else a->face = atan2f(-wx, -wz);
+			} else if (--a->t <= 0) {
+				unsigned h = hash2(i + (int)a->ph, a->t + 91);
+				if (h % 3 == 0) { // wander a little inside the zone
+					a->tx = a->hx + ((float)(h % 19) - 9.0f) * a->hr / 12.0f; a->tz = a->hz + ((float)((h >> 8) % 19) - 9.0f) * a->hr / 12.0f;
+					a->state = AS_WALK;
+				} else a->t = 40 + (int)(h % 120);
+			}
+		} else { // squirrel
+			if (a->state == AS_IDLE && d < 6.0f) { a->state = AS_RUN; a->t = 0; }
+			if (a->state == AS_RUN) {
+				float gx, gz;
+				if (a->hasTree) { gx = a->treeX - a->x; gz = a->treeZ - a->z; }
+				else { gx = dx; gz = dz; }
+				float gd = sqrtf(gx * gx + gz * gz) + 0.001f;
+				if (a->hasTree && gd < 0.9f) { a->state = AS_CLIMB; }
+				else { animMove(a, gx / gd * 0.15f, gz / gd * 0.15f); a->face = atan2f(-gx, -gz); }
+				if (!a->hasTree && d > 14.0f) a->state = AS_IDLE;
+			}
+			if (a->state == AS_CLIMB) {
+				if (d > 11.0f) { a->y -= 0.04f; if (a->y <= 0.0f) { a->y = 0.0f; a->state = AS_IDLE; a->t = 90; } }
+				else if (a->y < 2.4f) a->y += 0.05f;
+				a->face = atan2f(-(a->treeX - a->x), -(a->treeZ - a->z));
+			} else if (a->state == AS_IDLE && --a->t <= 0) { // a few hops near the home tree
+				unsigned h = hash2(i * 3 + (int)a->ph, 1717);
+				float ang = (float)(h % 628) * 0.01f, r = 0.7f + (float)((h >> 8) % 10) * 0.2f;
+				float tx = a->x + cosf(ang) * r, tz = a->z + sinf(ang) * r, hx = tx - a->hx, hz = tz - a->hz;
+				if (hx * hx + hz * hz < a->hr * a->hr && animMove(a, cosf(ang) * r, sinf(ang) * r)) a->face = atan2f(-cosf(ang), -sinf(ang));
+				a->t = 50 + (int)(h % 140);
+			}
+		}
+	}
+}
+
+static void drawWildlife(void) {
+	for (int i = 0; i < N_ANIM; i++) {
+		const Animal* a = &anim[i];
+		if (!inView(a->x, a->z)) continue;
+		float dx = a->x - gCamX, dz = a->z - gCamZ;
+		if (dx * dx + dz * dz > 70.0f * 70.0f) continue; // tiny: not worth drawing from afar
+		gPx = a->x; gPz = a->z; gFace = a->face; gLean = 0.0f; gBob = a->y; gSx = 1.0f; gSy = 1.0f;
+		const float* c = a->clr;
+		if (a->kind == 0) {
+			int fly = a->state == AS_FLY, peck = a->state == AS_IDLE && ((int)(a->ph * 0.5f) % 7 == 0);
+			gLean = peck ? 0.5f : (fly ? -0.25f : 0.0f);
+			addPart(0, 0.17f, 0, 0, 0, 0, 0.065f, 0.065f, 0.13f, 0, c[0], c[1], c[2]);               // body
+			addPart(0, 0.17f, 0, 0, 0.07f, -0.14f, 0.045f, 0.05f, 0.045f, 0, c[0] * 0.65f, c[1] * 0.7f, c[2] * 0.75f); // head
+			addPart(0, 0.17f, 0, 0, 0.065f, -0.20f, 0.012f, 0.012f, 0.03f, 0, 0.95f, 0.65f, 0.20f);  // beak
+			float w = fly ? sinf(a->ph * 2.6f) * 0.13f : 0.0f;
+			addPart(0.09f, 0.17f, 0, 0, 0.02f + w, 0.0f, 0.07f, 0.01f, 0.10f, 0, c[0] * 0.8f, c[1] * 0.8f, c[2] * 0.8f);   // wings
+			addPart(-0.09f, 0.17f, 0, 0, 0.02f + w, 0.0f, 0.07f, 0.01f, 0.10f, 0, c[0] * 0.8f, c[1] * 0.8f, c[2] * 0.8f);
+			if (!fly) { addPart(0.03f, 0.10f, 0, 0, -0.05f, 0, 0.01f, 0.05f, 0.01f, 0, 0.8f, 0.4f, 0.4f); addPart(-0.03f, 0.10f, 0, 0, -0.05f, 0, 0.01f, 0.05f, 0.01f, 0, 0.8f, 0.4f, 0.4f); }
+			if (!fly) addShadow(a->x, a->z, 0.14f, 0.18f, 0.30f);
+		} else {
+			float climb = a->state == AS_CLIMB ? -1.1f : 0.0f;
+			gLean = climb;
+			addPart(0, 0.14f, 0, 0, 0, 0, 0.06f, 0.06f, 0.14f, 0, c[0], c[1], c[2]);                    // body
+			addPart(0, 0.14f, 0, 0, 0.05f, -0.17f, 0.05f, 0.05f, 0.05f, 0, c[0] * 1.05f, c[1] * 1.05f, c[2] * 1.05f); // head
+			addPart(0, 0.14f, 0, 0, 0.19f, 0.20f, 0.04f, 0.13f, 0.05f, 0.0f, c[0] * 0.85f, c[1] * 0.85f, c[2] * 0.85f); // tail
+			addPart(0, 0.14f, 0, 0.0f, 0.12f, -0.16f, 0.07f, 0.02f, 0.03f, 0, 0.85f, 0.85f, 0.82f);        // ears / face patch
+			if (a->state != AS_CLIMB) addShadow(a->x, a->z, 0.13f, 0.2f, 0.30f);
+		}
+		gLean = 0.0f; gBob = 0.0f;
+	}
+}
+
+// ---- the dynamic geometry of the world systems -----------------------------------------------------------------
+static float gKeeperPh = 0.0f;
+static void drawWorldDyn(int frame) {
+	if (gRoom < 0) {
+		drawTrain();
+		if (gTraffic) drawWildlife();
+	} else {
+		const Room* m = &rooms[gRoom];
+		if (m->kHas) {
+			const Ped* p = &keeperPed[gRoom];
+			gBaseY = 0.0f;
+			drawBody(p, m->kX, m->kZ, m->kFace, (float)frame * 0.04f, 0, 0, 0, 0, 0, 0.0f);
+		}
+		for (int i = 0; i < m->nCrate; i++) {
+			if (wareGot[i]) continue;
+			float x = m->crate[i][0], z = m->crate[i][1];
+			addBoxG(x - 0.45f, z - 0.45f, x + 0.45f, z + 0.45f, 0.0f, 0.8f, 0.78f, 0.60f, 0.38f, 0.8f, 1.0f);
+			addBoxY(x - 0.47f, z - 0.08f, x + 0.47f, z + 0.08f, 0.55f, 0.6f, 0.95f, 0.80f, 0.15f);
+		}
+		if (gRoom == RM_STATION) drawStationTrain();
+	}
+}
+// emissive extras: street lights, cash bills, the train's lights, crates' glow
+static void drawWorldLit(int frame, float night) {
+	if (gRoom >= 0) return;
+	float k = 0.50f + 0.50f * night;
+	for (int i = 0; i < nLamp; i++) {
+		const Lamp* l = &lamps[i];
+		if (!inView(l->x, l->z)) continue;
+		addBoxY(l->x - l->w * 0.5f, l->z - l->w * 0.3f, l->x + l->w * 0.5f, l->z + l->w * 0.3f, l->y - 0.1f, l->y + 0.08f, 1.0f * k, 0.92f * k, 0.62f * k);
+	}
+	for (int i = 0; i < N_CASH; i++) {
+		const CashP* c = &cashP[i];
+		if (!c->active || !inView(c->x, c->z)) continue;
+		float t = (float)frame * 0.07f + (float)i, w = 0.12f + 0.28f * fabsf(cosf(t)), y = 0.95f + 0.12f * sinf(t * 1.3f);
+		float g = c->val >= 20 ? 0.95f : 0.30f;
+		(void)g;
+		if (c->val >= 20) addBoxY(c->x - w, c->z - 0.17f, c->x + w, c->z + 0.17f, y, y + 0.05f, 0.95f, 0.80f, 0.20f);
+		else              addBoxY(c->x - w, c->z - 0.17f, c->x + w, c->z + 0.17f, y, y + 0.05f, 0.25f, 0.85f, 0.40f);
+	}
+	drawTrainLit(night);
+}
+
+static void initWorld(void) {
+	for (int k = 0; k < RM_N; k++) {
+		styleNpc(&keeperPed[k], hash2(k, 4711));
+		keeperPed[k].walk = 0; keeperPed[k].hp = 4; keeperPed[k].dead = 0; keeperPed[k].panic = 0; keeperPed[k].scale = 1.0f; keeperPed[k].width = 1.0f;
+	}
+	initCash();
+	initWildlife();
+}
+
+// ---- ambient sound by district -----------------------------------------------------------------------------------
+enum { AMB_TRAFFIC, AMB_RAIN, AMB_CRICKET, AMB_BIRD, AMB_IND, AMB_TUNNEL, AMB_FWY, AMB_TRAIN, AMB_ROOM, AMB_N };
+static void ambTargets(float px, float pz, float out[AMB_N]) {
+	static const float tab[Z_N][5] = { // traffic, birds, crickets, industrial hum, expressway roar
+		{0.34f, 0.04f, 0.05f, 0.00f, 0.08f}, {0.14f, 0.30f, 0.32f, 0.00f, 0.00f}, {0.26f, 0.12f, 0.15f, 0.00f, 0.00f},
+		{0.28f, 0.08f, 0.10f, 0.00f, 0.00f}, {0.14f, 0.03f, 0.05f, 0.32f, 0.00f}, {0.08f, 0.20f, 0.10f, 0.24f, 0.00f},
+		{0.08f, 0.38f, 0.38f, 0.00f, 0.00f}, {0.14f, 0.10f, 0.18f, 0.06f, 0.00f}, {0.18f, 0.04f, 0.08f, 0.08f, 0.00f},
+		{0.26f, 0.04f, 0.06f, 0.00f, 0.32f}
+	};
+	memset(out, 0, sizeof(float) * AMB_N);
+	if (gRoom >= 0) { out[AMB_ROOM] = 0.30f; out[AMB_TRAFFIC] = 0.03f; if (gRoom == RM_STATION) out[AMB_TRAIN] = stTrainOff() == 0.0f ? 0.0f : 0.35f; return; }
+	int z = zoneAt(px, pz);
+	out[AMB_TRAFFIC] = tab[z][0]; out[AMB_BIRD] = tab[z][1]; out[AMB_CRICKET] = tab[z][2]; out[AMB_IND] = tab[z][3]; out[AMB_FWY] = tab[z][4];
+	if (ceilingAt(px, pz) < 50.0f) { out[AMB_TUNNEL] = 0.40f; out[AMB_FWY] += 0.20f; out[AMB_BIRD] = 0.0f; }
+	float dx = px - trX, dz = pz - TRK_Z, d = sqrtf(dx * dx + dz * dz);
+	if (d < 150.0f && trV > 0.02f) out[AMB_TRAIN] = (1.0f - d / 150.0f) * 0.55f;
 }
 
 static void initStars(void) {
@@ -2949,7 +4736,7 @@ static void drawDroplets(void) {
 }
 
 // Ambience follows the weather and time of day; occasional car horns and distant sirens.
-static void updateAudio(int inGame, int paused) {
+static void updateAudio(int inGame, int paused, float px, float pz) {
 	static float g = 0.0f;
 	static int hornT = 400, sirenT = 1800;
 	if (!sndOK) return;
@@ -2962,11 +4749,26 @@ static void updateAudio(int inGame, int paused) {
 		ndspChnSetMix(THEME_CH, mix);
 	}
 	g += ((inGame ? (paused ? 0.35f : 1.0f) : 0.0f) - g) * 0.05f;
-	ambSetVol(0, 0.30f * g);
-	ambSetVol(1, wRain * 0.50f * g);
-	ambSetVol(2, wNight * 0.30f * g);
-	ambSetVol(3, (1.0f - wNight) * (1.0f - wRain) * (1.0f - 0.5f * wDusk) * 0.26f * g);
-	if (inGame && !paused) {
+	{ // district ambience: each zone mixes the loops differently; indoors everything is muffled
+		static float cur[AMB_N];
+		float tgt[AMB_N];
+		ambTargets(px, pz, tgt);
+		float day = (1.0f - wNight) * (1.0f - wRain) * (1.0f - 0.5f * wDusk);
+		tgt[AMB_BIRD] *= day * 1.2f;
+		tgt[AMB_CRICKET] *= wNight * 1.2f;
+		if (!inGame) { for (int i = 0; i < AMB_N; i++) tgt[i] = 0.0f; tgt[AMB_TRAFFIC] = 0.30f; tgt[AMB_BIRD] = 0.20f * day; }
+		for (int i = 0; i < AMB_N; i++) cur[i] += (tgt[i] - cur[i]) * 0.04f;
+		ambSetVol(AMB_TRAFFIC, cur[AMB_TRAFFIC] * g);
+		ambSetVol(AMB_RAIN, (gRoom >= 0 ? 0.12f : 1.0f) * wRain * 0.50f * g);
+		ambSetVol(AMB_CRICKET, cur[AMB_CRICKET] * g);
+		ambSetVol(AMB_BIRD, cur[AMB_BIRD] * g);
+		ambSetVol(AMB_IND, cur[AMB_IND] * g);
+		ambSetVol(AMB_TUNNEL, cur[AMB_TUNNEL] * g);
+		ambSetVol(AMB_FWY, cur[AMB_FWY] * g);
+		ambSetVol(AMB_TRAIN, cur[AMB_TRAIN] * g);
+		ambSetVol(AMB_ROOM, cur[AMB_ROOM] * g);
+	}
+	if (inGame && !paused && gRoom < 0) {
 		if (--hornT <= 0)  { playSfx(SFX_HORN, 0.16f);  hornT  = 420  + (int)(hash2(hornT, 5) % 900); }
 		if (--sirenT <= 0) { playSfx(SFX_SIREN, 0.20f); sirenT = 2600 + (int)(hash2(sirenT, 9) % 2400); }
 	}
@@ -3025,17 +4827,12 @@ static void drawHud2D(float aim, int armed, float fade) {
 
 // Vertical streets, west to east (x = ROAD_C(k)); horizontal streets, north to south (z = ROAD_C(k)).
 static const char* vNames[ROADS] = {
-	"Western Ave", "Damen Ave", "Ashland Ave", "Halsted St", "Clark St", "State St", "Michigan Ave"
+	"Cicero Ave", "Pulaski Rd", "Kedzie Ave", "California Ave", "Western Ave", "Ashland Ave", "Halsted St",
+	"Clark St", "LaSalle St", "State St", "Wabash Ave", "Michigan Ave", "Columbus Dr"
 };
 static const char* hNames[ROADS] = {
-	"Belmont Ave", "Diversey Pkwy", "Fullerton Ave", "Armitage Ave", "North Ave", "Division St", "Chicago Ave"
-};
-// Chicago neighborhoods, a 4x4 layout over the city (rows north to south, columns west to east).
-static const char* hoods[4][4] = {
-	{ "Ravenswood",     "Lakeview",          "Wrigleyville", "Uptown"        },
-	{ "Roscoe Village", "Lincoln Park",      "Old Town",     "Gold Coast"    },
-	{ "Bucktown",       "Wicker Park",       "River North",  "Streeterville" },
-	{ "West Town",      "Ukrainian Village", "The Loop",     "Grant Park"    }
+	"Devon Ave", "Montrose Ave", "Irving Park Rd", "Belmont Ave", "Fullerton Ave", "North Ave", "Chicago Ave",
+	"Ohio St", "Grand Ave", "Lake St", "Madison St", "Roosevelt Rd", "Cermak Rd"
 };
 
 #define N_MENU_TEXT 19
@@ -3109,6 +4906,32 @@ static void drawCentered(const C2D_Text* t, float cx, float y, float scale, u32 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static int roadIdx(float v) { return clampi((int)floorf((v - ROAD_C(0)) / ROAD_SP + 0.5f), 0, ROADS - 1); }
 
+// colour of a city block on the map, by district type
+static void mapBlockRGB(int t, int* r, int* g, int* b) {
+	static const unsigned char c[14][3] = {
+		{0x22, 0x2c, 0x4a}, {0x24, 0x2a, 0x3c}, {0x25, 0x2e, 0x44}, {0x1d, 0x4a, 0x2c}, {0x3a, 0x3f, 0x4c}, {0x2c, 0x29, 0x25}, {0x2d, 0x25, 0x3c},
+		{0x3a, 0x2c, 0x20}, {0x30, 0x2e, 0x22}, {0x1c, 0x34, 0x48}, {0x20, 0x22, 0x28}, {0x1f, 0x48, 0x3c}, {0x1c, 0x21, 0x2e}, {0x1c, 0x21, 0x2e}
+	};
+	if (t < 0 || t > 13) t = 10;
+	*r = c[t][0]; *g = c[t][1]; *b = c[t][2];
+}
+static u32 mapBlockClr(int t, int lift) {
+	int r, g, b;
+	mapBlockRGB(t, &r, &g, &b);
+	r += lift; g += lift; b += lift + (lift > 0 ? 6 : 0);
+	return C2D_Color32((u8)(r > 255 ? 255 : r), (u8)(g > 255 ? 255 : g), (u8)(b > 255 ? 255 : b), 0xFF);
+}
+static u32 doorClr(int room) {
+	switch (room) {
+	case RM_STORE:   return C2D_Color32(0x40, 0xE0, 0x70, 0xFF);
+	case RM_DINER:   return C2D_Color32(0xFF, 0x98, 0x30, 0xFF);
+	case RM_LAUNDRY: return C2D_Color32(0x30, 0xD8, 0xFF, 0xFF);
+	case RM_APT:     return C2D_Color32(0xFF, 0x58, 0xD8, 0xFF);
+	case RM_WARE:    return C2D_Color32(0xFF, 0xDC, 0x40, 0xFF);
+	default:         return C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF);
+	}
+}
+
 static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	const u32 cBg    = C2D_Color32(0x12, 0x15, 0x1d, 0xFF);
 	const u32 cRoad  = C2D_Color32(0x4a, 0x51, 0x66, 0xFF);
@@ -3135,11 +4958,26 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 			int t = blkType[i][j];
 			fillClipped(MAP_CX + (bx - BLK_H - px) * MAP_S, MAP_CY + (bz - BLK_H - pz) * MAP_S,
 			            MAP_CX + (bx + BLK_H - px) * MAP_S, MAP_CY + (bz + BLK_H - pz) * MAP_S,
-			            t == BT_PARK ? cPark : (t == BT_PLAZA ? cPlaza : cBlock));
+			            mapBlockClr(t, 0));
 		}
+	}
+	{ // the lake east of the city and the elevated line: gravel band, track, and the road tunnels underneath
+		const u32 cLake = C2D_Color32(0x14, 0x2c, 0x4a, 0xFF);
+		fillClipped(MAP_CX + (CITY_H + 12.0f - px) * MAP_S, 0.0f, 400.0f, MAP_H, cLake);
+		fillClipped(MAP_CX + (-ext - px) * MAP_S, MAP_CY + (RAIL_Z - RAIL_HW - pz) * MAP_S,
+		            MAP_CX + ( ext - px) * MAP_S, MAP_CY + (RAIL_Z + RAIL_HW - pz) * MAP_S, C2D_Color32(0x4e, 0x46, 0x3e, 0xFF));
+		for (int k = 0; k < ROADS; k++) {
+			float rx = ROAD_C(k);
+			fillClipped(MAP_CX + (rx - ROAD_HW - px) * MAP_S, MAP_CY + (RAIL_Z - RAIL_HW - pz) * MAP_S,
+			            MAP_CX + (rx + ROAD_HW - px) * MAP_S, MAP_CY + (RAIL_Z + RAIL_HW - pz) * MAP_S, cRoad);
+		}
+		for (int s = -1; s <= 1; s += 2)
+			fillClipped(MAP_CX + (-ext - px) * MAP_S, MAP_CY + (TRK_Z + 0.7f * (float)s - pz) * MAP_S - 0.5f,
+			            MAP_CX + ( ext - px) * MAP_S, MAP_CY + (TRK_Z + 0.7f * (float)s - pz) * MAP_S + 0.5f, C2D_Color32(0xB4, 0xB8, 0xC8, 0xFF));
 	}
 	for (int i = 0; i < nBld; i++) {
 		const Building* b = &bldg[i];
+		if (b->kind == 3) continue; // collision only
 		if (b->kind == 1) {
 			float cx = MAP_CX + ((b->x0 + b->x1) * 0.5f - px) * MAP_S, cy = MAP_CY + ((b->z0 + b->z1) * 0.5f - pz) * MAP_S;
 			if (cx > 3.0f && cx < 317.0f && cy > 3.0f && cy < MAP_H - 3.0f)
@@ -3147,13 +4985,40 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 			continue;
 		}
 		fillClipped(MAP_CX + (b->x0 - px) * MAP_S, MAP_CY + (b->z0 - pz) * MAP_S,
-		            MAP_CX + (b->x1 - px) * MAP_S, MAP_CY + (b->z1 - pz) * MAP_S, b->kind == 2 ? cPark : cBld);
+		            MAP_CX + (b->x1 - px) * MAP_S, MAP_CY + (b->z1 - pz) * MAP_S,
+		            b->kind == 2 ? cPark : mapBlockClr(blkType[blockOfV((b->x0 + b->x1) * 0.5f)][blockOfV((b->z0 + b->z1) * 0.5f)], 22));
 	}
 	// road centre lines
 	for (int k = 0; k < ROADS; k++) {
 		float sx = MAP_CX + (ROAD_C(k) - px) * MAP_S, sy = MAP_CY + (ROAD_C(k) - pz) * MAP_S;
 		fillClipped(sx - 0.5f, MAP_CY + (-ext - pz) * MAP_S, sx + 0.5f, MAP_CY + (ext - pz) * MAP_S, cMid);
 		fillClipped(MAP_CX + (-ext - px) * MAP_S, sy - 0.5f, MAP_CX + (ext - px) * MAP_S, sy + 0.5f, cMid);
+	}
+
+	{ // the expressway (translucent: the streets run under it), its centre line, and the L train
+		fillClipped(MAP_CX + (FWY_X0 - px) * MAP_S, MAP_CY + (FWY_Z - FWY_HW - pz) * MAP_S,
+		            MAP_CX + (FWY_X1 - px) * MAP_S, MAP_CY + (FWY_Z + FWY_HW - pz) * MAP_S, C2D_Color32(0x2a, 0x2e, 0x3a, 0xC8));
+		for (float dx = FWY_X0; dx < FWY_X1; dx += 10.0f)
+			fillClipped(MAP_CX + (dx - px) * MAP_S, MAP_CY + (FWY_Z - pz) * MAP_S - 0.5f, MAP_CX + (dx + 5.0f - px) * MAP_S, MAP_CY + (FWY_Z - pz) * MAP_S + 0.5f, C2D_Color32(0xE0, 0xB8, 0x30, 0xFF));
+		for (int s = -1; s <= 1; s += 2)
+			fillClipped(MAP_CX + (FWY_X0 - px) * MAP_S, MAP_CY + (FWY_Z + (float)s * (FWY_HW - 0.6f) - pz) * MAP_S - 0.5f,
+			            MAP_CX + (FWY_X1 - px) * MAP_S, MAP_CY + (FWY_Z + (float)s * (FWY_HW - 0.6f) - pz) * MAP_S + 0.5f, C2D_Color32(0xC8, 0xCC, 0xD8, 0xFF));
+		float hl = (float)TRAIN_CARS * (TCAR_L + 0.5f) * 0.5f;
+		fillClipped(MAP_CX + (trX - hl - px) * MAP_S, MAP_CY + (TRK_Z - 1.4f - pz) * MAP_S, MAP_CX + (trX + hl - px) * MAP_S, MAP_CY + (TRK_Z + 1.4f - pz) * MAP_S, C2D_Color32(0xFF, 0xD8, 0x50, 0xFF));
+	}
+	if (gMode == M_FREE) { // cash lying around and the doors you can use
+		for (int i = 0; i < N_CASH; i++) {
+			if (!cashP[i].active) continue;
+			float sx = MAP_CX + (cashP[i].x - px) * MAP_S, sy = MAP_CY + (cashP[i].z - pz) * MAP_S;
+			if (sx > 2.0f && sx < 318.0f && sy > 2.0f && sy < MAP_H - 2.0f) C2D_DrawRectSolid(sx - 1.0f, sy - 1.0f, 0.5f, 2.0f, 2.0f, C2D_Color32(0x70, 0xFF, 0x90, 0xFF));
+		}
+		for (int i = 0; i < nDoor; i++) {
+			float sx = MAP_CX + (doors[i].x - px) * MAP_S, sy = MAP_CY + (doors[i].z - pz) * MAP_S;
+			if (sx > 5.0f && sx < 315.0f && sy > 22.0f && sy < MAP_H - 5.0f) {
+				C2D_DrawRectSolid(sx - 3.5f, sy - 3.5f, 0.5f, 7.0f, 7.0f, cWhite);
+				C2D_DrawRectSolid(sx - 2.5f, sy - 2.5f, 0.5f, 5.0f, 5.0f, doorClr(doors[i].room));
+			}
+		}
 	}
 
 	// traffic
@@ -3266,13 +5131,11 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	drawCentered(&btnBlackout, 239.0f, (float)BTN_Y0 + 3.0f, 0.45f, cText);
 
 	// where in Chicago the player is
-	int ni = clampi((int)floorf((px + CITY_H) / CELL_W), 0, 3);
-	int nj = clampi((int)floorf((pz + CITY_H) / CELL_W), 0, 3);
 	int a  = roadIdx(px);
 	int b  = roadIdx(pz);
 	char line1[64], line2[96];
-	snprintf(line1, sizeof line1, "%s, Chicago, IL", hoods[nj][ni]);
-	snprintf(line2, sizeof line2, "Near %s & %s", vNames[a], hNames[b]);
+	snprintf(line1, sizeof line1, "%s, Chicago, IL", hoodAt(px, pz));
+	snprintf(line2, sizeof line2, "%s  -  near %s & %s", kZoneName[zoneAt(px, pz)], vNames[a], hNames[b]);
 	C2D_Text t1, t2;
 	C2D_TextParse(&t1, gDyn, line1);
 	C2D_TextOptimize(&t1);
@@ -3534,7 +5397,7 @@ static int runLoading(C3D_RenderTarget* top, C3D_RenderTarget* bottom, int mode,
 	while (aptMainLoop()) {
 		hidScanInput();
 		u32 down = hidKeysDown();
-		updateAudio(0, 0);
+		updateAudio(0, 0, 0.0f, 0.0f);
 		if (f == 40) { setupMode(mode); ready = 1; }
 		if (!ready) prog += (0.45f - prog) * 0.05f; else prog += (1.0f - prog) * 0.04f;
 		if (prog > 0.995f && ready) prog = 1.0f;
@@ -3688,9 +5551,112 @@ static void drawMapMode(float px, float pz) {
 	}
 }
 
+// ---- Free Roam HUD: cash, boost, neighbourhood banner, the A prompt, toasts --------------------------------------
+static int gHudQuiet = 0;       // 1 while the pause menu is up: no prompt, no banner
+static void drawFreeHud(int frame) {
+	char b[64];
+	// cash
+	snprintf(b, sizeof b, "$ %d", gCash);
+	C2D_DrawRectSolid(300.0f, 8.0f, 0.5f, 92.0f, 22.0f, neon(0, 0, 0, 0.55f));
+	frameRect(300.0f, 8.0f, 92.0f, 22.0f, 1.0f, neon(110, 255, 150, 0.8f));
+	txt(b, 386.0f, 10.0f, 0.55f, neon(110, 255, 150, 1.0f), 2);
+	if (gBoost > 0) {
+		int s = (gBoost + 59) / 60;
+		float k = (float)gBoost / (float)(120 * 60); if (k > 1.0f) k = 1.0f;
+		snprintf(b, sizeof b, "SPEED BOOST %d:%02d", s / 60, s % 60);
+		txt(b, 386.0f, 33.0f, 0.32f, neon(0, 229, 255, 1.0f), 2);
+		C2D_DrawRectSolid(300.0f, 45.0f, 0.5f, 92.0f, 3.0f, neon(0, 0, 0, 0.55f));
+		C2D_DrawRectSolid(300.0f, 45.0f, 0.5f, 92.0f * k, 3.0f, neon(0, 229, 255, 0.9f));
+	}
+	if (!gHudQuiet) {
+		// where you are
+		if (gRoom >= 0) {
+			txt(roomName[gRoom], 200.0f, 10.0f, 0.6f, neon(255, 255, 255, 0.95f), 1);
+		} else if (gZoneBannerT > 0 && gZoneBanner) {
+			float a = (float)gZoneBannerT / 30.0f; if (a > 1.0f) a = 1.0f;
+			float in = (float)(170 - gZoneBannerT) / 14.0f; if (in < a) a = in < 0.0f ? 0.0f : in;
+			C2D_DrawRectSolid(110.0f, 8.0f, 0.5f, 180.0f, 30.0f, neon(0, 0, 0, 0.5f * a));
+			C2D_DrawRectSolid(110.0f, 8.0f, 0.5f, 3.0f, 30.0f, neon(255, 46, 209, a));
+			txt(gZoneBanner, 200.0f, 9.0f, 0.5f, neon(255, 255, 255, a), 1);
+			txt(kZoneName[zoneAt(gPlX, gPlZ)], 200.0f, 26.0f, 0.3f, neon(0, 229, 255, a), 1);
+		}
+		// the interaction prompt: always the A button
+		if (gPrompt && gTrans == 0 && gShop < 0 && gState == GS_PLAY) {
+			float pw = 60.0f + 7.0f * (float)strlen(gPromptTxt);
+			if (pw > 300.0f) pw = 300.0f;
+			float x0 = 200.0f - pw * 0.5f, pulse = 0.5f + 0.5f * sinf((float)frame * 0.14f);
+			C2D_DrawRectSolid(x0, 196.0f, 0.5f, pw, 26.0f, neon(0, 0, 0, 0.62f));
+			frameRect(x0, 196.0f, pw, 26.0f, 1.0f, neon(0, 229, 255, 0.7f + 0.3f * pulse));
+			C2D_DrawRectSolid(x0 + 4.0f, 200.0f, 0.5f, 18.0f, 18.0f, neon(255, 46, 209, 1.0f));
+			txt("A", x0 + 13.0f, 201.0f, 0.5f, neon(255, 255, 255, 1.0f), 1);
+			txt(gPromptTxt, x0 + 26.0f + (pw - 30.0f) * 0.5f, 203.0f, 0.42f, neon(255, 255, 255, 1.0f), 1);
+		}
+	}
+	if (gToast > 0 && gState == GS_PLAY) txt(gToastTxt, 200.0f, 170.0f, 0.5f, neon(255, 255, 255, gToast > 30 ? 1.0f : (float)gToast / 30.0f), 1);
+}
+
+// bottom screen while a shop menu is open
+static void drawShopBottom(int frame) {
+	static char lbl[8][44];
+	const char* items[8];
+	int n;
+	const ShopItem* it = shopItems(gShop, &n);
+	for (int i = 0; i < n; i++) {
+		const char* own = NULL;
+		if (it[i].kind == IK_CAP && gCap) own = "OWNED";
+		if (it[i].kind == IK_SHADES && gShades) own = "OWNED";
+		if (it[i].kind == IK_JACKET && gJacketIx == it[i].a) own = "WEARING";
+		if (own) snprintf(lbl[i], sizeof lbl[i], "%s   %s", it[i].name, own);
+		else if (it[i].price <= 0) snprintf(lbl[i], sizeof lbl[i], "%s   FREE", it[i].name);
+		else snprintf(lbl[i], sizeof lbl[i], "%s   $%d", it[i].name, it[i].price);
+		items[i] = lbl[i];
+	}
+	items[n] = "LEAVE";
+	char sub[48];
+	if (kKeeperName[gShop][0]) snprintf(sub, sizeof sub, "%s  -  CASH $%d", kKeeperName[gShop], gCash);
+	else snprintf(sub, sizeof sub, "CASH $%d", gCash);
+	menuPanel(1.0f, roomName[gShop], items, n + 1, gShopSel, frame, sub, gShopMsgT > 0 ? gShopMsg : "A: BUY     B: LEAVE     D-PAD / TOUCH", 66.0f, 29.0f, 1);
+}
+
+// bottom screen inside a building: a floor plan with you, the service spot and the door
+static void drawRoomBottom(float px, float pz, float face, int frame) {
+	const Room* m = &rooms[gRoom];
+	C2D_DrawRectSolid(0.0f, 0.0f, 0.5f, 320.0f, 240.0f, neon(4, 8, 16, 1.0f));
+	for (float y = 2.0f; y < 240.0f; y += 6.0f) C2D_DrawRectSolid(0.0f, y, 0.5f, 320.0f, 1.0f, neon(0, 229, 255, 0.05f));
+	brackets(8.0f, 8.0f, 304.0f, 224.0f, 20.0f, 2.0f, neon(0, 229, 255, 0.95f));
+	txt(roomName[gRoom], 160.0f, 14.0f, 0.6f, neon(0, 229, 255, 1.0f), 1);
+	char b[64];
+	snprintf(b, sizeof b, "CASH $%d", gCash);
+	txt(b, 160.0f, 34.0f, 0.4f, neon(110, 255, 150, 1.0f), 1);
+	float rw = m->x1 - m->x0, rh = m->z1 - m->z0;
+	float sc = 276.0f / rw; if (128.0f / rh < sc) sc = 128.0f / rh;
+	float ox = 160.0f - (m->x0 + rw * 0.5f) * sc, oz = 114.0f - (m->z0 + rh * 0.5f) * sc;
+	C2D_DrawRectSolid(ox + m->x0 * sc, oz + m->z0 * sc, 0.5f, rw * sc, rh * sc, neon(18, 26, 40, 1.0f));
+	frameRect(ox + m->x0 * sc, oz + m->z0 * sc, rw * sc, rh * sc, 1.0f, neon(0, 150, 180, 0.9f));
+	for (int i = 0; i < m->nSol; i++) {
+		const float* q = m->sol[i];
+		C2D_DrawRectSolid(ox + q[0] * sc, oz + q[1] * sc, 0.5f, (q[2] - q[0]) * sc, (q[3] - q[1]) * sc, neon(70, 90, 120, 1.0f));
+	}
+	for (int i = 0; i < m->nCrate; i++) if (!wareGot[i]) C2D_DrawRectSolid(ox + m->crate[i][0] * sc - 2.0f, oz + m->crate[i][1] * sc - 2.0f, 0.5f, 4.0f, 4.0f, neon(255, 220, 60, 1.0f));
+	if (m->kHas) C2D_DrawCircleSolid(ox + m->kX * sc, oz + m->kZ * sc, 0.5f, 3.0f, neon(255, 150, 60, 1.0f));
+	float pulse = 0.5f + 0.5f * sinf((float)frame * 0.14f);
+	C2D_DrawCircleSolid(ox + m->aX * sc, oz + m->aZ * sc, 0.5f, 4.0f + 3.0f * pulse, neon(255, 46, 209, 0.45f));
+	C2D_DrawCircleSolid(ox + m->aX * sc, oz + m->aZ * sc, 0.5f, 2.5f, neon(255, 46, 209, 1.0f));
+	C2D_DrawRectSolid(ox + m->exX * sc - 4.0f, oz + m->exZ * sc - 2.0f, 0.5f, 8.0f, 4.0f, neon(110, 255, 150, 1.0f));
+	{
+		float dx = -sinf(face), dy = -cosf(face), nx = -dy, ny = dx, X = ox + px * sc, Y = oz + pz * sc;
+		C2D_DrawTriangle(X + dx * 9.0f, Y + dy * 9.0f, neon(255, 255, 255, 1.0f), X + dx * 2.0f + nx * 3.5f, Y + dy * 2.0f + ny * 3.5f, neon(255, 255, 255, 1.0f),
+		                 X + dx * 2.0f - nx * 3.5f, Y + dy * 2.0f - ny * 3.5f, neon(255, 255, 255, 1.0f), 0.5f);
+		C2D_DrawCircleSolid(X, Y, 0.5f, 3.5f, neon(30, 123, 255, 1.0f));
+	}
+	if (gPrompt) { snprintf(b, sizeof b, "A:  %s", gPromptTxt); txt(b, 160.0f, 184.0f, 0.5f, neon(255, 255, 255, 1.0f), 1); }
+	else txt("PINK = SERVICE SPOT     GREEN = DOOR", 160.0f, 186.0f, 0.34f, neon(255, 46, 209, 0.9f), 1);
+	txt("B: RUN     Y: CAMERA     SELECT: PAUSE", 160.0f, 208.0f, 0.34f, neon(120, 220, 235, 0.85f), 1);
+}
+
 // ---- top-screen HUD (drawn with citro2d on top of the 3D view) ----
 static void drawTopHud(int frame, float camYaw) {
-	if (gMode == M_FREE && gState != GS_COUNTDOWN && gGo <= 0) return;
+	if (gMode == M_FREE && gState != GS_COUNTDOWN && gGo <= 0) { drawFreeHud(frame); return; }
 	const float CX = 200.0f, CY = 120.0f;
 	if (gMode == M_DM || gMode == M_BR) {
 		if (plFlash > 0) { // damage flash around the edges
@@ -3979,6 +5945,7 @@ int main(int argc, char** argv) {
 	initCars();
 	initPeds();
 	initCrates();
+	initWorld();
 	for (int w = 0; w < WP_COUNT; w++) ammo[w] = wdef[w].startAmmo;
 	initAudio();
 
@@ -4122,10 +6089,15 @@ int main(int argc, char** argv) {
 			}
 			held = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; // game input is frozen while paused
 		}
+		if (!title && !paused && gMode == M_FREE && gShop >= 0 && gTrans == 0) { // a shop is open: the menu takes all the input
+			updateShop(down, &tp);
+			held = 0; down = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0;
+		}
+		if (!title && gTrans > 0) { held = 0; down = 0; cp.dx = 0; cp.dy = 0; cs.dx = 0; cs.dy = 0; } // the screen is fading
 		pauseDim += ((paused ? 1.0f : 0.0f) - pauseDim) * 0.25f;
 		if (pauseDim < 0.01f) pauseDim = 0.0f;
 		updateWeather();
-		updateAudio(!title, paused);
+		updateAudio(!title, paused, px, pz);
 		if (title) titleFade += (1.0f - titleFade) * 0.04f;
 
 		if (!title && !paused && gMode != M_TP && (down & KEY_Y)) camStyle = (camStyle + 1) % 3; // quick camera switch
@@ -4181,12 +6153,11 @@ int main(int argc, char** argv) {
 		// touch: bottom strip = HACK button, elsewhere = drag to look
 		if ((held & KEY_TOUCH) && !wheelOpen) {
 				if (tp.py >= BTN_Y0 && gMode != M_TP) {
-				if (down & KEY_TOUCH) {
-					if (phoneTimer == 0 && tp.py < BTN_Y1) {
+					// the strip is the hack buttons (not inside a building, where the bottom screen shows the floor plan)
+					if (gRoom < 0 && (down & KEY_TOUCH) && phoneTimer == 0 && tp.py < BTN_Y1) {
 						pending = (tp.px < 160) ? 1 : 2; // 1 = hack lights, 2 = blackout
 						phoneTimer = 120;                // character pulls out the phone
 					}
-				}
 			} else if (lastTouchX >= 0) {
 				yaw   -= (tp.px - lastTouchX) * 0.01f * lookScale;
 				pitch += (tp.py - lastTouchY) * 0.01f * lookScale;
@@ -4208,7 +6179,7 @@ int main(int argc, char** argv) {
 		if (phoneTimer > 0 || (!title && (gState != GS_PLAY || gMode == M_TP))) { fx = 0.0f; sx = 0.0f; len = 0.0f; } // standing still: on the phone, counting down, game over, or at the range
 		int aimFace = (aimAmt > 0.5f) || (camStyle == 2);        // aiming / first person: body follows the camera
 		int running = (held & KEY_B) && len > 0.5f && aimAmt < 0.3f;
-		float speed = running ? 0.17f : (aimAmt > 0.3f ? 0.045f : 0.07f);
+		float speed = (running ? 0.17f : (aimAmt > 0.3f ? 0.045f : 0.07f)) * (gBoost > 0 ? 1.3f : 1.0f);
 		float dirx = -sinf(yaw), dirz = -cosf(yaw);
 		float rgtx =  cosf(yaw), rgtz = -sinf(yaw);
 		float nx = px + (dirx * fx + rgtx * sx) * speed;
@@ -4258,6 +6229,13 @@ int main(int argc, char** argv) {
 				updatePeds(sim);
 				if (!title) updateMode(px, pz, len > 0.0f);
 			}
+			updateTrain();
+			if (!title) {
+				int canAct = (gState == GS_PLAY && phoneTimer == 0 && !wheelOpen && gShop < 0 && aimAmt < 0.3f);
+				updateWorld(px, pz, down, canAct, sim);
+				if (gTraffic && gRoom < 0) updateWildlife(px, pz);
+				if (gTele) { px = gTeleX; pz = gTeleZ; yaw = gTeleYaw; face = gTeleYaw; pitch = 0.3f; moveAmt = 0.0f; gTele = 0; }
+			}
 			sim++;
 		}
 
@@ -4286,16 +6264,20 @@ int main(int argc, char** argv) {
 			if (camStyle == 2 || blocked(cx, cz)) { cx = px; cz = pz; dist = 0.0f; }
 			cy = (camStyle == 2) ? 1.62f + fabsf(cosf(phase)) * 0.035f * moveAmt : hh + sinf(cpitch) * dist;
 			if (cy < 0.4f) cy = 0.4f;
+			{ // never through a ceiling: the freeway deck, a tunnel roof, the ceiling of a shop
+				float ch = (gRoom >= 0) ? rooms[gRoom].h - 0.35f : ceilingAt(cx, cz) - 0.3f;
+				if (cy > ch) cy = ch;
+			}
 		}
 		if (title) { // slow cinematic orbit around the city
 			orbit += 0.006f;
-			cyaw = orbit; cpitch = 0.6f; cy = 140.0f;
-			cx = sinf(orbit) * 200.0f; cz = cosf(orbit) * 200.0f;
+			cyaw = orbit; cpitch = 0.55f; cy = 190.0f;
+			cx = sinf(orbit) * 330.0f; cz = cosf(orbit) * 330.0f;
 		}
 		if (shake > 0.01f) { cx += rnd() * shake * 0.15f; cy += rnd() * shake * 0.15f; cz += rnd() * shake * 0.15f; }
 
 		float fov = ((camStyle == 2) ? 72.0f : 65.0f) - 16.0f * aimAmt;
-		Mtx_PerspTilt(&proj, C3D_AngleFromDegrees(fov), C3D_AspectRatioTop, 0.2f, 400.0f, false);
+		Mtx_PerspTilt(&proj, C3D_AngleFromDegrees(fov), C3D_AspectRatioTop, 0.2f, title ? 800.0f : 400.0f, false);
 		C3D_Mtx mv;
 		Mtx_Identity(&mv);
 		Mtx_RotateX(&mv, cpitch, true);
@@ -4303,14 +6285,16 @@ int main(int argc, char** argv) {
 		Mtx_Translate(&mv, -cx, -cy, -cz, true);
 
 		gCamX = cx; gCamZ = cz; gCamYaw = cyaw;
-		gCullR = title ? 400.0f : 140.0f;
+		gCullR = title ? 700.0f : 140.0f;
 		gFwdX = -sinf(cyaw); gFwdZ = -cosf(cyaw);
 		gCone = !title;
 		unsigned char vis[CELLS]; // which districts the camera can see (the title orbit sees them all)
+		const float cullFar = gFog ? wFogE + 57.0f : 440.0f; // a district entirely beyond the fog is just sky colour: skip it (57 = half a district's diagonal)
 		for (int c = 0; c < CELLS; c++) {
-			float dx = ((float)(c & 3) - 1.5f) * CELL_W - cx, dz = ((float)(c >> 2) - 1.5f) * CELL_W - cz;
+			float dx = ((float)(c % CN) - (float)(CN - 1) * 0.5f) * CELL_W - cx, dz = ((float)(c / CN) - (float)(CN - 1) * 0.5f) * CELL_W - cz;
 			float d = sqrtf(dx * dx + dz * dz), dot = dx * gFwdX + dz * gFwdZ;
-			vis[c] = (title || d < 100.0f || dot + 70.0f > 0.62f * d) ? 1 : 0;
+			vis[c] = ((title ? d < 150.0f : d < 100.0f) || dot + 70.0f > 0.62f * d) ? 1 : 0;
+			if (!title && d > cullFar) vis[c] = 0;
 		}
 
 		// ---- shooting (the crosshair ray starts at the camera; the bullet leaves the barrel) ----
@@ -4325,7 +6309,8 @@ int main(int argc, char** argv) {
 				muz[0] = px + hx * (0.6f + L) + rx * 0.36f; muz[1] = 1.2f; muz[2] = pz + hz * (0.6f + L) + rz * 0.36f;
 			}
 			if (fireCool > 0) fireCool--;
-			if (gState == GS_PLAY && !wheelOpen && phoneTimer == 0 && armed && (held & (KEY_R | KEY_ZR)) && fireCool == 0) {
+			if (gRoom >= 0 && armed && (down & (KEY_R | KEY_ZR))) toast("NO WEAPONS INDOORS");
+			if (gState == GS_PLAY && gRoom < 0 && !wheelOpen && phoneTimer == 0 && armed && (held & (KEY_R | KEY_ZR)) && fireCool == 0) {
 				const WDef* w = &wdef[curWeapon];
 				int fresh = (down & (KEY_R | KEY_ZR)) ? 1 : 0;
 				if (gMode == M_TP) {
@@ -4342,6 +6327,7 @@ int main(int argc, char** argv) {
 
 		// ---- build this frame's dynamic geometry ----
 		drawDynamic();
+		{ int wst = vcount; drawWorldDyn(sim); GSPGPU_FlushDataCache(&vbo[wst], (vcount - wst) * sizeof(Vertex)); }
 		if (!title && gMode == M_TP) drawTpRoom(sim);
 		else if (!title && gMode != M_FREE) drawBots();
 		if (!title) {
@@ -4360,32 +6346,34 @@ int main(int argc, char** argv) {
 		}
 		int litStart = vcount;            // emissive: signal heads, lights, ammo crates, tracers, rocket
 		drawLights(sim, wNight);
+		drawWorldLit(sim, wNight);
 		if (gCratesOn) drawCrates(sim);
 		drawLoot(sim);
 		drawTracers();
 		GSPGPU_FlushDataCache(&vbo[litStart], (vcount - litStart) * sizeof(Vertex));
 		int skyStart = vcount;            // blended: sun / moon / stars, rain, muzzle flashes, smoke, explosions
-		drawSkyBodies(cx, cy, cz, cyaw);
-		drawRain(cx, cz, cyaw);
+		const int inRoom = (!title && gRoom >= 0);
+		if (!inRoom) { drawSkyBodies(cx, cy, cz, cyaw); drawRain(cx, cz, cyaw); }
 		drawStorm();
 		drawFx(cyaw);
 		int dropStart = vcount;           // lens droplets + HUD (pixel coordinates, own pass)
-		drawDroplets();
+		if (!inRoom) drawDroplets();
 		float fadeA = title ? 1.0f - titleFade : 0.0f;
+		if (gTrans > 0) { float u = fabsf((float)gTrans - 13.0f) / 13.0f; if (1.0f - u > fadeA) fadeA = 1.0f - u; }
 		drawHud2D(aimAmt, !title && !paused && armed, fadeA);
 		GSPGPU_FlushDataCache(&vbo[skyStart], (vcount - skyStart) * sizeof(Vertex));
 
-		float t = (hackFrames > 0) ? 0.25f : 1.0f;
+		float t = (hackFrames > 0 && !inRoom) ? 0.25f : 1.0f;
 		float fogC[3] = { wSky[0], wSky[1], wSky[2] };
 		if (hackFrames > 0) { fogC[0] = 0.03f; fogC[1] = 0.03f; fogC[2] = 0.06f; }
-		float fS = title ? wFogS + 140.0f : wFogS, fE = title ? wFogE + 260.0f : wFogE; // the title orbit is far above the city
+		float fS = title ? wFogS + 260.0f : wFogS, fE = title ? wFogE + 420.0f : wFogE; // the title orbit is far above the city
 		float fogK = 1.0f / (fE - fS);
-		float fogA = gFog ? -fogK : 0.0f, fogB = gFog ? -fS * fogK : 0.0f;
+		float fogA = (gFog && !inRoom) ? -fogK : 0.0f, fogB = (gFog && !inRoom) ? -fS * fogK : 0.0f;
 		float glow = wNight + 0.35f * wDusk + 0.12f * wRain;
 		if (glow > 1.0f) glow = 1.0f;
 
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-		C3D_RenderTargetClear(top, C3D_CLEAR_ALL, hackFrames > 0 ? 0x080810FF : skyColor(1.0f), 0);
+		C3D_RenderTargetClear(top, C3D_CLEAR_ALL, inRoom ? 0x14141CFF : (hackFrames > 0 ? 0x080810FF : skyColor(1.0f)), 0);
 		C3D_FrameDrawOn(top);
 		// citro2d changes the GPU state while drawing the bottom screen, so set ours up every frame
 		C3D_BindProgram(&program);
@@ -4402,9 +6390,11 @@ int main(int argc, char** argv) {
 		C3D_DepthTest(true, GPU_GREATER, GPU_WRITE_ALL);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uFog, fogA, fogB, 0.0f, 0.0f);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, uFogClr, fogC[0], fogC[1], fogC[2], 1.0f);
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, wTint[0] * t, wTint[1] * t, wTint[2] * t, 1.0f);
+		if (inRoom) C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, 1.0f, 1.0f, 1.0f, 1.0f);
+		else        C3D_FVUnifSet(GPU_VERTEX_SHADER, uTint, wTint[0] * t, wTint[1] * t, wTint[2] * t, 1.0f);
 		envPlain();
-		if (title || gMode != M_TP) { // the shooting range is far from the city: skip the city entirely
+		if (inRoom) drawRange(rooms[gRoom].start, rooms[gRoom].count);   // the inside of a shop
+		if ((title || gMode != M_TP) && !inRoom) { // the shooting range is far from the city: skip the city entirely
 			drawRange(0, globalEnd);                         // ground + skyline
 			drawCells(cellAStart, cellACount, vis);          // roofs, road markings, crossings, signal poles
 			if (gWin) { envTextured(); C3D_TexBind(0, &texDay); }
@@ -4418,7 +6408,7 @@ int main(int argc, char** argv) {
 		drawRange(litStart, skyStart - litStart);
 
 		// 3) lit windows: the night texture added on top of the facades
-		if (gWin && glow > 0.03f && (title || gMode != M_TP)) {
+		if (gWin && glow > 0.03f && (title || gMode != M_TP) && !inRoom) {
 			C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ONE, GPU_ONE, GPU_ONE);
 			C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_COLOR);
 			C3D_FVUnifSet(GPU_VERTEX_SHADER, uFogClr, 0.0f, 0.0f, 0.0f, 1.0f); // distant windows fade to black
@@ -4451,6 +6441,7 @@ int main(int argc, char** argv) {
 		C2D_TextBufClear(gDyn);
 		C2D_SceneBegin(top);
 		C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+		gHudQuiet = paused;
 		if (!title) drawTopHud(frame, cyaw);
 		C2D_Flush();
 
@@ -4462,6 +6453,8 @@ int main(int argc, char** argv) {
 		if (title) { if (feState == 0) drawTitleBottom(frame); else drawFrontEnd(feState, feSel, frame); }
 		else {
 			if (gMode == M_TP) drawTpBottom(frame);
+			else if (gShop >= 0) drawShopBottom(frame);
+			else if (gRoom >= 0) drawRoomBottom(px, pz, face, frame);
 			else {
 				drawMap(px, pz, frame, phoneTimer, face);
 				drawMapMode(px, pz);
