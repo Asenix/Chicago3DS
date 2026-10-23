@@ -1,111 +1,139 @@
 # Chicago3DS
 
-Nintendo 3DS homebrew source project.
+Open-city Nintendo 3DS homebrew game, written in C (devkitPro, libctru, citro3d, citro2d). Everything is in `source/main.c`
+plus one vertex shader (`source/vshader.v.pica`).
+
+> **Status, stated plainly.** The 3DS-side code has been compiled for ARM with the project's own compiler flags and the
+> title music, packaging and game logic have been tested on a PC (see [Testing](#testing)). It has **not** been run on a
+> real Nintendo 3DS by the author of these tests, so frame rate, rendering, sound and input feel on hardware are unverified.
+> No frame rate is promised anywhere in this file; measure it on your console with the in-game FPS readout.
 
 ## Controls
 | Button | Action |
 | --- | --- |
 | Circle Pad | move (strafes while aiming) |
 | C-Stick / D-Pad / touch-drag | look (D-Pad Left/Right turn, Up/Down tilt) |
-| A | use: enter a door, talk to a shopkeeper, leave a building (a panel shows what A will do) |
 | B | run |
+| A | interact: open a door, use a shop counter or the ticket machine, leave a building |
 | L or ZL | aim (over-the-shoulder camera + crosshair) |
-| R or ZR | shoot (firing also aims) |
+| R or ZR | shoot (firing also aims; no weapons inside buildings) |
 | Hold X | weapon wheel: pick with the Circle Pad or by touch, release to equip |
 | Y | quick-switch camera style |
-| SELECT | pause menu: RESUME, WEATHER, GRAPHICS, CAMERA, TITLE |
+| SELECT | pause menu: RESUME, WEATHER, GRAPHICS (fog, windows, FPS readout; the readout is on by default), CAMERA, MAIN MENU |
 | START | quit (title screen only) |
 
-Weapons: pistol, SMG, shotgun, rocket launcher. Each has its own ammo count (shown in the wheel and on the map screen).
-A pedestrian goes down after 4 hits (a shotgun blast counts as one hit); rocket explosions kill everyone nearby. Yellow
-crates on the sidewalks refill ammo. Camera styles (CAMERA menu): Default, Watch Dogs (close over-the-shoulder), First Person.
-Touch HACK LIGHTS / BLACKOUT on the bottom screen to use the phone.
+Weapons: pistol, SMG, shotgun, rocket launcher, each with its own ammo. Touch HACK LIGHTS / BLACKOUT on the bottom screen
+to use the phone (that strip is not available inside a building, where the bottom screen shows the floor plan).
 
 ## Menus and game modes
-Title screen: press A / tap, then **Single Player** (Free Roam) or **Multiplayer** (Deathmatch, Battle Royale, Target Practice). The menus use the same neon style as the pause menu; B goes back. Every mode shows a black loading screen with a description, then a 3-2-1-GO countdown. Pause (SELECT) > **MAIN MENU** leaves a mode.
+Title screen: press A / tap, then **Single Player** (Free Roam) or **Multiplayer** (Deathmatch, Battle Royale, Target Practice).
+Every mode shows a loading screen with a description, then a 3-2-1-GO countdown. Pause (SELECT) > MAIN MENU leaves a mode.
 
-- **Deathmatch** - random spawn, NPCs hunt you. Every enemy hit costs 10 health (10 hits = dead). Stay out of sight for ~2 s and you heal back up to 50% only. Endless: you cannot win. Levels at 10 / 25 / 30 / 45 / 50 kills (Level 5 max; before 10 kills is a warm-up "Level 0"). Each level adds more enemies, more health, faster fire, longer bursts and better aim. Kills refill some ammo.
-- **Battle Royale** - random spawn, no weapons. Guns, ammo drops and medkits lie around the map (blue = gun, yellow = ammo, green = medkit on the map). Medkits go on the weapon wheel (hold X, 6th tile). 11 NPCs loot, heal and shoot each other. A storm shrinks in 5 stages; last one alive wins.
-- **Target Practice** - first person only, you cannot move. 5 rounds x 3 shots against 3 NPC rivals, ring score 1-10 per shot (bullseye 10). Circle Pad / C-stick / D-pad look, R fires, L steadies the aim. Highest total wins; equal top scores are a draw.
+- **Free Roam** - the whole city, traffic, pedestrians, wildlife, shops. Buildings can be entered (below).
+- **Deathmatch** - random spawn, NPCs hunt you; levels at 10 / 25 / 30 / 45 / 50 kills make them tougher. Endless.
+- **Battle Royale** - no weapons at the start; guns, ammo and medkits lie around the map, 11 NPC fighters, a storm shrinks in 5 stages.
+- **Target Practice** - first person, in a shooting range far east of the city (x = 1000); 5 rounds x 3 shots against 3 NPC rivals.
 
-## City layout
-The city is 14 x 14 blocks (560 m x 560 m), 40 m between road centre lines, bordered by Lake Michigan on the east. It is one connected map:
+Deathmatch, Battle Royale and Target Practice are played in the middle of the city / at the range; the interiors, shops,
+wildlife and traffic are Free Roam only.
 
-| District | Where | What is there |
-| --- | --- | --- |
-| Downtown (the Loop) | middle | glass towers on plazas, up to ~95 m tall, the densest streets |
-| Residential | north and west | brick houses with gaps, yards, trees |
-| Mixed use / commercial | around the centre | mid-rises with car parks, shop fronts with awnings, signs |
-| Industrial / docks | south and south-east | warehouses with loading-dock doors, container stacks, cranes at the water |
-| Parks, courts, plazas | east (Grant Park) and scattered | grass, paths, ponds, fountains, basketball courts, playgrounds, benches |
-| Vacant lots | scattered | fenced lots, rubble, weeds |
-| Rail line (row 4 from the north) | all the way across | elevated embankment with a track, a **moving L train** that stops at both stations, and road **tunnels** under it at every north-south street |
-| Expressway (row 11 from the north) | all the way across | multi-lane elevated freeway on pillars with guardrails and overhead signs. It comes down on a ramp at the west end and runs out over the lake at the east end. Streets pass **underneath** it, and the shaded space under the deck has parked cars. |
+## The city: what is real, what is scenery, what is simulated
+The city is 14 x 14 blocks, 40 m between road centre lines (560 m x 560 m). The player can walk anywhere inside +-300 m.
+Blocks are chosen in `pickBlock()` / built in `layoutBlock()`; counts in the shipped layout: 17 glass-tower blocks, 4 low-rise,
+10 mid-rise, 20 parks, 5 plazas, 31 house blocks, 16 mixed shop-and-flat, 9 strip-mall, 29 industrial, 6 dock, 11 vacant lots,
+10 courts, plus a row of 14 rail blocks and a row of 14 freeway blocks. Lake on the east edge. About 300 buildings, 290 trees.
 
-Streets have sidewalks, crosswalks, traffic signals, street signs, street lights, hydrants, trash cans, benches, fences and parked cars. Neighbourhood names (7 x 7 districts of 2 x 2 blocks) show on the bottom screen and as a banner when you cross into one. Block types are chosen in `pickBlock()` and built in `layoutBlock()`, `layoutRail()` and `layoutFreeway()` in `main.c`.
-
-**Important limitation:** the freeway deck, its ramp and the train platforms are scenery you walk *under or beside*. There is no vertical collision, so you cannot walk up the ramp or ride on the train. The train is something you watch (and a ticket machine takes you between stations).
-
-## Free Roam: buildings, shops, money
-Press **A** when the prompt "A  ENTER ..." appears at a door. The screen fades, you are inside and the bottom screen shows a floor plan (pink = the spot to use, green = the exit). Press A at the pink spot to open the shop menu: D-Pad or touch to choose, A to buy, B to leave. No weapons can be fired indoors. There are 43 doors in the city.
-
-| Building | What you can do |
+| Thing | What it really is |
 | --- | --- |
-| Quick Stop (convenience store) | energy drink $4 (speed boost 90 s), chips $2 (boost 30 s), Chicago cap $12, sunglasses $15 (both show on your character) |
-| Lakeside Diner | coffee $3, milkshake $5, deep dish slice $7, cheeseburger $8: each gives a speed boost |
-| Wash & Fold (laundromat) | red / blue / green / black jacket $6 each (changes your character's jacket) |
-| Apartment | sleep until morning, sunset or night (free, changes the time of day) |
-| Warehouse (the loading-dock doors) | the dealer sells pistol / SMG / shotgun / rocket ammo; 5 loose crates inside pay $15 each when you walk into them |
-| L Station (two of them) | ticket machine: $5 to ride to the other station |
+| Buildings, fences, benches, trees, parked cars, station walls | **Solid.** Axis-aligned collision boxes (`bldg[]`); the player and the NPC nav grid avoid them. |
+| 43 doors into 6 interiors | **Implemented.** A at a door fades inside; every door was driven through enter, shop and exit in the host tests, and the exit spot is always walkable. Interiors: Quick Stop x4, Lakeside Diner x4, Wash & Fold x5, Apartment x5, Warehouse x23, L Station x2. |
+| Shops | **Implemented.** Cash (street pickups, $15 for crates delivered in the warehouse) buys: speed boosts (energy drink, chips, coffee, milkshake, deep-dish slice, cheeseburger), cap, sunglasses, jackets, ammo, and sleeping in the apartment (changes the time of day). |
+| Elevated rail line | **Scenery you can walk under.** The embankment is solid; there are tunnels at every cross street. The player cannot climb onto it. |
+| Moving train (outdoors) | **Simulated, not boardable.** 6 cars run along the elevated track and stop at the two stations for a few seconds (`updateTrain()`); the player cannot get on or collide with it. |
+| Train station interiors | **Implemented rooms.** The train visible from the platform is a timer-driven loop, separate from the outdoor train. |
+| Ticket machine ($5) | **A fade-out teleport** to the other station's front door (`ACT_RIDE`). There is no ride, no view from inside a train, and the outdoor train is not involved. |
+| Elevated freeway | **Scenery you can walk under.** Piers and underpass car parks are real; the deck, the west-end ramp and the east end over the lake are visual only (the engine has no vertical collision, the player is always at ground level). The ramp is **not** climbable and the freeway cannot be driven or walked on. |
+| Pigeons (14) and squirrels (10) | **Simple animation AI**, Free Roam only: pigeons scatter within ~5 m, squirrels run to a tree and climb it. They have no gameplay effect. |
+| Traffic (36 cars) and pedestrians (30) | Simple lane and sidewalk movement, Free Roam only. |
 
-You start with $40. Cash bills ($5 / $10 / $20, shown as green dots on the map) lie around the city and come back after a while. Not enough cash, an item you already own, or full ammo all show a message instead of doing nothing.
-
-## Wildlife and ambience
-Pigeons (plazas, parks, courts, commercial streets) and squirrels (parks, house yards, they run up trees) are spawned only near their habitats, 24 animals in total, and only in Free Roam. They scatter when you get close. The background sound changes by district: traffic downtown, birds and crickets in parks and houses, an industrial hum and birdsong at the docks, an expressway roar near and under the freeway, an echoing rumble inside tunnels, a train that gets louder as it passes, and a quiet room tone inside buildings.
+Why the ramp and train are not interactive: the whole engine assumes a flat ground plane. Walking up a ramp or standing on a
+moving train would need a height field for the player, vertical collision against the deck, camera changes and re-testing
+every spawn and door. That is a bigger change than "stabilise"; it is not done, and it is not claimed.
 
 ## Pedestrians
-Each pedestrian gets a random look in `styleNpc()`: 10 skin tones, 9 hair colours, hair styles (short, long, afro, bun, bald), caps, beanies and head
-scarves, 8 outfits (tee, long sleeves, shorts, dress, hoodie, suit, coat, tank), shoes, backpacks / bags, sunglasses, beards, and different heights and builds.
+Each pedestrian gets a random look in `styleNpc()`: 10 skin tones, 9 hair colours, hair styles, caps, beanies and head scarves, 8 outfits,
+shoes, backpacks / bags, sunglasses, beards, heights and builds.
 
 ## Sound and music
-* The title music is `assets/title.mp3`, converted to `romfs/title.pcm` (32 kHz stereo) and streamed from the app's romfs. To use a different
-  song, replace `assets/title.mp3` and run `tools/convert_audio.sh` (needs ffmpeg), then rebuild.
-* If `title.pcm` can't be found (romfs or `sdmc:/3ds/Chicago3DS/title.pcm`), a built-in synthesized theme plays instead. The title screen's top line says which
-  one is active, or "NO SOUND" if `dspfirm.cdc` is missing.
-* Gunshots, explosions, footsteps, traffic, rain, crickets, birdsong, horns and sirens are generated in code.
-* Audio needs the DSP firmware dump at `sdmc:/3ds/dspfirm.cdc` (create it once with the DSP1 homebrew). Without it the game runs silently.
+* The title music is `assets/title.mp3`, converted to `romfs/title.pcm` (32 kHz stereo) and streamed from the app's RomFS.
+  To change the song, replace `assets/title.mp3`, run `tools/convert_audio.sh` (needs ffmpeg) and rebuild.
+* **Fallback order, tested on a PC with fake RomFS/SD folders:** `romfs:/title.pcm` -> `sdmc:/3ds/Chicago3DS/title.pcm` (also
+  `sdmc:/3ds/chicago3ds/` and `sdmc:/Chicago3DS/`) -> a built-in synthesised theme. The built-in theme is also used if the file is
+  shorter than 4 bytes, the reader thread cannot start, or the file cannot be read while streaming. The title screen's top line says which
+  source is active, or "NO SOUND" without DSP firmware.
+* Sound effects are generated in code. Audio needs the DSP firmware dump at `sdmc:/3ds/dspfirm.cdc`; without it the game runs silently.
 
-## Boot sequence
-Three developer logos (original placeholders, edit `logoName` / `logoTag` in `main.c`) fade in and slowly out to black, then the title
-screen fades in and the music starts. A or START skips the logos.
-
-## Performance notes
-The city is built once into one vertex buffer (about 169,000 static vertices of a 230,000 budget, 8.3 MB of linear memory). Each frame only the 80 m districts in front of you and inside the fog distance are drawn, which on a PC measurement averages about 53,000 static vertices and peaks around 100,000 in clear weather (fewer in rain, night and sunset, where the fog is closer). Cars, people, wildlife and lights are rebuilt each frame within a 140 m radius. If the frame rate is low, turn off FOG or WINDOWS in the pause menu, or lower `gCullR` / the fog distances in `main.c`.
-
-Tuned for a New 3DS: the game switches the CPU to 804 MHz at start-up (`osSetSpeedupEnable`). It still runs on an Old 3DS, just with a shorter safe draw distance.
-The bottom-left of the map shows a live FPS counter. If it drops below 60 on an Old 3DS, open the pause menu > GRAPHICS and turn off FOG or WINDOWS,
-or lower `gCullR` (draw distance for cars, people and signals) in `main.c`. The window textures are procedural (no image files needed).
-
-## Build locally
-Install devkitPro with the 3DS development packages (3ds-dev), open a terminal in this folder, then run:
+## Build
+With devkitPro (3ds-dev installed), in this folder:
 
 ```sh
 make
 ```
 
-The output should be `chicago3ds.3dsx`. Copy it to your SD card and launch it with the Homebrew Launcher.
+Output: `chicago3ds.3dsx`. Copy it to the SD card and start it from the Homebrew Launcher.
 
-## Build with GitHub Actions
-Upload this folder's contents to a GitHub repository, preserving the `.github/workflows/build.yml` path. Push to the repository or open Actions and run **Build 3DSX** manually. Download the `chicago3ds` artifact from the completed workflow run.
+### Packaging, and why the command is what it is
+`3dsxtool` only embeds a RomFS **together with an SMDH**. Running it as `3dsxtool X.elf X.3dsx --romfs=romfs` alone stops with
+`Cannot open SMDH file!` (checked against the 3dsxtool source and by running it). The working command, used by the Makefile, is
 
-## What has and has not been verified
-Checked on a PC (the game logic is compiled on Linux with 3DS stubs and run with the address sanitizer; run `tools/hosttest/run.sh` to repeat it): every door can be reached on foot; enter, shop, buy and leave works for all 43 doors; every room's service spot, exit and crates are reachable; all shop items change cash and state correctly (and refuse when you cannot pay); the train stops at both stations and stays on its rails; wildlife never ends up inside walls; the per-frame vertex budget does not overflow; Deathmatch, Battle Royale and Target Practice still run. `main.c` also type-checks without warnings against the real libctru, citro3d and citro2d headers (on x86, not ARM). Interiors and street views were rendered on the PC to look at the geometry.
+```
+3dsxtool chicago3ds.elf chicago3ds.3dsx --smdh=chicago3ds.smdh --romfs=romfs
+```
 
-**Not done:** the code has not been built with devkitPro/devkitARM (that toolchain could not be installed in the environment it was written in) and has never run on a real 3DS, so frame rate, memory use (the vertex buffer grew from 1.4 MB to 8.3 MB), audio mixing and touch behaviour on the real hardware are untested. Build it with GitHub Actions or locally and use this checklist on the console:
-1. Title screen: music plays, menus work. Start Free Roam.
-2. Walk to a shop door (small coloured squares on the map). A prompt appears; press A. Buy something, leave, check the cash counter.
-3. Open the pause menu inside a shop and back out; check the A prompt does not appear while paused.
-4. Walk under the freeway and through a rail tunnel; watch the train arrive at a station; ride from one station to the other.
-5. Look at the FPS counter (pause > GRAPHICS > FPS) downtown and in clear weather, then with fog off. Note the lowest value.
-6. Start Deathmatch, Battle Royale and Target Practice and make sure they still work on the larger map.
-7. Report anything that crashes or stutters, with where you were standing.
+If embedding the RomFS fails for any reason, the Makefile prints a warning and packages **without** it
+(`3dsxtool X.elf X.3dsx --smdh=X.smdh`); the game then finds the music on the SD card or uses the built-in theme. The GitHub
+Actions build reports whether the RomFS ended up inside the `.3dsx` (it reads the RomFS offset from the file's header).
+The icon is `assets/icon.png` (48x48); the devkitPro default icon is the fallback if it is missing.
+
+### GitHub Actions
+`.github/workflows/build.yml` has two jobs: **build** (devkitARM container: `make`, packaging report, uploads the `.3dsx`) and
+**hosttest** (the PC tests below). It runs on pushes and pull requests to `main`, or manually from the Actions tab.
+
+## Testing
+`tools/hosttest/run.sh` compiles `source/main.c` on a PC against the **real** libctru / citro3d / citro2d headers and runs the game's
+own logic under AddressSanitizer and UndefinedBehaviorSanitizer. The 3DS libraries are replaced by stand-ins
+(`tools/hosttest/hoststubs.c`); a function the game calls that has no stand-in is a link error, and an undeclared one is a compile error,
+so API drift is caught. What it runs:
+
+* city generation: capacity limits, building overlaps, lot bounds, vertex-buffer fit;
+* every one of the 43 doors: walk up, enter, use the counter, buy, leave; all interiors and crates reachable; ticket ride arrival;
+* train range and both station stops, wildlife, NPC navigation grid (A*), fighters never leave the map or stand inside a solid;
+* Deathmatch, Battle Royale and a full 5-round Target Practice match;
+* the music source order and fallbacks above;
+* the game's real `main()` for 3000 frames per mode with scripted input (menus, loading, play), and a forced vertex-buffer allocation failure;
+* a draw-budget scan over 29,768 camera views.
+
+Host results from the last run (these are PC measurements of data, not of speed):
+
+| Measure | Value |
+| --- | --- |
+| Static city vertices | 169,422 of the 229,998-vertex buffer (36 bytes each, 8.27 MB linear memory) |
+| Worst frame buffer use | 208,398 vertices on the title orbit (all districts visible); 174,660 in play |
+| Static vertices submitted per frame in play | average 49,268; worst 104,358 with fog on (about 35k triangles); worst 135,864 with fog off |
+| Linear memory (host accounting of every `linearAlloc`, including citro3d/citro2d buffers and the framebuffers) | 12.65 MiB peak |
+| Static data (.bss) / code (.text), ARM compile | about 1.66 MB / 186 KB |
+
+Reading libctru's `allocateHeaps()`, an application that gets the usual 64 MB allocation ends up with about 32 MB of linear heap, so
+12.65 MiB should fit; this is from the source code, depends on how the app is launched, and was not measured on a console. If the 8.27 MB vertex buffer cannot be
+allocated, the game now shows a "not enough linear memory" screen and exits instead of crashing.
+
+**What no test here can tell you:** the real frame rate, whether 35k-100k vertices per frame run smoothly on a New 3DS (or at all on an
+Old 3DS), how it looks, how it sounds, or whether the touch and button handling feels right. Look at the FPS readout (bottom-left of the bottom screen; pause menu > GRAPHICS > FPS turns it off or on); if it is low, turn off FOG or WINDOWS or lower the draw distances in `main.c`. The FPS readout shows `FULL` if the vertex buffer
+ever overflows.
+
+Not yet verified at all: a full link against the real devkitPro libraries and a run of the GitHub Actions workflow for these changes.
+
+## Tuning
+New 3DS: the game switches the CPU to 804 MHz at start-up (`osSetSpeedupEnable`). It has not been tried on an Old 3DS. Draw distance is
+cut by the district visibility rule in `computeVis()` (near districts plus a forward cone, none beyond the fog) and by `gCullR` for
+cars, people and signals.
