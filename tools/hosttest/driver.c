@@ -19,25 +19,32 @@ int main(int argc, char** argv) {
 	printf("largest district: %d vertices; global (ground+skyline) %d\n", mx, globalEnd);
 	float hmax = 0; for (int i = 0; i < nBld; i++) if (bldg[i].kind == 0 && bldg[i].h > hmax) hmax = bldg[i].h;
 	printf("tallest building %.1f m\n", hmax);
-	// overlap check: building footprints vs each other and trees
-	int overlaps = 0;
+	// Footprint checks. kind 0 = building, 1 = tree, 2 = fountain, 3 = collision-only solid (fences, benches, rail embankment, ramp
+	// piers ...). Solids are allowed to touch each other and to lie outside a lot (the rail and freeway are built across blocks on
+	// purpose), but a building, tree or fountain must not overlap another one, and a building must stay inside its lot.
+	int overlaps = 0, solidOverlaps = 0, solidOnBld = 0;
 	for (int i = 0; i < nBld; i++) for (int j = i + 1; j < nBld; j++) {
 		const Building *a = &bldg[i], *b = &bldg[j];
-		if (a->x0 < b->x1 - 0.01f && a->x1 > b->x0 + 0.01f && a->z0 < b->z1 - 0.01f && a->z1 > b->z0 + 0.01f) {
+		if (!(a->x0 < b->x1 - 0.01f && a->x1 > b->x0 + 0.01f && a->z0 < b->z1 - 0.01f && a->z1 > b->z0 + 0.01f)) continue;
+		if (a->kind <= 2 && b->kind <= 2) {
 			overlaps++; if (overlaps < 8) printf("  overlap: #%d kind%d (%.1f,%.1f) vs #%d kind%d (%.1f,%.1f)\n", i, a->kind, a->x0, a->z0, j, b->kind, b->x0, b->z0);
-		}
+		} else if (a->kind == 3 && b->kind == 3) solidOverlaps++;
+		else solidOnBld++;
 	}
-	printf("footprint overlaps: %d\n", overlaps);
-	// anything blocking the road / sidewalk? (building footprint must stay inside its lot)
+	printf("footprint overlaps among buildings/trees/fountains: %d (collision-only solids: %d touching each other, %d touching a building/tree)\n", overlaps, solidOverlaps, solidOnBld);
 	int outside = 0;
 	for (int i = 0; i < nBld; i++) {
 		const Building* a = &bldg[i];
+		if (a->kind != 0) continue;
 		float cx = (a->x0 + a->x1) * 0.5f, cz = (a->z0 + a->z1) * 0.5f;
 		float bx = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * floorf((cx + CITY_H) / ROAD_SP);
 		float bz = -CITY_H + ROAD_SP * 0.5f + ROAD_SP * floorf((cz + CITY_H) / ROAD_SP);
-		if (a->x0 < bx - LOT_H - 0.01f || a->x1 > bx + LOT_H + 0.01f || a->z0 < bz - LOT_H - 0.01f || a->z1 > bz + LOT_H + 0.01f) { outside++; if (outside < 6) printf("  outside lot: #%d kind%d [%.1f %.1f %.1f %.1f] block (%.0f,%.0f)\n", i, a->kind, a->x0, a->z0, a->x1, a->z1, bx, bz); }
+		if (a->x0 < bx - LOT_H - 0.01f || a->x1 > bx + LOT_H + 0.01f || a->z0 < bz - LOT_H - 0.01f || a->z1 > bz + LOT_H + 0.01f) { outside++; if (outside < 6) printf("  building outside its lot: #%d [%.1f %.1f %.1f %.1f] block (%.0f,%.0f)\n", i, a->x0, a->z0, a->x1, a->z1, bx, bz); }
 	}
-	printf("footprints outside their lot: %d\n", outside);
+	printf("buildings outside their lot: %d\n", outside);
+	if (gVtxOver) { printf("FAIL: the city does not fit the vertex buffer: %u vertices refused\n", gVtxOver); return 1; }
+	if (gDropped || bkOverflow) { printf("FAIL: capacity limits hit (dropped %d, bucket overflow %d)\n", gDropped, bkOverflow); return 1; }
+	if (overlaps || outside) { printf("FAIL: building geometry\n"); return 1; }
 	if (argc < 8) return 0;
 	initCars(); initPeds(); initCrates();
 	if (argc > 8) { // lineup: every pedestrian in a row facing the camera

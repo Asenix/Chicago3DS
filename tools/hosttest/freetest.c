@@ -2,7 +2,6 @@
 #include "../../source/main.c"
 #undef main
 #include <stdlib.h>
-u64 osGetTime(void){ static u64 t=777; return t+=1234; }
 static int fails=0;
 #define CHECK(c,...) do{ if(!(c)){ fails++; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } }while(0)
 
@@ -16,7 +15,8 @@ static void bfsWorld(float sx,float sz){
   while(h<t){ int c=q[h++]; int ci=c/NX, cj=c%NX;
     for(int k=0;k<4;k++){ int ni=ci+dx[k], nj=cj+dz[k]; if(ni<0||nj<0||ni>=NX||nj>=NX) continue; if(seen[ni*NX+nj]) continue;
       float x=(float)ni*0.5f-CITY_H-30.0f, z=(float)nj*0.5f-CITY_H-30.0f;
-      if(blockedR(x,z,PLAYER_R)) continue; seen[ni*NX+nj]=1; q[t++]=ni*NX+nj; } }
+      if(blockedR(x,z,PLAYER_R)) continue;
+      seen[ni*NX+nj]=1; q[t++]=ni*NX+nj; } }
   free(q);
 }
 // BFS inside a room (gRoom set)
@@ -88,7 +88,7 @@ int main(void){
       int before=gCash; for(int j=0;j<n;j++) shopBuy(gRoom,j); CHECK(gCash<=before,"door %d: cash grew from shop",i);
       gCash=0; int c0=gCash; shopBuy(gRoom,0); CHECK(gCash==c0,"door %d: bought with no cash",i);
     }
-    if(gRoom==RM_APT){ int w0=weather; shopBuy(gRoom,2); CHECK(gTrans>0,"apt: no rest fade"); for(int f=0;f<40;f++) frame(0,1); (void)w0; gRoom=gRoom; }
+    if(gRoom==RM_APT){ int w0=weather; shopBuy(gRoom,2); CHECK(gTrans>0,"apt: no rest fade"); for(int f=0;f<40;f++) frame(0,1); (void)w0; }
     else if(gRoom==RM_STATION){ gCash=500; int rd=gRetDoor; shopBuy(gRoom,0); CHECK(gCash==495,"ticket price (%d)",gCash); for(int f=0;f<40;f++) frame(0,1); CHECK(gRoom==-1,"ride: still inside"); CHECK(!blockedR(px,pz,PLAYER_R),"ride: arrival blocked"); (void)rd; cycles++; continue; }
     gShop=-1;
     if(gRoom>=0){
@@ -122,6 +122,7 @@ int main(void){
   for(int t=0;t<40;t++){ float cx=(float)((t*37)%500)-250.0f, cz=(float)((t*91)%500)-250.0f; gCamX=cx; gCamZ=cz; gCullR=90; gCone=0; vcount=staticCount; drawDynamic(); drawWorldDyn(t*7); drawWorldLit(t*7,1.0f); int d=vcount-staticCount; if(d>worst) worst=d; }
   printf("worst dynamic verts/frame %d (room %d)\n",worst,MAX_VERTS-staticCount);
   CHECK(worst<MAX_VERTS-staticCount,"dynamic overflow");
+  CHECK(gVtxOver==0,"%u vertices refused because the buffer was full",gVtxOver);
   printf("%s (%d fails)\n",fails?"FAILED":"ALL OK",fails);
   return fails?1:0;
 }
