@@ -31,7 +31,7 @@
 #define CITY_H    (GRID * ROAD_SP * 0.5f)     // half size of the whole city (280)
 #define ROAD_END  (CITY_H + 10.0f)            // traffic and pedestrians wrap here
 #define FLOOR_H   3.5f
-#define MAX_VERTS 230000
+#define MAX_VERTS 229998   // a multiple of 3, so a full buffer never ends in half a triangle
 #define MAX_BLD   3600
 #define MAX_PATCH 2400
 #define MAX_FEAT  11000
@@ -85,8 +85,10 @@ static int inView(float x, float z) {
 
 static float gAlpha = 1.0f; // alpha written into new vertices (rain, sky bodies, shadows, droplets)
 
+static unsigned gVtxOver = 0; // vertices refused because the buffer was full (should stay 0; the FPS readout shows it if it does not)
+
 static void addVT(float x, float y, float z, float r, float g, float b, float u, float v) {
-	if (vcount >= MAX_VERTS) return;
+	if (vcount >= MAX_VERTS) { gVtxOver++; return; }
 	Vertex* p = &vbo[vcount++];
 	p->pos[0] = x; p->pos[1] = y; p->pos[2] = z;
 	p->clr[0] = r; p->clr[1] = g; p->clr[2] = b; p->clr[3] = gAlpha;
@@ -129,10 +131,6 @@ static void addBoxG(float x0, float z0, float x1, float z1, float y0, float y1,
 
 static void addBoxY(float x0, float z0, float x1, float z1, float y0, float y1, float r, float g, float b) {
 	addBoxG(x0, z0, x1, z1, y0, y1, r, g, b, 1.0f, 1.0f);
-}
-
-static void addBox(float x0, float z0, float x1, float z1, float h, float r, float g, float b) {
-	addBoxY(x0, z0, x1, z1, 0.0f, h, r, g, b);
 }
 
 // ---- window textures ---------------------------------------------------------------
@@ -851,11 +849,16 @@ static void layoutBlock(int i, int j) {
 			addB(0, pvx - 2.2f, pvz - 2.2f, pvx + 2.2f, pvz + 2.2f, 3.4f, 0.86f, 0.84f, 0.78f, st);
 		}
 		int placed = 0;
+		float tpx[6], tpz[6];
 		for (int tries = 0; tries < 40 && placed < 6; tries++) {
 			float x = bx + (float)((int)(lrnd(&st) % 23) - 11), z = bz + (float)((int)(lrnd(&st) % 23) - 11);
 			if (fabsf(x - bx) < 2.8f || fabsf(z - bz) < 2.8f) continue;
 			if (pond && fabsf(x - bx) < 7.0f && fabsf(z - bz) < 5.5f) continue;
 			if (pav && fabsf(x - pvx) < 4.0f && fabsf(z - pvz) < 4.0f) continue;
+			int crowded = 0;                                   // two trees on the same spot are one tree drawn twice
+			for (int k = 0; k < placed; k++) if (fabsf(x - tpx[k]) < 2.0f && fabsf(z - tpz[k]) < 2.0f) crowded = 1;
+			if (crowded) continue;
+			tpx[placed] = x; tpz[placed] = z;
 			addTree(x, z, lrnd(&st));
 			placed++;
 		}
@@ -2652,12 +2655,11 @@ enum { GS_COUNTDOWN, GS_PLAY, GS_OVER };
 static int   gMode = M_FREE, gState = GS_PLAY, gCount = 0;
 static float plHp = 100.0f;        // player health 0..100
 static int   plSince = 999;        // frames since the player was last hurt
-static int   plHeal = 0, plMedkits = 0, plRegen = 0, plFlash = 0;
+static int   plHeal = 0, plMedkits = 0, plFlash = 0;
 static float plHitAng[4], plHitZ[4]; // where the last hits came from (x, z of the attacker)
 static int   plHitLife[4];
 static int   ownedW[WP_COUNT];     // weapons the player has
 static float gPlX = 0.0f, gPlZ = 0.0f, gPlYaw = 0.0f, gCamYaw = 0.0f;
-static int   gPlRun = 0;
 static int   gKills = 0, gLevel = 0, gTime = 0, gBanner = 0;
 
 // ---- navigation grid (A* for the computer-controlled fighters) -------------------------------
@@ -3274,7 +3276,7 @@ static void feedAdd(const char* a, const char* how, const char* b) {
 	feedLife[0] = 420;
 }
 static int  gToast = 0;
-static char gToastTxt[40];
+static char gToastTxt[64];
 static void toast(const char* s) { snprintf(gToastTxt, sizeof gToastTxt, "%s", s); gToast = 150; }
 
 static int gOverT = 0, gPlace = 0, gWon = 0, gGo = 0, gLastMenu = 3, plUnseen = 0, plMoving = 0;
@@ -4235,7 +4237,7 @@ static const char* const kServiceTxt[RM_N] = {"TALK TO THE CLERK", "ORDER FOOD",
 static int   gCash = 40;
 static int   gBoost = 0;                       // frames of speed boost left
 static int   gShop = -1, gShopSel = 0, gShopMsgT = 0;
-static char  gShopMsg[48];
+static char  gShopMsg[64];
 static int   gTrans = 0, gTransAct = 0, gTransArg = 0;   // screen fade: at the midpoint the queued action runs
 enum { ACT_ENTER, ACT_EXIT, ACT_RIDE, ACT_REST };
 static int   gRetDoor = -1;                    // the door the player went in through
@@ -4282,7 +4284,7 @@ static void shopBuy(int room, int idx) {
 		snprintf(b, sizeof b, "TICKET  -$%d", it->price); toast(b); playSfx(SFX_PICKUP, 0.7f); return;
 	}
 	gCash -= it->price;
-	if (it->price > 0) { char c[48]; snprintf(c, sizeof c, "%s  -$%d", b, it->price); shopSay(c); } else shopSay(b);
+	if (it->price > 0) { char c[64]; snprintf(c, sizeof c, "%s  -$%d", b, it->price); shopSay(c); } else shopSay(b);
 	playSfx(SFX_PICKUP, 0.7f);
 }
 
@@ -4582,7 +4584,6 @@ static void drawWildlife(void) {
 }
 
 // ---- the dynamic geometry of the world systems -----------------------------------------------------------------
-static float gKeeperPh = 0.0f;
 static void drawWorldDyn(int frame) {
 	if (gRoom < 0) {
 		drawTrain();
@@ -4936,7 +4937,6 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	const u32 cBg    = C2D_Color32(0x12, 0x15, 0x1d, 0xFF);
 	const u32 cRoad  = C2D_Color32(0x4a, 0x51, 0x66, 0xFF);
 	const u32 cMid   = C2D_Color32(0x6b, 0x73, 0x8c, 0xFF);
-	const u32 cBlock = C2D_Color32(0x1c, 0x21, 0x2e, 0xFF);
 	const u32 cPill  = C2D_Color32(0x00, 0x00, 0x00, 0xB4);
 	const u32 cText  = C2D_Color32(0xF0, 0xF2, 0xF8, 0xFF);
 	const u32 cPink  = C2D_Color32(0xE0, 0x30, 0xE0, 0xFF);
@@ -4947,8 +4947,6 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	// roads (the whole city ground), then the city blocks on top
 	float ext = CITY_H + 12.0f;
 	const u32 cPark  = C2D_Color32(0x1d, 0x4a, 0x2c, 0xFF);
-	const u32 cPlaza = C2D_Color32(0x3a, 0x3f, 0x4c, 0xFF);
-	const u32 cBld   = C2D_Color32(0x2f, 0x37, 0x4b, 0xFF);
 	const u32 cTree  = C2D_Color32(0x2a, 0x7a, 0x3c, 0xFF);
 	fillClipped(MAP_CX + (-ext - px) * MAP_S, MAP_CY + (-ext - pz) * MAP_S,
 	            MAP_CX + ( ext - px) * MAP_S, MAP_CY + ( ext - pz) * MAP_S, cRoad);
@@ -5100,7 +5098,8 @@ static void drawMap(float px, float pz, int frame, int phoneTimer, float face) {
 	if (gFps) {
 		char fb[16];
 		C2D_Text tf;
-		snprintf(fb, sizeof fb, "%d FPS", gFpsValue);
+		if (gVtxOver) snprintf(fb, sizeof fb, "%d FPS FULL", gFpsValue); // the vertex buffer overflowed: some geometry was not drawn
+		else          snprintf(fb, sizeof fb, "%d FPS", gFpsValue);
 		C2D_TextParse(&tf, gDyn, fb);
 		C2D_TextOptimize(&tf);
 		float w, h;
@@ -5760,7 +5759,7 @@ static void drawTopHud(int frame, float camYaw) {
 	if (gToast > 0 && gState == GS_PLAY) txt(gToastTxt, 200.0f, 172.0f, 0.5f, neon(255, 255, 255, gToast > 30 ? 1.0f : (float)gToast / 30.0f), 1);
 	if (gState == GS_COUNTDOWN) {
 		int n = gCount / 60; // 3, 2, 1
-		char b[8];
+		char b[16];
 		snprintf(b, sizeof b, "%d", n);
 		float ph = (float)(gCount % 60) / 60.0f, sc = 2.6f + 1.0f * ph;
 		C2D_DrawRectSolid(0.0f, 86.0f, 0.5f, 400.0f, 70.0f, neon(0, 0, 0, 0.35f));
@@ -5902,10 +5901,38 @@ static void drawCells(const int* st, const int* cnt, const unsigned char* vis) {
 	drawRange(rs, rc);
 }
 
+// Which districts to draw for a camera at (cx,cz) looking along (fx,fz): everything near, plus a forward cone. A district that
+// lies entirely beyond the fog is just sky colour, so it is skipped (57 = half a district's diagonal). Used by the main loop
+// and by the host draw-budget test, so the test measures the real rule.
+static void computeVis(float cx, float cz, float fx, float fz, int title, unsigned char* vis) {
+	const float cullFar = gFog ? wFogE + 57.0f : 440.0f;
+	for (int c = 0; c < CELLS; c++) {
+		float dx = ((float)(c % CN) - (float)(CN - 1) * 0.5f) * CELL_W - cx, dz = ((float)(c / CN) - (float)(CN - 1) * 0.5f) * CELL_W - cz;
+		float d = sqrtf(dx * dx + dz * dz), dot = dx * fx + dz * fz;
+		vis[c] = ((title ? d < 150.0f : d < 100.0f) || dot + 70.0f > 0.62f * d) ? 1 : 0;
+		if (!title && d > cullFar) vis[c] = 0;
+	}
+}
+
 int main(int argc, char** argv) {
 	gfxInitDefault();
 	osSetSpeedupEnable(true); // New 3DS: 804 MHz CPU + extra cache (ignored on an Old 3DS)
 	romfsInit();              // title music lives in romfs:/title.pcm
+	// The city's vertex buffer is the largest single allocation (MAX_VERTS x 36 bytes = about 8.3 MB of linear memory).
+	// It is taken first, and a failure stops with a readable message instead of writing through a NULL pointer later.
+	vbo = (Vertex*)linearAlloc(sizeof(Vertex) * MAX_VERTS);
+	if (!vbo) {
+		consoleInit(GFX_TOP, NULL);
+		printf("Chicago 3DS\n\nNot enough linear memory for the city\nvertex buffer (%u KB needed).\n\nPress START to exit.\n", (unsigned)(sizeof(Vertex) * MAX_VERTS / 1024));
+		while (aptMainLoop()) {
+			hidScanInput();
+			if (hidKeysDown() & KEY_START) break;
+			gspWaitForVBlank();
+		}
+		romfsExit();
+		gfxExit();
+		return 1;
+	}
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
 	C2D_Prepare();
@@ -5934,7 +5961,6 @@ int main(int argc, char** argv) {
 	AttrInfo_AddLoader(&attr, 1, GPU_FLOAT, 4); // colour
 	AttrInfo_AddLoader(&attr, 2, GPU_FLOAT, 2); // texture coordinates
 
-	vbo = (Vertex*)linearAlloc(sizeof(Vertex) * MAX_VERTS);
 	texOK = initWindowTex();
 	if (!texOK) gWin = 0;
 	initStars();
@@ -6289,13 +6315,7 @@ int main(int argc, char** argv) {
 		gFwdX = -sinf(cyaw); gFwdZ = -cosf(cyaw);
 		gCone = !title;
 		unsigned char vis[CELLS]; // which districts the camera can see (the title orbit sees them all)
-		const float cullFar = gFog ? wFogE + 57.0f : 440.0f; // a district entirely beyond the fog is just sky colour: skip it (57 = half a district's diagonal)
-		for (int c = 0; c < CELLS; c++) {
-			float dx = ((float)(c % CN) - (float)(CN - 1) * 0.5f) * CELL_W - cx, dz = ((float)(c / CN) - (float)(CN - 1) * 0.5f) * CELL_W - cz;
-			float d = sqrtf(dx * dx + dz * dz), dot = dx * gFwdX + dz * gFwdZ;
-			vis[c] = ((title ? d < 150.0f : d < 100.0f) || dot + 70.0f > 0.62f * d) ? 1 : 0;
-			if (!title && d > cullFar) vis[c] = 0;
-		}
+		computeVis(cx, cz, gFwdX, gFwdZ, title, vis);
 
 		// ---- shooting (the crosshair ray starts at the camera; the bullet leaves the barrel) ----
 		if (!title && !paused) {
