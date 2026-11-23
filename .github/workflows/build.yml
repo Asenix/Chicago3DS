@@ -1,39 +1,52 @@
 name: Build Chicago3DS
 
 on:
-
   push:
-
-    branches: [main]
-
   workflow_dispatch:
 
 jobs:
-
   build:
-
     runs-on: ubuntu-latest
-
-    container: devkitpro/devkitarm:latest
-
     steps:
-
-      - name: Get source code
-
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Chicago3DS
+      - name: Unpack audio (assets.zip + voices.zip) into romfs/
+        run: |
+          mkdir -p romfs
+          for z in assets.zip voices.zip; do
+            if [ -f "$z" ]; then
+              echo "== $z"
+              rm -rf _unz && mkdir _unz
+              unzip -o -q "$z" -d _unz
+              # works whether the zip is flat or has a folder inside it
+              find _unz -type f -name '*.raw' -exec cp -f {} romfs/ \;
+              rm -rf _unz
+            else
+              echo "!! $z not found in the repo root"
+            fi
+          done
+          ls -l romfs
+          test -f romfs/music.raw || { echo "::error::romfs/music.raw missing - is assets.zip in the repo root?"; exit 1; }
+          test -f romfs/v_gm1.raw || { echo "::error::voice files missing - is voices.zip in the repo root?"; exit 1; }
 
-        run: make
+      - name: Build with devkitPro
+        run: |
+          docker run --rm -v "$PWD":/work -w /work devkitpro/devkitarm bash -c \
+            "dkp-pacman -Syu --noconfirm && dkp-pacman -S --noconfirm 3ds-dev && make"
 
-      - name: Upload 3DSX
+      - name: Check the result
+        run: |
+          ls -l chicago3ds.3dsx
+          SIZE=$(stat -c %s chicago3ds.3dsx)
+          echo "chicago3ds.3dsx is $SIZE bytes"
+          if [ "$SIZE" -lt 3000000 ]; then
+            echo "::error::the .3dsx is small - the audio did not get packed into it"
+            exit 1
+          fi
 
+      - name: Upload
         uses: actions/upload-artifact@v4
-
         with:
-
-          name: Chicago3DS-3DSX
-
+          name: chicago3ds
           path: chicago3ds.3dsx
-
-          if-no-files-found: error
