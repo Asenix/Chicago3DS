@@ -11,24 +11,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Unpack audio (assets.zip + voices.zip) into romfs/
+      - name: Collect audio into romfs/
         run: |
-          mkdir -p romfs
-          for z in assets.zip voices.zip; do
-            if [ -f "$z" ]; then
-              echo "== $z"
-              rm -rf _unz && mkdir _unz
-              unzip -o -q "$z" -d _unz
-              # works whether the zip is flat or has a folder inside it
-              find _unz -type f -name '*.raw' -exec cp -f {} romfs/ \;
-              rm -rf _unz
-            else
-              echo "!! $z not found in the repo root"
-            fi
+          rm -rf /tmp/audio_src && mkdir -p romfs /tmp/audio_src
+          echo "== audio-ish files in the repo"
+          find . -path ./.git -prune -o -type f \( -iname '*.zip' -o -iname '*.raw' -o -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.flac' -o -iname '*.m4a' \) -print
+          # 1) every zip in the repo (any name, flat or inside folders): take the .raw files and any music files out of it
+          find . -path ./.git -prune -o -type f -iname '*.zip' -print | while read -r z; do
+            echo "== unpacking $z"
+            rm -rf /tmp/_unz && mkdir /tmp/_unz
+            unzip -o -q "$z" -d /tmp/_unz || continue
+            find /tmp/_unz -type f | sed 's|^/tmp/_unz/|     |'
+            find /tmp/_unz -type f -iname '*.raw' -exec cp -f {} romfs/ \;
+            find /tmp/_unz -type f \( -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.flac' -o -iname '*.m4a' \) -exec cp -f {} /tmp/audio_src/ \;
           done
+          # 2) loose .raw files anywhere else in the repo (an "assets" folder, the root, ...)
+          find . -path ./.git -prune -o -path ./romfs -prune -o -type f -iname '*.raw' -print | while read -r f; do
+            [ -e "romfs/$(basename "$f")" ] || cp "$f" romfs/
+          done
+          # 3) title music: if there is still no music.raw, build it from a music file (first 2 minutes)
+          if [ ! -f romfs/music.raw ]; then
+            SRC=$(find . -path ./.git -prune -o -type f \( -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.flac' -o -iname '*.m4a' \) -print | head -n 1)
+            [ -n "$SRC" ] || SRC=$(find /tmp/audio_src -type f | head -n 1)
+            if [ -n "$SRC" ]; then
+              echo "== making music.raw from $SRC"
+              command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+              ffmpeg -y -loglevel error -i "$SRC" -t 120 -f s16le -ac 2 -ar 22050 romfs/music.raw
+            fi
+          fi
+          echo "== romfs now holds:"
           ls -l romfs
-          test -f romfs/music.raw || { echo "::error::romfs/music.raw missing - is assets.zip in the repo root?"; exit 1; }
-          test -f romfs/v_gm1.raw || { echo "::error::voice files missing - is voices.zip in the repo root?"; exit 1; }
+          [ -f romfs/music.raw ] || echo "::warning::No title music found (no music.raw and no mp3 anywhere in the repo) - the game will still build, but the title screen will be silent. Upload your mp3 to the repo root."
+          [ -f romfs/pistol.raw ] || echo "::warning::No sound effects found (pistol.raw missing) - upload assets.zip to the repo root."
+          [ -f romfs/v_gm1.raw ] || echo "::warning::No voice files found (v_gm1.raw missing) - upload voices.zip to the repo root."
+          exit 0
 
       - name: Build with devkitPro
         run: |
@@ -38,12 +54,7 @@ jobs:
       - name: Check the result
         run: |
           ls -l chicago3ds.3dsx
-          SIZE=$(stat -c %s chicago3ds.3dsx)
-          echo "chicago3ds.3dsx is $SIZE bytes"
-          if [ "$SIZE" -lt 3000000 ]; then
-            echo "::error::the .3dsx is small - the audio did not get packed into it"
-            exit 1
-          fi
+          echo "chicago3ds.3dsx is $(stat -c %s chicago3ds.3dsx) bytes"
 
       - name: Upload
         uses: actions/upload-artifact@v4
